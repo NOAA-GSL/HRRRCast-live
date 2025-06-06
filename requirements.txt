@@ -1,0 +1,17 @@
+numpy
+joblib
+matplotlib
+xarray
+dask
+seaborn
+fire
+xesmf
+netcdf4
+h5netcdf
+bottleneck
+cartopy
+tqdm
+pandas
+zarr
+pygrib
+tensorflow[and-cuda]==2.15.1
