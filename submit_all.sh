@@ -23,11 +23,14 @@ echo "Submitted job 1: $jobid1"
 jobid2=$(submit_with_check sbatch --parsable jobs/job-get-bcs.sh ${init_time} ${lead_hour})
 echo "Submitted job 2: $jobid2"
 
-jobid3=$(submit_with_check sbatch --dependency=afterany:$jobid1 --parsable jobs/job-make-ics.sh ${init_time} ${lead_hour})
+jobid3=$(submit_with_check sbatch --dependency=afterany:$jobid1 --parsable jobs/job-make-ics.sh ${init_time})
 echo "Submitted job 3: $jobid3"
 
-jobid4=$(submit_with_check sbatch --dependency=afterany:$jobid3 --parsable jobs/job-fcst.sh ${init_time} ${lead_hour})
-echo "Submitted job 4: $jobid4"
+jobid4=$(submit_with_check sbatch --dependency=afterany:$jobid2 --parsable jobs/job-make-bcs.sh ${init_time} ${lead_hour})
+echo "Submitted job 3: $jobid4"
 
-jobid5=$(submit_with_check sbatch --dependency=afterany:$jobid4 --parsable jobs/job-plot.sh ${init_time} ${lead_hour})
-echo "Submitted job 5: $jobid5"
+jobid5=$(submit_with_check sbatch --dependency=afterany:$jobid3:$jobid4 --parsable jobs/job-fcst.sh ${init_time} ${lead_hour})
+echo "Submitted job 4: $jobid5"
+
+jobid6=$(submit_with_check sbatch --dependency=afterany:$jobid5 --parsable jobs/job-plot.sh ${init_time} ${lead_hour})
+echo "Submitted job 5: $jobid6"

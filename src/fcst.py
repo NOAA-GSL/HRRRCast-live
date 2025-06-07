@@ -166,7 +166,7 @@ class WeatherForecaster:
             step = hour - from_hour
             
             current_input[0, :, :, :74] = hourly_forecasts[from_hour]
-            current_input[0, :, :, 76] = step / 6.0
+            current_input[0, :, :, -1] = step / 6.0
             
             output = model.predict(current_input)
             hourly_forecasts[hour] = output[0]
@@ -231,6 +231,9 @@ class WeatherForecaster:
             lats, lons = self.data_loader.get_coordinates()
             init_datetime = self.data_loader.get_init_datetime()
             
+            lead_channel = np.ones((1, model_input.shape[1], model_input.shape[2], 1))
+            model_input = np.concatenate([model_input, lead_channel], axis=-1)
+
             logger.info(f"Running forecast for {init_datetime} with {lead_hours} hour lead time")
             logger.info(f"Model input shape: {model_input.shape}")
             

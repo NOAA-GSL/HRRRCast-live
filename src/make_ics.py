@@ -151,8 +151,7 @@ class GRIBPreprocessor:
             logger.info(f"Saving preprocessed data to {output_file}")
             
             # Create model input array
-            lead_channel = np.ones((1, self.config.grid_height, self.config.grid_width))
-            model_input = np.concatenate((pres_norm, sfc_norm, lead_channel), axis=0)
+            model_input = np.concatenate((pres_norm, sfc_norm), axis=0)
             model_input = np.transpose(model_input, (1, 2, 0))[None, ...]
             
             # Save all data in compressed format
