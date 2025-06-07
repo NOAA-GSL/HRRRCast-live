@@ -15,4 +15,10 @@
 source /scratch3/BMC/gsd-hpcs/Daniel.Abdi/miniconda3/etc/profile.d/conda.sh
 conda activate hrrrcast-live
 
-python3 src/make_ics.py net-deterministic/normalize.nc 2024 05 06 23
+year=${1:-2024}
+month=${2:-05}
+day=${3:-06}
+hour=${4:-23}
+init_time="${year} ${month} ${day} ${hour}"
+
+python3 src/make_ics.py net-deterministic/normalize.nc ${init_time}

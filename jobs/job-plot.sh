@@ -15,4 +15,11 @@
 source /scratch3/BMC/gsd-hpcs/Daniel.Abdi/miniconda3/etc/profile.d/conda.sh
 conda activate hrrrcast-live
 
-python3 src/plot.py 2024 05 06 23 1
+year=${1:-2024}
+month=${2:-05}
+day=${3:-06}
+hour=${4:-23}
+lead_hour=${5:-18}
+init_time="${year} ${month} ${day} ${hour}"
+
+python3 src/plot.py ${init_time} ${lead_hour}
