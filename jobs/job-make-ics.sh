@@ -17,4 +17,4 @@ day=${3:-06}
 hour=${4:-23}
 init_time="${year} ${month} ${day} ${hour}"
 
-python3 src/make_ics.py net-deterministic/normalize.nc ${init_time}
+python3 src/make_ics.py net-diffusion/normalize.nc ${init_time}

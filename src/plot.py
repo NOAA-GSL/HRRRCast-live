@@ -71,7 +71,7 @@ class ForecastPlotter:
         try:
             import cartopy.crs as ccrs
             import cartopy.feature as cfeature
-            self.use_cartopy = False
+            self.use_cartopy = True
         except ImportError:
             logger.warning("Cartopy not available, using simple plotting")
             self.use_cartopy = False
@@ -93,24 +93,22 @@ class ForecastPlotter:
         """Create a custom colormap for radar reflectivity."""
         # Define reflectivity colors (similar to NWS radar) - expanded to match bounds
         colors = [
-            '#04e9e7',  # -10 to -5 dBZ
-            '#019ff4',  # -5 to 0 dBZ
-            '#0300f4',  # 0 to 5 dBZ
-            '#02fd02',  # 5 to 10 dBZ
-            '#01c501',  # 10 to 15 dBZ
-            '#008e00',  # 15 to 20 dBZ
-            '#fdf802',  # 20 to 25 dBZ
-            '#e5bc00',  # 25 to 30 dBZ
-            '#fd9500',  # 30 to 35 dBZ
-            '#fd0000',  # 35 to 40 dBZ
-            '#d40000',  # 40 to 45 dBZ
-            '#bc0000',  # 45 to 50 dBZ
-            '#f800fd',  # 50 to 55 dBZ
-            '#9854c6',  # 55 to 60 dBZ
-            '#663399',  # 60 to 65 dBZ - add new color
-            '#4d1a66'   # 65 to 70 dBZ - add new color
+            "#FFFFFF",  # White (no echo)
+            "#B0E2FF",  # Light Blue (weak echoes)
+            "#7EC0EE",
+            "#00FA9A",  # Green (light precipitation)
+            "#32CD32",
+            "#FFFF00",  # Yellow (moderate precipitation)
+            "#FFD700",
+            "#FFA500",  # Orange
+            "#FF4500",  # Red (heavy rain)
+            "#FF0000",
+            "#8B0000",  # Dark red (intense storms)
+            "#9400D3",  # Purple
+            "#8B008B",
+            "#4B0082",  # Deep purple (extreme storms)
         ]
-        bounds = np.arange(-10, 75, 5)  # [-10, -5, 0, 5, ..., 70, 75] = 17 bounds
+        bounds = np.arange(0, 70, 5)
         norm = mcolors.BoundaryNorm(bounds, len(colors))
         cmap = mcolors.ListedColormap(colors)
         return cmap, norm
@@ -139,6 +137,8 @@ class ForecastPlotter:
             ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
             ax.add_feature(cfeature.BORDERS, linewidth=0.5)
             ax.add_feature(cfeature.STATES, linewidth=0.3)
+
+            ax.gridlines(draw_labels=True)
         else:
             fig, ax = plt.subplots(figsize=self.config.figure_size)
         

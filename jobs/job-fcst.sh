@@ -20,4 +20,4 @@ hour=${4:-23}
 lead_hour=${5:-18}
 init_time="${year} ${month} ${day} ${hour}"
 
-python3 src/fcst.py $PWD/net-deterministic/model.keras ${init_time} ${lead_hour}
+python3 src/fcst.py $PWD/net-diffusion/model.keras ${init_time} ${lead_hour}

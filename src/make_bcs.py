@@ -40,7 +40,7 @@ class WeatherPreprocessConfig:
         self.sfc_vars = ["GFS-MSLET", "GFS-PRES", "GFS-PRMSL", "GFS-REFC"]
         
         # Pressure levels (hPa)
-        self.levels = [200, 500, 850, 1000]
+        self.levels = [250, 500, 850, 1000]
         
         # Grid downsampling factor (applied after HRRR interpolation)
         self.downsample_factor = 2
@@ -188,10 +188,11 @@ class GRIBPreprocessor:
                         hrrr_vals = self.interpolator.interpolate_to_hrrr_grid(gfs_vals, gfs_lats, gfs_lons)
                         
                         # Downsample the HRRR grid
-                        idx = v_idx * len(self.config.levels) + l_idx
+                        base_idx = 74
+                        idx = base_idx + v_idx * len(self.config.levels) + l_idx
                         
                         if idx < len(norms[0]):
-                            mean, std = norms[0, idx + 74], norms[1, idx + 74]
+                            mean, std = norms[0, idx], norms[1, idx]
                             raw_vals.append(hrrr_vals)
                             normalized_vals.append(self.normalize(hrrr_vals, mean, std))
                         else:
@@ -214,7 +215,7 @@ class GRIBPreprocessor:
             norms = xr.open_dataset(norm_file)['UGRD'].values
             
             # Mean/std for surface variables (assuming indices based on variable count)
-            base_idx = len(self.config.pl_vars) * len(self.config.levels)
+            base_idx = 74 + len(self.config.pl_vars) * len(self.config.levels)
             mslet_mean, mslet_std = norms[0, base_idx], norms[1, base_idx]
             pres_mean, pres_std = norms[0, base_idx + 1], norms[1, base_idx + 1]
             prmsl_mean, prmsl_std = norms[0, base_idx + 2], norms[1, base_idx + 2]

@@ -37,6 +37,7 @@ class WeatherPreprocessConfig:
         # Pressure level and surface variables
         self.pl_vars = ["UGRD", "VGRD", "VVEL", "TMP", "HGT", "SPFH"]
         self.sfc_vars = ["T2M", "REFC"]
+        self.consts = ["LAND", "OROG"]
         
         # Pressure levels (hPa)
         self.levels = [200, 300, 475, 800, 825, 850, 875, 900, 925, 950, 975, 1000]

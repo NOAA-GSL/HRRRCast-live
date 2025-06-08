@@ -29,6 +29,16 @@ try:
 except ImportError as e:
     logging.warning(f"Could not import custom modules: {e}")
 
+from diffusion_params import (
+    USE_DIFFUSION,
+    NUM_DIFFUSION_STEPS,
+    NUM_INFERENCE_STEPS,
+    INFERENCE_STEPS,
+    compute_epsilon,
+    ddpm,
+    ddim,
+)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -94,7 +104,7 @@ class PreprocessedDataLoader:
 
 class ForecastModel:
     """Handles model loading and inference."""
-    
+
     def __init__(self, model_path: str):
         self.model_path = model_path
         self.model = None
@@ -132,9 +142,10 @@ class ForecastModel:
 class WeatherForecaster:
     """Handles the forecasting pipeline."""
     
-    def __init__(self, data_loader: PreprocessedDataLoader):
-        self.data_loader = data_loader
-        self.metadata = data_loader.metadata
+    def __init__(self, data_loader_hrrr: PreprocessedDataLoader, data_loader_gfs: PreprocessedDataLoader):
+        self.data_loader_hrrr = data_loader_hrrr
+        self.data_loader_gfs = data_loader_gfs
+        self.metadata = data_loader_hrrr.metadata
     
     @staticmethod
     def denormalize(output: np.ndarray, norm_file: str) -> np.ndarray:
@@ -148,7 +159,25 @@ class WeatherForecaster:
             logger.error(f"Error in denormalization: {e}")
             raise
     
-    def autoregressive_rollout(self, initial_input: np.ndarray, model: ForecastModel, 
+    def predict(self, model: ForecastModel, current_input: np.ndarray):
+        if USE_DIFFUSION:
+            member=0
+            np.random.seed(member)
+            Xn = current_input[:, :, :, 102:176] 
+            Xn = np.random.normal(size=Xn.shape)
+            for t_ in tqdm(range(NUM_INFERENCE_STEPS - 1)):
+                ti = NUM_INFERENCE_STEPS - 1 - t_
+                t = INFERENCE_STEPS[ti]
+                current_input[:, :, :, -2] = t / NUM_DIFFUSION_STEPS
+                current_input[:, :, :, 102:176] = Xn
+                X0 = model.predict(current_input)
+                epsilon_t = compute_epsilon(Xn, X0, t)
+                Xn = ddim(Xn, epsilon_t, ti, seed=member)
+            return Xn
+        else:
+            return model.predict(current_input)
+
+    def autoregressive_rollout(self, initial_input: np.ndarray, forcing_input: np.ndarray, model: ForecastModel, 
                              target_hour: int) -> Tuple[Dict[int, np.ndarray], Dict[int, Dict]]:
         """Perform greedy autoregressive rollout."""
         logger.info(f"Starting autoregressive rollout for {target_hour} hours")
@@ -165,11 +194,20 @@ class WeatherForecaster:
             from_hour = ((hour - 1) // 6) * 6
             step = hour - from_hour
             
+            # setup ICs and BCs
             current_input[0, :, :, :74] = hourly_forecasts[from_hour]
+            current_input[0, :, :, 74:102] = forcing_input[hour, :, :, :]
             current_input[0, :, :, -1] = step / 6.0
             
-            output = model.predict(current_input)
-            hourly_forecasts[hour] = output[0]
+            # predict
+            output = self.predict(model, current_input)
+
+            # set to 0 negative REFC values
+            refc = output[..., -1]
+            refc = tf.where(refc < 0, tf.zeros_like(refc), refc)
+            output = tf.concat([output[...,:-1], tf.expand_dims(refc, axis=-1)], axis=-1)
+
+            hourly_forecasts[hour] = output
             history[hour] = {
                 'step': step,
                 'from': from_hour,
@@ -227,12 +265,27 @@ class WeatherForecaster:
         """Run the complete forecasting pipeline."""
         try:
             # Get preprocessed data
-            model_input = self.data_loader.get_model_input()
-            lats, lons = self.data_loader.get_coordinates()
-            init_datetime = self.data_loader.get_init_datetime()
-            
-            lead_channel = np.ones((1, model_input.shape[1], model_input.shape[2], 1))
-            model_input = np.concatenate([model_input, lead_channel], axis=-1)
+            model_input_hrrr = self.data_loader_hrrr.get_model_input()
+            model_input_gfs = self.data_loader_gfs.get_model_input()
+            lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
+            if USE_DIFFUSION:
+                rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 74))
+                step_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
+                model_input = np.concatenate([
+                    model_input_hrrr[:, :, :, :74],
+                    model_input_gfs[0:1, :, :, :],
+                    rand_channel,
+                    model_input_hrrr[:, :, :, 74:],
+                    step_channel, lead_channel], axis=-1)
+            else:
+                model_input = np.concatenate([
+                    model_input_hrrr[:, :, :, :74],
+                    model_input_gfs[0:1, :, :, :],
+                    model_input_hrrr[:, :, :, 74:],
+                    lead_channel], axis=-1)
+
+            lats, lons = self.data_loader_hrrr.get_coordinates()
+            init_datetime = self.data_loader_hrrr.get_init_datetime()
 
             logger.info(f"Running forecast for {init_datetime} with {lead_hours} hour lead time")
             logger.info(f"Model input shape: {model_input.shape}")
@@ -240,7 +293,7 @@ class WeatherForecaster:
             logger.info(self.metadata)
 
             # Run autoregressive forecast
-            hourly_forecasts, history = self.autoregressive_rollout(model_input, model, lead_hours)
+            hourly_forecasts, history = self.autoregressive_rollout(model_input, model_input_gfs, model, lead_hours)
             
             # Denormalize all outputs
             logger.info("Denormalizing outputs...")
@@ -296,13 +349,15 @@ def run_weather_forecast(model_path: str, init_year: str, init_month: str,
         # Load preprocessed data
         date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         hrrr_preprocessed_file = f"{base_dir}/{date_str}/hrrr_{date_str}.npz"
-        data_loader = PreprocessedDataLoader(hrrr_preprocessed_file)
+        gfs_preprocessed_file = f"{base_dir}/{date_str}/gfs_{date_str}.npz"
+        data_loader_hrrr = PreprocessedDataLoader(hrrr_preprocessed_file)
+        data_loader_gfs = PreprocessedDataLoader(gfs_preprocessed_file)
         
         # Load model
         model = ForecastModel(model_path)
         
         # Initialize forecaster
-        forecaster = WeatherForecaster(data_loader)
+        forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs)
         
         # Run forecast
         forecast_dataset, output_file = forecaster.run_forecast(model, lead_hours, output_dir)

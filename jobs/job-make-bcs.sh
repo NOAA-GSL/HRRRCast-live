@@ -19,4 +19,4 @@ lead_hour=${5:-18}
 init_time="${year} ${month} ${day} ${hour}"
 date_str="${year}${month}${day}_${hour}"
 
-python3 src/make_bcs.py net-deterministic-gfs/normalize.nc ${init_time} ${lead_hour} --hrrr_grid_file "${date_str}/hrrr_${date_str}_surface.grib2"
+python3 src/make_bcs.py net-diffusion/normalize.nc ${init_time} ${lead_hour} --hrrr_grid_file "${date_str}/hrrr_${date_str}_surface.grib2"
