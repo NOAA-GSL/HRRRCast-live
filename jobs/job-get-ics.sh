@@ -8,12 +8,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --time=00:10:00
 
-# virutal env
-#source /scratch3/BMC/gsd-hpcs/Daniel.Abdi/hrrrcast-live/env/bin/activate
-
 # conda
-source /scratch3/BMC/gsd-hpcs/Daniel.Abdi/miniconda3/etc/profile.d/conda.sh
-conda activate hrrrcast-live
+source etc/env.sh
 
 year=${1:-2024}
 month=${2:-05}

@@ -1,8 +1,32 @@
-Install the dependencies provided in environment.yaml using miniconda3
-and activate the environment
+HRRRCast installation
+=====================
+1. Environment is installed with conda. Installing miniconda3 is sufficient.
 
-    conda activate hrrrcast-live
+2. Installing the environment.yaml
 
+	a) If you have GPU or you want to install on a CPU machine
+	Install the dependencies provided in environment.yaml using miniconda3
+	and activate the environment
+	
+	    conda activate hrrrcast-live
+	
+	b) If you are on an HPC environment like Ursa where there is no internet connection
+	on compute node, we have to fake cuda availability on the login node.
+	
+	    ./install_env_ursa.sh
+
+3. After that edit the environment files in etc/ to your conda installation directory
+
+4. If you want plotting, make sure you download cartopy shape files
+
+5. There is a submit script ./sumbit_all.sh that you can use to run
+   forecasts from a given forecast intializaton time for upto certain lead hours
+
+       ./submit_all.sh 2024 05 06 23 6
+
+
+How to use trained models
+=========================
 You should then be able to load the models using something like
 
     tf.keras.models.load_model("model_97.keras", safe_mode=False)
