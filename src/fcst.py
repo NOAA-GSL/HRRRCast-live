@@ -159,23 +159,63 @@ class WeatherForecaster:
             logger.error(f"Error in denormalization: {e}")
             raise
     
-    def predict(self, model: ForecastModel, current_input: np.ndarray):
+    def predict(self, model: ForecastModel, X: tf.Tensor):
+        member = 0
         if USE_DIFFUSION:
-            member=0
-            np.random.seed(member)
-            Xn = current_input[:, :, :, 102:176] 
-            Xn = np.random.normal(size=Xn.shape)
+            num_output_channels = 74
+            start = 102
+            batch_size = 1
+
+            # start from complete gaussian noise
+            tf.random.set_seed(member)
+            Xn = tf.random.normal(
+                shape=tf.shape(X[0, :, :, start : start + num_output_channels])
+            )
+            Xn = tf.tile(tf.expand_dims(Xn, axis=0), [batch_size, 1, 1, 1])
+            X = tf.concat(
+                [
+                    X[:, :, :, :start],
+                    Xn,
+                    X[:, :, :, start + num_output_channels :],
+                ],
+                axis=-1,
+            )
+
+            # iterate over diffusion steps
             for t_ in tqdm(range(NUM_INFERENCE_STEPS - 1)):
                 ti = NUM_INFERENCE_STEPS - 1 - t_
                 t = INFERENCE_STEPS[ti]
-                current_input[:, :, :, -2] = t / NUM_DIFFUSION_STEPS
-                current_input[:, :, :, 102:176] = Xn
-                X0 = model.predict(current_input)
-                epsilon_t = compute_epsilon(Xn, X0, t)
+                # set the correct time embedding
+                X = tf.concat(
+                    [
+                        X[:, :, :, :-2],
+                        tf.fill(
+                            tf.concat([tf.shape(X)[:-1], [1]], axis=0),
+                            t / NUM_DIFFUSION_STEPS,
+                        ),
+                        X[:, :, :, -1:],
+                    ],
+                    axis=-1,
+                )
+
+                # predict total noise
+                x_0 = model.predict(X)
+                epsilon_t = compute_epsilon(Xn, x_0, t)
+
                 Xn = ddim(Xn, epsilon_t, ti, seed=member)
+                X = tf.concat(
+                    [
+                        X[:, :, :, :start],
+                        Xn,
+                        X[:, :, :, start + num_output_channels :],
+                    ],
+                    axis=-1,
+                )
+
             return Xn
         else:
-            return model.predict(current_input)
+            return model.predict(X)
+
 
     def autoregressive_rollout(self, initial_input: np.ndarray, forcing_input: np.ndarray, model: ForecastModel, 
                              target_hour: int) -> Tuple[Dict[int, np.ndarray], Dict[int, Dict]]:
@@ -183,10 +223,10 @@ class WeatherForecaster:
         logger.info(f"Starting autoregressive rollout for {target_hour} hours")
         
         # Initial input (updated during rollout)
-        current_input = initial_input.copy()
+        X = tf.convert_to_tensor(initial_input, dtype=tf.float32)
         
         # Stores forecasts and history
-        hourly_forecasts = {0: current_input[0, :, :, :74].copy()}
+        hourly_forecasts = {0: tf.identity(X[0:1, :, :, :74])}
         history = {0: {'step': 0, 'from': None}}
         
         # Process all hourly steps
@@ -195,19 +235,28 @@ class WeatherForecaster:
             step = hour - from_hour
             
             # setup ICs and BCs
-            current_input[0, :, :, :74] = hourly_forecasts[from_hour]
-            current_input[0, :, :, 74:102] = forcing_input[hour, :, :, :]
-            current_input[0, :, :, -1] = step / 6.0
+            X = tf.concat(
+                [
+                    hourly_forecasts[from_hour],
+                    forcing_input[hour:hour+1, :, :, :],
+                    X[:, :, :, 102:-1],
+                    tf.fill(
+                        tf.concat([tf.shape(X)[:-1], [1]], axis=0),
+                        step / 6.0,
+                    ),
+                ],
+                axis=-1,
+            )
             
             # predict
-            output = self.predict(model, current_input)
+            y = self.predict(model, X)
 
             # set to 0 negative REFC values
-            refc = output[..., -1]
+            refc = y[..., -1]
             refc = tf.where(refc < 0, tf.zeros_like(refc), refc)
-            output = tf.concat([output[...,:-1], tf.expand_dims(refc, axis=-1)], axis=-1)
+            y = tf.concat([y[...,:-1], tf.expand_dims(refc, axis=-1)], axis=-1)
 
-            hourly_forecasts[hour] = output
+            hourly_forecasts[hour] = y
             history[hour] = {
                 'step': step,
                 'from': from_hour,
