@@ -91,8 +91,8 @@ class GridInterpolator:
 
         self.config.hrrr_lats, self.config.hrrr_lons = lats_ds, lons_ds
         self.hrrr_ds = xr.Dataset({
-            "lat": ("y", lats_ds[:, 0]),
-            "lon": ("x", lons_ds[0, :])
+            "lat": (("y", "x"), lats_ds),
+            "lon": (("y", "x"), lons_ds)
         })
         self.hrrr_coords_loaded = True
         return lats_ds, lons_ds
