@@ -150,7 +150,7 @@ class ForecastPlotter:
             im = ax.contourf(lons, lats, data, levels=20, cmap=cmap, extend='both')
         
         # Add colorbar
-        cbar = plt.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
+        cbar = plt.colorbar(im, ax=ax, shrink=0.5, pad=0.02)
         cbar.set_label(f'{long_name} ({units})', fontsize=10)
         
         # Set title
@@ -308,7 +308,7 @@ class ForecastPlotter:
                     im = axes[i].contourf(lons, lats, data, levels=20, cmap=cmap, extend='both')
                 
                 # Add colorbar
-                plt.colorbar(im, ax=axes[i], shrink=0.8)
+                plt.colorbar(im, ax=axes[i], shrink=0.4)
                 
                 # Set title
                 axes[i].set_title(f"{title}\nForecast: {timestamp_str} + {lead_hour}h", 
