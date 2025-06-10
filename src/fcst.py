@@ -142,10 +142,11 @@ class ForecastModel:
 class WeatherForecaster:
     """Handles the forecasting pipeline."""
     
-    def __init__(self, data_loader_hrrr: PreprocessedDataLoader, data_loader_gfs: PreprocessedDataLoader):
+    def __init__(self, data_loader_hrrr: PreprocessedDataLoader, data_loader_gfs: PreprocessedDataLoader, member: int):
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
         self.metadata = data_loader_hrrr.metadata
+        self.member = member
     
     @staticmethod
     def denormalize(output: np.ndarray, norm_file: str) -> np.ndarray:
@@ -160,14 +161,13 @@ class WeatherForecaster:
             raise
     
     def predict(self, model: ForecastModel, X: tf.Tensor):
-        member = 0
         if USE_DIFFUSION:
             num_output_channels = 74
             start = 102
             batch_size = 1
 
             # start from complete gaussian noise
-            tf.random.set_seed(member)
+            tf.random.set_seed(self.member)
             Xn = tf.random.normal(
                 shape=tf.shape(X[0, :, :, start : start + num_output_channels])
             )
@@ -202,7 +202,7 @@ class WeatherForecaster:
                 x_0 = model.predict(X)
                 epsilon_t = compute_epsilon(Xn, x_0, t)
 
-                Xn = ddim(Xn, epsilon_t, ti, seed=member)
+                Xn = ddim(Xn, epsilon_t, ti, seed=self.member)
                 X = tf.concat(
                     [
                         X[:, :, :, :start],
@@ -378,7 +378,7 @@ class WeatherForecaster:
             date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
             Path(f"{output_dir}/{date_str}").mkdir(parents=True, exist_ok=True)
             
-            output_file = f"{output_dir}/{date_str}/hrrrcast_{date_str}.nc"
+            output_file = f"{output_dir}/{date_str}/hrrrcast_{date_str}_mem{self.member}.nc"
             logger.info(f"Saving forecast to {output_file}")
             outdata_xr.to_netcdf(output_file)
             
@@ -392,7 +392,7 @@ class WeatherForecaster:
 
 def run_weather_forecast(model_path: str, init_year: str, init_month: str,
                         init_day: str, init_hh: str, lead_hours: int,
-                        base_dir: str = "./", output_dir: str = "./"):
+                        member: int, base_dir: str = "./", output_dir: str = "./"):
     """Main forecasting function."""
     try:
         # Load preprocessed data
@@ -406,7 +406,7 @@ def run_weather_forecast(model_path: str, init_year: str, init_month: str,
         model = ForecastModel(model_path)
         
         # Initialize forecaster
-        forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs)
+        forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member)
         
         # Run forecast
         forecast_dataset, output_file = forecaster.run_forecast(model, lead_hours, output_dir)
@@ -431,6 +431,7 @@ def parse_arguments():
     parser.add_argument("init_day", help="Initialization day (DD)")
     parser.add_argument("init_hh", help="Initialization hour (HH)")
     parser.add_argument("lead_hours", type=int, help="Lead time in hours")
+    parser.add_argument("member", type=int, default=0, help="Ensemble member ID (0...N)")
     parser.add_argument("--base_dir", default="./", help="Base directory for input preprocessed files")
     parser.add_argument("--output_dir", default="./", help="Output directory for forecast files")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -455,6 +456,7 @@ def main():
             init_day=args.init_day,
             init_hh=args.init_hh,
             lead_hours=args.lead_hours,
+            member=args.member,
             base_dir=args.base_dir,
             output_dir=args.output_dir
         )

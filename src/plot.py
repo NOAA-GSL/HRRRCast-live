@@ -330,8 +330,8 @@ class ForecastPlotter:
 
 
 def plot_forecast_data(init_year: str, init_month: str, init_day: str, 
-                      init_hh: str, lead_hour: str, forecast_dir: str = "./", 
-                      output_dir: str = "./"):
+                      init_hh: str, lead_hour: str, member: int,
+                      forecast_dir: str = "./", output_dir: str = "./"):
     """Main plotting function."""
     try:
         # Validate inputs
@@ -346,11 +346,11 @@ def plot_forecast_data(init_year: str, init_month: str, init_day: str,
         logger.info(f"Valid time: {valid_datetime}")
         
         # Setup paths
-        forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_{date_str}.nc"
+        forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_{date_str}_mem{member}.nc"
         
         # Create output directory
         timestamp_str = f"{init_year}-{init_month}-{init_day} {init_hh}:00 UTC"
-        output_subdir = f"{output_dir}/{date_str}/{date_str}_lead{lead_hour_int:02d}h"
+        output_subdir = f"{output_dir}/{date_str}/{date_str}_mem{member}_lead{lead_hour_int:02d}h"
         Path(output_subdir).mkdir(parents=True, exist_ok=True)
         
         # Validate forecast file exists
@@ -395,6 +395,7 @@ def parse_arguments():
     parser.add_argument("init_day", help="Initialization day (DD)")
     parser.add_argument("init_hh", help="Initialization hour (HH)")
     parser.add_argument("lead_hour", help="Lead hour for forecast (0, 1, 2, ...)")
+    parser.add_argument("member", type=int, default=0, help="Ensemble member ID (0...N)")
     parser.add_argument("--forecast_dir", default="./", help="Directory containing forecast files")
     parser.add_argument("--output_dir", default="./", help="Output directory for plots")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -418,6 +419,7 @@ def main():
             init_day=args.init_day,
             init_hh=args.init_hh,
             lead_hour=args.lead_hour,
+            member=args.member,
             forecast_dir=args.forecast_dir,
             output_dir=args.output_dir
         )

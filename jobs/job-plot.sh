@@ -16,6 +16,7 @@ month=${2:-05}
 day=${3:-06}
 hour=${4:-23}
 lead_hour=${5:-18}
+member=${6:-0}
 init_time="${year} ${month} ${day} ${hour}"
 
-python3 src/plot.py ${init_time} ${lead_hour}
+python3 src/plot.py ${init_time} ${lead_hour} ${member}
