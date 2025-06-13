@@ -35,11 +35,11 @@ echo "Submitted job: $jobid4"
 
 # run two ensemble members
 for MEMBER in {0..1}; do
-    atparse < jobs/job-fcst.sh > logs/job-fcsts.sh
-    jobid5=$(submit_with_check sbatch --dependency=afterok:$jobid3:$jobid4 --parsable logs/job-fcst.sh)
+    atparse < jobs/job-fcst.sh > logs/job-fcst-${MEMBER}.sh
+    jobid5=$(submit_with_check sbatch --dependency=afterok:$jobid3:$jobid4 --parsable logs/job-fcst-${MEMBER}.sh)
     echo "Submitted job: $jobid5"
 
-    atparse < jobs/job-plot.sh > logs/job-plot.sh
-    jobid6=$(submit_with_check sbatch --dependency=afterok:$jobid5 --parsable logs/job-plot.sh)
+    atparse < jobs/job-plot.sh > logs/job-plot-${MEMBER}.sh
+    jobid6=$(submit_with_check sbatch --dependency=afterok:$jobid5 --parsable logs/job-plot-${MEMBER}.sh)
     echo "Submitted job: $jobid6"
 done
