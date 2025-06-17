@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from dateutil import parser
 from pathlib import Path
 from typing import List, Tuple
 import requests
@@ -50,20 +51,21 @@ def setup_logging(log_level: str = 'INFO') -> logging.Logger:
 # -------------------------------
 # Utility Functions
 # -------------------------------
-def validate_datetime(year: str, month: str, day: str, hour: str) -> Tuple[str, str, str, str]:
-    """Validate and format datetime components."""
+def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
+    """Validate and format any datetime string that Python can parse."""
     try:
-        # Pad with zeros if necessary
-        year = year.zfill(4)
-        month = month.zfill(2)
-        day = day.zfill(2)
-        hour = hour.zfill(2)
+        # Parse the datetime string using dateutil parser (very flexible)
+        dt = parser.parse(datetime_str)
         
-        # Validate the date
-        datetime(int(year), int(month), int(day), int(hour))
+        # Format components with proper padding
+        year = f"{dt.year:04d}"
+        month = f"{dt.month:02d}"
+        day = f"{dt.day:02d}"
+        hour = f"{dt.hour:02d}"
         
-        return year, month, day, hour
-    except ValueError as e:
+        return dt, year, month, day, hour
+        
+    except (ValueError, TypeError, parser.ParserError) as e:
         raise ValueError(f"Invalid date/time: {e}")
 
 def create_output_directory(base_dir: str, date_str: str) -> Path:
@@ -161,12 +163,12 @@ def download_hrrr_files(year: str, month: str, day: str, hour: str, output_dir: 
 # -------------------------------
 # Main Functions
 # -------------------------------
-def download_hrrr_data(year: str, month: str, day: str, hour: str, base_dir: str = "./") -> dict:
+def download_hrrr_data(datetime_str: str, base_dir: str = "./") -> dict:
     """Download HRRR initial condition data for specified date and time."""
     logger = logging.getLogger(__name__)
     
     # Validate inputs
-    year, month, day, hour = validate_datetime(year, month, day, hour)
+    init_datetime, year, month, day, hour = validate_datetime(datetime_str)
     date_str = f"{year}{month}{day}_{hour}"
     
     # Create output directory
@@ -192,16 +194,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python get_ics.py 2024 01 15 12
-  python get_ics.py 2024 1 15 12 --base-dir /data/weather
-  python get_ics.py 2024 01 15 12 --log-level DEBUG
+  python get_ics.py 2024-01-15T12
+  python get_ics.py 2024-01-15T12 --base-dir /data/weather
+  python get_ics.py 2024-01-15T12 --log-level DEBUG
         """
     )
     
-    parser.add_argument('year', help='Year (e.g., 2024)')
-    parser.add_argument('month', help='Month (1-12)')
-    parser.add_argument('day', help='Day (1-31)')
-    parser.add_argument('hour', help='Hour (0-23)')
+    parser.add_argument('inittime',
+                       help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument('--base-dir', default='./', help='Base directory for downloads (default: ./)')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        help='Set logging level (default: INFO)')
@@ -214,7 +214,7 @@ Examples:
     try:
         # Download HRRR data
         results = download_hrrr_data(
-            args.year, args.month, args.day, args.hour, args.base_dir
+            args.inittime, args.base_dir
         )
         
         # Summary

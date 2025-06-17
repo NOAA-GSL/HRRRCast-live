@@ -58,12 +58,12 @@ This script handles CUDA availability simulation on login nodes.
 Use the provided submission script to run forecasts:
 
 ```bash
-./submit_all.sh <YEAR> <MONTH> <DAY> <HOUR> <LEAD_HOURS>
+./submit_all.sh <YYYY-MM-DDTHH> <LEAD_HOURS>
 ```
 
 **Example**: Run a 6-hour forecast starting from May 6, 2024 at 23:00 UTC:
 ```bash
-./submit_all.sh 2024 05 06 23 6
+./submit_all.sh 2024-05-06T23 6
 ```
 
 ## Model Usage

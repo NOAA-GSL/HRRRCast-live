@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
+from dateutil import parser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -329,17 +330,35 @@ class ForecastPlotter:
             logger.error(f"Error creating summary plot: {e}")
 
 
-def plot_forecast_data(init_year: str, init_month: str, init_day: str, 
-                      init_hh: str, lead_hour: str, member: int,
+def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
+    """Validate and format any datetime string that Python can parse."""
+    try:
+        # Parse the datetime string using dateutil parser (very flexible)
+        dt = parser.parse(datetime_str)
+        
+        # Format components with proper padding
+        year = f"{dt.year:04d}"
+        month = f"{dt.month:02d}"
+        day = f"{dt.day:02d}"
+        hour = f"{dt.hour:02d}"
+        
+        return dt, year, month, day, hour
+        
+    except (ValueError, TypeError, parser.ParserError) as e:
+        raise ValueError(f"Invalid date/time: {e}")
+
+
+def plot_forecast_data(datetime_str: str,
+                      lead_hour: str, member: int,
                       forecast_dir: str = "./", output_dir: str = "./"):
     """Main plotting function."""
     try:
         # Validate inputs
+        init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         lead_hour_int = int(lead_hour)
         
         # Calculate forecast valid time
-        init_datetime = datetime.strptime(date_str, "%Y%m%d_%H")
         valid_datetime = init_datetime + timedelta(hours=lead_hour_int)
         
         logger.info(f"Plotting forecast data for {init_datetime} + {lead_hour_int}h")
@@ -390,10 +409,8 @@ def parse_arguments():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    parser.add_argument("init_year", help="Initialization year (YYYY)")
-    parser.add_argument("init_month", help="Initialization month (MM)")
-    parser.add_argument("init_day", help="Initialization day (DD)")
-    parser.add_argument("init_hh", help="Initialization hour (HH)")
+    parser.add_argument('inittime',
+                       help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hour", help="Lead hour for forecast (0, 1, 2, ...)")
     parser.add_argument("member", type=int, default=0, help="Ensemble member ID (0...N)")
     parser.add_argument("--forecast_dir", default="./", help="Directory containing forecast files")
@@ -414,10 +431,7 @@ def main():
         
         # Run plotting
         plot_forecast_data(
-            init_year=args.init_year,
-            init_month=args.init_month,
-            init_day=args.init_day,
-            init_hh=args.init_hh,
+            datetime_str=args.inittime,
             lead_hour=args.lead_hour,
             member=args.member,
             forecast_dir=args.forecast_dir,
