@@ -20,5 +20,5 @@ month=`echo $init_time |cut -c6-7`
 day=`echo $init_time |cut -c9-10`
 hour=`echo $init_time |cut -c12-13`
 
-+echo "In get_ics, init_time=$init_time, year/month/day/hour/,${year} ${month} ${day} ${hour}"
+echo "In plot, init_time=${init_time}, year/month/day/hour/=${year} ${month} ${day} ${hour}, lead_hour=${lead_hour}, member=${member}"
 python3 src/plot.py ${init_time} ${lead_hour} ${member}

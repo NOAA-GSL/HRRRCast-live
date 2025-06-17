@@ -22,5 +22,5 @@ month=`echo $init_time |cut -c6-7`
 day=`echo $init_time |cut -c9-10`
 hour=`echo $init_time |cut -c12-13`
 
-echo " in fcst, init_time=$init_time, year/month/day/hour/,${year} ${month} ${day} ${hour}, lead_hour=$lead_hour, member=$member"
+echo "In fcst, init_time=${init_time}, year/month/day/hour/=${year} ${month} ${day} ${hour}, lead_hour=${lead_hour}, member=${member}"
 python3 src/fcst.py $PWD/net-diffusion/model.keras ${init_time} ${lead_hour} ${member}

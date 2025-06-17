@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
+from dateutil import parser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -337,20 +338,39 @@ class GRIBPreprocessor:
             raise
 
 
-def preprocess_grib_data(norm_file: str, init_year: str, init_month: str, 
-                        init_day: str, init_hh: str, lead_hours: str,
+def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
+    """Validate and format any datetime string that Python can parse."""
+    try:
+        # Parse the datetime string using dateutil parser (very flexible)
+        dt = parser.parse(datetime_str)
+        
+        # Format components with proper padding
+        year = f"{dt.year:04d}"
+        month = f"{dt.month:02d}"
+        day = f"{dt.day:02d}"
+        hour = f"{dt.hour:02d}"
+        
+        return dt, year, month, day, hour
+        
+    except (ValueError, TypeError, parser.ParserError) as e:
+        raise ValueError(f"Invalid date/time: {e}")
+
+
+
+def preprocess_grib_data(norm_file: str, datetime_str: str,
+                        lead_hours: str,
                         base_dir: str = "./", output_dir: str = "./", 
                         hrrr_grid_file: Optional[str] = None):
     """Main preprocessing function for GFS data with HRRR grid interpolation - processes all lead times from separate files."""
     try:
         # Validate inputs
-        init_datetime = datetime.strptime(f"{init_year}{init_month}{init_day}_{init_hh}", "%Y%m%d_%H")
         max_lead_time = int(lead_hours)
-        logger.info(f"Preprocessing GFS data initialized at {init_datetime} with lead times 0 to {max_lead_time}h")
+        logger.info(f"Preprocessing GFS data initialized at {datetime_str} with lead times 0 to {max_lead_time}h")
         logger.info("Data will be interpolated to HRRR grid before downsampling")
         logger.info("Reading from separate GRIB files for each lead time based on valid time")
         
         # Setup paths
+        init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         
         # Create output directory if it doesn't exist
@@ -441,10 +461,8 @@ def parse_arguments():
     )
     
     parser.add_argument("norm_file", help="Path to the normalization file")
-    parser.add_argument("init_year", help="Initialization year (YYYY)")
-    parser.add_argument("init_month", help="Initialization month (MM)")
-    parser.add_argument("init_day", help="Initialization day (DD)")
-    parser.add_argument("init_hh", help="Initialization hour (HH)")
+    parser.add_argument('inittime',
+                       help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hours", help="Maximum lead time in hours (will process 0 to lead_hours)")
     parser.add_argument("--base_dir", default="./", help="Base directory for input GRIB files")
     parser.add_argument("--output_dir", default="./", help="Output directory for preprocessed data")
@@ -466,10 +484,7 @@ def main():
         # Run preprocessing
         output_file = preprocess_grib_data(
             norm_file=args.norm_file,
-            init_year=args.init_year,
-            init_month=args.init_month,
-            init_day=args.init_day,
-            init_hh=args.init_hh,
+            datetime_str=args.inittime,
             lead_hours=args.lead_hours,
             base_dir=args.base_dir,
             output_dir=args.output_dir,

@@ -20,4 +20,5 @@ day=`echo $init_time |cut -c9-10`
 hour=`echo $init_time |cut -c12-13`
 date_str="${year}${month}${day}_${hour}"
 
+echo "In make_bcs, init_time=${init_time}, year/month/day/hour/,${year} ${month} ${day} ${hour}, lead_hour=${lead_hour}"
 python3 src/make_bcs.py net-diffusion/normalize.nc ${init_time} ${lead_hour} --hrrr_grid_file "${date_str}/hrrr_${date_str}_surface.grib2"

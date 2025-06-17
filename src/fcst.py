@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
+from dateutil import parser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -390,12 +391,31 @@ class WeatherForecaster:
             raise
 
 
-def run_weather_forecast(model_path: str, init_year: str, init_month: str,
-                        init_day: str, init_hh: str, lead_hours: int,
+def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
+    """Validate and format any datetime string that Python can parse."""
+    try:
+        # Parse the datetime string using dateutil parser (very flexible)
+        dt = parser.parse(datetime_str)
+        
+        # Format components with proper padding
+        year = f"{dt.year:04d}"
+        month = f"{dt.month:02d}"
+        day = f"{dt.day:02d}"
+        hour = f"{dt.hour:02d}"
+        
+        return dt, year, month, day, hour
+        
+    except (ValueError, TypeError, parser.ParserError) as e:
+        raise ValueError(f"Invalid date/time: {e}")
+
+
+def run_weather_forecast(model_path: str, datetime_str: str,
+                        lead_hours: int,
                         member: int, base_dir: str = "./", output_dir: str = "./"):
     """Main forecasting function."""
     try:
         # Load preprocessed data
+        init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         hrrr_preprocessed_file = f"{base_dir}/{date_str}/hrrr_{date_str}.npz"
         gfs_preprocessed_file = f"{base_dir}/{date_str}/gfs_{date_str}.npz"
@@ -426,10 +446,8 @@ def parse_arguments():
     )
     
     parser.add_argument("model_path", help="Path to the trained model")
-    parser.add_argument("init_year", help="Initialization year (YYYY)")
-    parser.add_argument("init_month", help="Initialization month (MM)")
-    parser.add_argument("init_day", help="Initialization day (DD)")
-    parser.add_argument("init_hh", help="Initialization hour (HH)")
+    parser.add_argument('inittime',
+                       help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hours", type=int, help="Lead time in hours")
     parser.add_argument("member", type=int, default=0, help="Ensemble member ID (0...N)")
     parser.add_argument("--base_dir", default="./", help="Base directory for input preprocessed files")
@@ -451,10 +469,7 @@ def main():
         # Run forecast
         forecast_dataset, output_file = run_weather_forecast(
             model_path=args.model_path,
-            init_year=args.init_year,
-            init_month=args.init_month,
-            init_day=args.init_day,
-            init_hh=args.init_hh,
+            datetime_str=args.inittime,
             lead_hours=args.lead_hours,
             member=args.member,
             base_dir=args.base_dir,

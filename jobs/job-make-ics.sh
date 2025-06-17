@@ -19,4 +19,5 @@ day=`echo $init_time |cut -c9-10`
 hour=`echo $init_time |cut -c12-13`
 
 # make ics
+echo "In make_ics, init_time=${init_time}, year/month/day/hour/,${year} ${month} ${day} ${hour}"
 python3 src/make_ics.py net-diffusion/normalize.nc ${init_time}

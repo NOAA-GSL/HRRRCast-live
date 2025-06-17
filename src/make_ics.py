@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from dateutil import parser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -178,16 +179,33 @@ class GRIBPreprocessor:
             raise
 
 
-def preprocess_grib_data(norm_file: str, init_year: str, init_month: str, 
-                        init_day: str, init_hh: str, base_dir: str = "./", 
-                        output_dir: str = "./"):
+def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
+    """Validate and format any datetime string that Python can parse."""
+    try:
+        # Parse the datetime string using dateutil parser (very flexible)
+        dt = parser.parse(datetime_str)
+        
+        # Format components with proper padding
+        year = f"{dt.year:04d}"
+        month = f"{dt.month:02d}"
+        day = f"{dt.day:02d}"
+        hour = f"{dt.hour:02d}"
+        
+        return dt, year, month, day, hour
+        
+    except (ValueError, TypeError, parser.ParserError) as e:
+        raise ValueError(f"Invalid date/time: {e}")
+
+
+def preprocess_grib_data(norm_file: str, datetime_str: str,
+                        base_dir: str = "./", output_dir: str = "./"):
     """Main preprocessing function."""
     try:
         # Validate inputs
-        init_datetime = datetime.strptime(f"{init_year}{init_month}{init_day}_{init_hh}", "%Y%m%d_%H")
-        logger.info(f"Preprocessing GRIB data for {init_datetime}")
+        logger.info(f"Preprocessing GRIB data for {datetime_str}")
         
         # Setup paths
+        init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         hrrr_pres_file = f"{base_dir}/{date_str}/hrrr_{date_str}_pressure.grib2"
         hrrr_sfc_file = f"{base_dir}/{date_str}/hrrr_{date_str}_surface.grib2"
@@ -254,10 +272,8 @@ def parse_arguments():
     )
     
     parser.add_argument("norm_file", help="Path to the normalization file")
-    parser.add_argument("init_year", help="Initialization year (YYYY)")
-    parser.add_argument("init_month", help="Initialization month (MM)")
-    parser.add_argument("init_day", help="Initialization day (DD)")
-    parser.add_argument("init_hh", help="Initialization hour (HH)")
+    parser.add_argument('inittime',
+                       help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("--base_dir", default="./", help="Base directory for input GRIB files")
     parser.add_argument("--output_dir", default="./", help="Output directory for preprocessed data")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -277,10 +293,7 @@ def main():
         # Run preprocessing
         output_file = preprocess_grib_data(
             norm_file=args.norm_file,
-            init_year=args.init_year,
-            init_month=args.init_month,
-            init_day=args.init_day,
-            init_hh=args.init_hh,
+            datetime_str=args.inittime,
             base_dir=args.base_dir,
             output_dir=args.output_dir
         )
