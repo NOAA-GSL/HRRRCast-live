@@ -2,7 +2,6 @@
 
 INIT_TIME=${1:-"2024 05 06 23"}
 LEAD_HOUR=${2:-18}
-MEMBER=${3:-6}
 ACCNR=${ACCNR:-gsd-hpcs}
 
 submit_with_check() {
