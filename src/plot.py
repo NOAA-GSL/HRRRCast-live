@@ -349,7 +349,7 @@ def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
 
 
 def plot_forecast_data(datetime_str: str,
-                      lead_hour: str, member: int,
+                      lead_hour: str, member: str,
                       forecast_dir: str = "./", output_dir: str = "./"):
     """Main plotting function."""
     try:
@@ -412,7 +412,7 @@ def parse_arguments():
     parser.add_argument('inittime',
                        help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hour", help="Lead hour for forecast (0, 1, 2, ...)")
-    parser.add_argument("member", type=int, default=0, help="Ensemble member ID (0...N)")
+    parser.add_argument("member",  help="Member identifier mem0, mem1 etc... or pmm")
     parser.add_argument("--forecast_dir", default="./", help="Directory containing forecast files")
     parser.add_argument("--output_dir", default="./", help="Output directory for plots")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
