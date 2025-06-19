@@ -1,6 +1,6 @@
 #!/bin/bash
 
-INIT_TIME=${1:-"2024 05 06 23"}
+INIT_TIME=${1:-"2024-05-06T23"}
 LEAD_HOUR=${2:-18}
 ACCNR=${ACCNR:-gsd-hpcs}
 
@@ -33,12 +33,25 @@ jobid4=$(submit_with_check sbatch --dependency=afterok:$jobid2 --parsable logs/j
 echo "Submitted job: $jobid4"
 
 # run two ensemble members
-for MEMBER in {0..1}; do
+jobids=()
+for MEMBER in {0..2}; do
     atparse < jobs/job-fcst.sh > logs/job-fcst-${MEMBER}.sh
     jobid5=$(submit_with_check sbatch --dependency=afterok:$jobid3:$jobid4 --parsable logs/job-fcst-${MEMBER}.sh)
+    jobids+=($jobid5)
     echo "Submitted job: $jobid5"
 
     atparse < jobs/job-plot.sh > logs/job-plot-${MEMBER}.sh
     jobid6=$(submit_with_check sbatch --dependency=afterok:$jobid5 --parsable logs/job-plot-${MEMBER}.sh)
     echo "Submitted job: $jobid6"
 done
+
+# ensemble PMM
+MEMBER="_mean"
+
+atparse < jobs/job-compute-pmm.sh > logs/job-compute-pmm.sh
+jobid7=$(submit_with_check sbatch --dependency=afterok:$(IFS=:; echo "${jobids[*]}") --parsable logs/job-compute-pmm.sh)
+echo "Submitted job: $jobid7"
+
+atparse < jobs/job-plot.sh > logs/job-plot-mean.sh
+jobid8=$(submit_with_check sbatch --dependency=afterok:$jobid7 --parsable logs/job-plot-mean.sh)
+echo "Submitted job: $jobid8"
