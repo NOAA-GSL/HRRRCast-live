@@ -31,7 +31,6 @@ except ImportError as e:
     logging.warning(f"Could not import custom modules: {e}")
 
 from diffusion_params import (
-    USE_DIFFUSION,
     NUM_DIFFUSION_STEPS,
     NUM_INFERENCE_STEPS,
     INFERENCE_STEPS,
@@ -143,11 +142,12 @@ class ForecastModel:
 class WeatherForecaster:
     """Handles the forecasting pipeline."""
     
-    def __init__(self, data_loader_hrrr: PreprocessedDataLoader, data_loader_gfs: PreprocessedDataLoader, member: int):
+    def __init__(self, data_loader_hrrr: PreprocessedDataLoader, data_loader_gfs: PreprocessedDataLoader, member: int, use_diffusion: bool):
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
         self.metadata = data_loader_hrrr.metadata
         self.member = member
+        self.use_diffusion = use_diffusion
     
     @staticmethod
     def denormalize(output: np.ndarray, norm_file: str) -> np.ndarray:
@@ -162,7 +162,7 @@ class WeatherForecaster:
             raise
     
     def predict(self, model: ForecastModel, X: tf.Tensor):
-        if USE_DIFFUSION:
+        if self.use_diffusion:
             num_output_channels = 74
             start = 102
             batch_size = 1
@@ -318,7 +318,7 @@ class WeatherForecaster:
             model_input_hrrr = self.data_loader_hrrr.get_model_input()
             model_input_gfs = self.data_loader_gfs.get_model_input()
             lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
-            if USE_DIFFUSION:
+            if self.use_diffusion:
                 rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 74))
                 step_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
                 model_input = np.concatenate([
@@ -411,7 +411,7 @@ def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
 
 def run_weather_forecast(model_path: str, datetime_str: str,
                         lead_hours: int,
-                        member: int, base_dir: str = "./", output_dir: str = "./"):
+                        member: int, base_dir: str = "./", output_dir: str = "./", use_diffusion = True):
     """Main forecasting function."""
     try:
         # Load preprocessed data
@@ -426,7 +426,7 @@ def run_weather_forecast(model_path: str, datetime_str: str,
         model = ForecastModel(model_path)
         
         # Initialize forecaster
-        forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member)
+        forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member, use_diffusion)
         
         # Run forecast
         forecast_dataset, output_file = forecaster.run_forecast(model, lead_hours, output_dir)
@@ -450,6 +450,7 @@ def parse_arguments():
                        help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hours", type=int, help="Lead time in hours")
     parser.add_argument("member", type=int, default=0, help="Ensemble member ID (0...N)")
+    parser.add_argument("--no_diffusion", default=False, action="store_true", help="Turn off diffusion")
     parser.add_argument("--base_dir", default="./", help="Base directory for input preprocessed files")
     parser.add_argument("--output_dir", default="./", help="Output directory for forecast files")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -473,7 +474,8 @@ def main():
             lead_hours=args.lead_hours,
             member=args.member,
             base_dir=args.base_dir,
-            output_dir=args.output_dir
+            output_dir=args.output_dir,
+            use_diffusion=not args.no_diffusion
         )
         
         logger.info(f"Forecast complete. Output saved to: {output_file}")

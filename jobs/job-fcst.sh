@@ -17,10 +17,15 @@ source etc/env.sh
 init_time="@[INIT_TIME]"
 lead_hour=@[LEAD_HOUR]
 member=@[MEMBER]
+use_diffusion=@[USE_DIFFUSION]
 year=`echo $init_time |cut -c1-4`
 month=`echo $init_time |cut -c6-7`
 day=`echo $init_time |cut -c9-10`
 hour=`echo $init_time |cut -c12-13`
 
-echo "In fcst, init_time=${init_time}, year/month/day/hour/=${year} ${month} ${day} ${hour}, lead_hour=${lead_hour}, member=${member}"
-python3 src/fcst.py $PWD/net-diffusion/model.keras ${init_time} ${lead_hour} ${member}
+echo "In fcst, init_time=${init_time}, year/month/day/hour/=${year} ${month} ${day} ${hour}, lead_hour=${lead_hour}, member=${member}, use_diffusion=${use_diffusion}"
+if [ $use_diffusion -eq 0 ]; then
+    python3 src/fcst.py $PWD/net-deterministic/model.keras ${init_time} ${lead_hour} ${member} --no_diffusion
+else
+    python3 src/fcst.py $PWD/net-diffusion/model.keras ${init_time} ${lead_hour} ${member}
+fi
