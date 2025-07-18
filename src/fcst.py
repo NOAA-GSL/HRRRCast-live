@@ -14,7 +14,6 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
-from dateutil import parser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -22,6 +21,8 @@ import numpy as np
 import tensorflow as tf
 import xarray as xr
 from tqdm import tqdm
+
+from nc2grib import Netcdf2Grib
 
 # Import custom modules (assuming they exist)
 try:
@@ -31,6 +32,7 @@ except ImportError as e:
     logging.warning(f"Could not import custom modules: {e}")
 
 from diffusion_params import (
+    USE_DIFFUSION,
     NUM_DIFFUSION_STEPS,
     NUM_INFERENCE_STEPS,
     INFERENCE_STEPS,
@@ -142,12 +144,11 @@ class ForecastModel:
 class WeatherForecaster:
     """Handles the forecasting pipeline."""
     
-    def __init__(self, data_loader_hrrr: PreprocessedDataLoader, data_loader_gfs: PreprocessedDataLoader, member: int, use_diffusion: bool):
+    def __init__(self, data_loader_hrrr: PreprocessedDataLoader, data_loader_gfs: PreprocessedDataLoader, member: int):
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
         self.metadata = data_loader_hrrr.metadata
         self.member = member
-        self.use_diffusion = use_diffusion
     
     @staticmethod
     def denormalize(output: np.ndarray, norm_file: str) -> np.ndarray:
@@ -162,7 +163,7 @@ class WeatherForecaster:
             raise
     
     def predict(self, model: ForecastModel, X: tf.Tensor):
-        if self.use_diffusion:
+        if USE_DIFFUSION:
             num_output_channels = 74
             start = 102
             batch_size = 1
@@ -318,7 +319,7 @@ class WeatherForecaster:
             model_input_hrrr = self.data_loader_hrrr.get_model_input()
             model_input_gfs = self.data_loader_gfs.get_model_input()
             lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
-            if self.use_diffusion:
+            if USE_DIFFUSION:
                 rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 74))
                 step_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
                 model_input = np.concatenate([
@@ -376,12 +377,17 @@ class WeatherForecaster:
             init_month = self.metadata['init_month']
             init_day = self.metadata['init_day']
             init_hh = self.metadata['init_hh']
-            date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
-            Path(f"{output_dir}/{date_str}").mkdir(parents=True, exist_ok=True)
+            #date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+
+            outdir = f'./hrrrcast.{init_year}{init_month}{init_day}/{init_hh}'
+            outdir = Path(outdir).mkdir(parents=True, exist_ok=True)
             
-            output_file = f"{output_dir}/{date_str}/hrrrcast_{date_str}_mem{self.member}.nc"
+            #output_file = f"{output_dir}/{date_str}/hrrrcast_{date_str}_mem{self.member}.nc"
             logger.info(f"Saving forecast to {output_file}")
-            outdata_xr.to_netcdf(output_file)
+            #outdata_xr.to_netcdf(output_file)
+
+            converter = Netcdf2Grib()
+            converter.save_grib2(init_datetime, outdata_xr, self.member, outdir)
             
             logger.info("Forecast completed successfully")
             return outdata_xr, output_file
@@ -391,31 +397,12 @@ class WeatherForecaster:
             raise
 
 
-def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
-    """Validate and format any datetime string that Python can parse."""
-    try:
-        # Parse the datetime string using dateutil parser (very flexible)
-        dt = parser.parse(datetime_str)
-        
-        # Format components with proper padding
-        year = f"{dt.year:04d}"
-        month = f"{dt.month:02d}"
-        day = f"{dt.day:02d}"
-        hour = f"{dt.hour:02d}"
-        
-        return dt, year, month, day, hour
-        
-    except (ValueError, TypeError, parser.ParserError) as e:
-        raise ValueError(f"Invalid date/time: {e}")
-
-
-def run_weather_forecast(model_path: str, datetime_str: str,
-                        lead_hours: int,
-                        member: int, base_dir: str = "./", output_dir: str = "./", use_diffusion = True):
+def run_weather_forecast(model_path: str, init_year: str, init_month: str,
+                        init_day: str, init_hh: str, lead_hours: int,
+                        member: int, base_dir: str = "./", output_dir: str = "./"):
     """Main forecasting function."""
     try:
         # Load preprocessed data
-        init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         hrrr_preprocessed_file = f"{base_dir}/{date_str}/hrrr_{date_str}.npz"
         gfs_preprocessed_file = f"{base_dir}/{date_str}/gfs_{date_str}.npz"
@@ -426,7 +413,7 @@ def run_weather_forecast(model_path: str, datetime_str: str,
         model = ForecastModel(model_path)
         
         # Initialize forecaster
-        forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member, use_diffusion)
+        forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member)
         
         # Run forecast
         forecast_dataset, output_file = forecaster.run_forecast(model, lead_hours, output_dir)
@@ -446,11 +433,12 @@ def parse_arguments():
     )
     
     parser.add_argument("model_path", help="Path to the trained model")
-    parser.add_argument('inittime',
-                       help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
+    parser.add_argument("init_year", help="Initialization year (YYYY)")
+    parser.add_argument("init_month", help="Initialization month (MM)")
+    parser.add_argument("init_day", help="Initialization day (DD)")
+    parser.add_argument("init_hh", help="Initialization hour (HH)")
     parser.add_argument("lead_hours", type=int, help="Lead time in hours")
     parser.add_argument("member", type=int, default=0, help="Ensemble member ID (0...N)")
-    parser.add_argument("--no_diffusion", default=False, action="store_true", help="Turn off diffusion")
     parser.add_argument("--base_dir", default="./", help="Base directory for input preprocessed files")
     parser.add_argument("--output_dir", default="./", help="Output directory for forecast files")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -470,12 +458,14 @@ def main():
         # Run forecast
         forecast_dataset, output_file = run_weather_forecast(
             model_path=args.model_path,
-            datetime_str=args.inittime,
+            init_year=args.init_year,
+            init_month=args.init_month,
+            init_day=args.init_day,
+            init_hh=args.init_hh,
             lead_hours=args.lead_hours,
             member=args.member,
             base_dir=args.base_dir,
-            output_dir=args.output_dir,
-            use_diffusion=not args.no_diffusion
+            output_dir=args.output_dir
         )
         
         logger.info(f"Forecast complete. Output saved to: {output_file}")
