@@ -351,26 +351,15 @@ def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
 def plot_forecast_data(datetime_str: str,
                       lead_hour: str, member: str,
                       forecast_dir: str = "./", output_dir: str = "./"):
-    """Main plotting function."""
+    """Main plotting function. Plots all hours from 1 to lead_hour (inclusive)."""
     try:
         # Validate inputs
         init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         lead_hour_int = int(lead_hour)
         
-        # Calculate forecast valid time
-        valid_datetime = init_datetime + timedelta(hours=lead_hour_int)
-        
-        logger.info(f"Plotting forecast data for {init_datetime} + {lead_hour_int}h")
-        logger.info(f"Valid time: {valid_datetime}")
-        
         # Setup paths
         forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_{date_str}_mem{member}.nc"
-        
-        # Create output directory
-        timestamp_str = f"{init_year}-{init_month}-{init_day} {init_hh}:00 UTC"
-        output_subdir = f"{output_dir}/{date_str}/{date_str}_mem{member}_lead{lead_hour_int:02d}h"
-        Path(output_subdir).mkdir(parents=True, exist_ok=True)
         
         # Validate forecast file exists
         if not os.path.exists(forecast_file):
@@ -380,22 +369,32 @@ def plot_forecast_data(datetime_str: str,
         config = ForecastPlotterConfig()
         plotter = ForecastPlotter(config)
         
-        # Load forecast data
+        # Load forecast data ONCE
         ds = plotter.load_forecast_data(forecast_file)
+        max_lead = len(ds.lead_time) - 1
+        if lead_hour_int > max_lead:
+            raise ValueError(f"Lead hour {lead_hour_int} not available in forecast data (max: {max_lead})")
         
-        # Validate lead hour exists in data
-        if lead_hour_int >= len(ds.lead_time):
-            raise ValueError(f"Lead hour {lead_hour_int} not available in forecast data (max: {len(ds.lead_time)-1})")
-        
-        # Plot variables
-        plotter.plot_pressure_level_variables(ds, lead_hour_int, output_subdir, timestamp_str)
-        plotter.plot_surface_variables(ds, lead_hour_int, output_subdir, timestamp_str)
-        plotter.create_summary_plot(ds, lead_hour_int, output_subdir, timestamp_str)
+        # Loop over all hours 1 to lead_hour (inclusive)
+        for h in range(1, lead_hour_int + 1):
+            # Calculate forecast valid time
+            valid_datetime = init_datetime + timedelta(hours=h)
+            logger.info(f"Plotting forecast data for {init_datetime} + {h}h (Valid: {valid_datetime})")
+            
+            # Create output directory for this hour
+            timestamp_str = f"{init_year}-{init_month}-{init_day} {init_hh}:00 UTC"
+            output_subdir = f"{output_dir}/{date_str}/{date_str}_mem{member}_lead{h:02d}h"
+            Path(output_subdir).mkdir(parents=True, exist_ok=True)
+            
+            # Plot variables for this hour
+            plotter.plot_pressure_level_variables(ds, h, output_subdir, timestamp_str)
+            plotter.plot_surface_variables(ds, h, output_subdir, timestamp_str)
+            plotter.create_summary_plot(ds, h, output_subdir, timestamp_str)
+            logger.info(f"Plots for lead hour {h} saved to: {output_subdir}")
         
         # Close dataset
         ds.close()
-        
-        logger.info(f"Plotting completed successfully. Plots saved to: {output_subdir}")
+        logger.info(f"Plotting completed successfully for all hours 1 to {lead_hour_int}.")
         
     except Exception as e:
         logger.error(f"Plotting failed: {e}")
