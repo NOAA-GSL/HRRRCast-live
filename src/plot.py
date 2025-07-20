@@ -412,7 +412,7 @@ def parse_arguments():
     parser.add_argument('inittime',
                        help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hour", help="Lead hour for forecast (0, 1, 2, ...)")
-    parser.add_argument("member",  help="Member identifier mem0, mem1 etc... or pmm")
+    parser.add_argument("--members", nargs='+', required=True, help="List/range of member IDs (e.g., 0-2 4 6-7 pmm)")
     parser.add_argument("--forecast_dir", default="./", help="Directory containing forecast files")
     parser.add_argument("--output_dir", default="./", help="Output directory for plots")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -428,15 +428,31 @@ def main():
         
         # Set logging level
         logging.getLogger().setLevel(getattr(logging, args.log_level))
-        
-        # Run plotting
-        plot_forecast_data(
-            datetime_str=args.inittime,
-            lead_hour=args.lead_hour,
-            member=args.member,
-            forecast_dir=args.forecast_dir,
-            output_dir=args.output_dir
-        )
+
+        # Parse members argument (support space/comma separated and ranges like 0-2, and allow non-integer like 'pmm')
+        def expand_member_arg(m):
+            result = []
+            for part in m.split(","):
+                part = part.strip()
+                if "-" in part and part.replace("-", "").isdigit():
+                    start, end = part.split("-")
+                    result.extend([str(i) for i in range(int(start), int(end)+1)])
+                elif part != "":
+                    result.append(part)
+            return result
+        members = []
+        for m in args.members:
+            members.extend(expand_member_arg(m))
+        members = sorted(set(members), key=lambda x: (not x.isdigit(), x))  # Sort numerically, then non-numeric
+
+        for member in members:
+            plot_forecast_data(
+                datetime_str=args.inittime,
+                lead_hour=args.lead_hour,
+                member=member,
+                forecast_dir=args.forecast_dir,
+                output_dir=args.output_dir
+            )
         
     except Exception as e:
         logger.error(f"Application failed: {e}")

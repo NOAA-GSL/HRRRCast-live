@@ -3,6 +3,8 @@
 INIT_TIME=${1:-"2024-05-06T23"}
 LEAD_HOUR=${2:-18}
 USE_DIFFUSION=${3:-1}
+N_ENSEMBLES=${4:-1}
+N_GPUS=${5:-1}
 ACCNR=${ACCNR:-gsd-hpcs}
 
 submit_with_check() {
@@ -13,6 +15,28 @@ submit_with_check() {
         exit 1
     fi
     echo "$jobid"
+}
+
+get_ranges() {
+    local N=$1     # total ensembles
+    local Ng=$2    # number of GPUs
+
+    local chunk=$(( N / Ng ))
+    local rem=$(( N % Ng ))
+    local start=0
+
+    for (( i=0; i<Ng; i++ )); do
+        local extra=0
+        if (( i < rem )); then
+            extra=1
+        fi
+
+        local end=$(( start + chunk + extra - 1 ))
+
+        echo "$start-$end"
+
+        start=$(( end + 1 ))
+    done
 }
 
 source ./atparse.bash
@@ -46,12 +70,12 @@ if [ $USE_DIFFUSION -eq 0 ]; then
 else
     # run two ensemble members
     jobids=()
-    for MEMBER in {0..2}; do
+    for MEMBER in $(get_ranges $N_ENSEMBLES $N_GPUS); do
         atparse < jobs/job-fcst.sh > logs/job-fcst-${MEMBER}.sh
         jobid5=$(submit_with_check sbatch --dependency=afterok:$jobid3:$jobid4 --parsable logs/job-fcst-${MEMBER}.sh)
         jobids+=($jobid5)
         echo "Submitted job: $jobid5"
-    
+
         atparse < jobs/job-plot.sh > logs/job-plot-${MEMBER}.sh
         jobid6=$(submit_with_check sbatch --dependency=afterok:$jobid5 --parsable logs/job-plot-${MEMBER}.sh)
         echo "Submitted job: $jobid6"

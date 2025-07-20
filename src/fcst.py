@@ -311,66 +311,57 @@ class WeatherForecaster:
         
         return xr.Dataset(data_vars)
     
-    def run_forecast(self, model: ForecastModel, lead_hours: int, output_dir: str = "./"):
-        """Run the complete forecasting pipeline."""
+    def run_forecast(self, model: ForecastModel, lead_hours: int, output_dir: str = "./", return_history: bool = False, model_input=None):
+        """Run the complete forecasting pipeline. Accepts precomputed model_input."""
         try:
-            # Get preprocessed data
-            model_input_hrrr = self.data_loader_hrrr.get_model_input()
-            model_input_gfs = self.data_loader_gfs.get_model_input()
-            lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
-            if self.use_diffusion:
-                rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 74))
-                step_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
-                model_input = np.concatenate([
-                    model_input_hrrr[:, :, :, :74],
-                    model_input_gfs[0:1, :, :, :],
-                    rand_channel,
-                    model_input_hrrr[:, :, :, 74:],
-                    step_channel, lead_channel], axis=-1)
-            else:
-                model_input = np.concatenate([
-                    model_input_hrrr[:, :, :, :74],
-                    model_input_gfs[0:1, :, :, :],
-                    model_input_hrrr[:, :, :, 74:],
-                    lead_channel], axis=-1)
+            # Use precomputed model_input if provided
+            if model_input is None:
+                model_input_hrrr = self.data_loader_hrrr.get_model_input()
+                model_input_gfs = self.data_loader_gfs.get_model_input()
+                lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
+                if self.use_diffusion:
+                    rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 74))
+                    step_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
+                    model_input = np.concatenate([
+                        model_input_hrrr[:, :, :, :74],
+                        model_input_gfs[0:1, :, :, :],
+                        rand_channel,
+                        model_input_hrrr[:, :, :, 74:],
+                        step_channel, lead_channel], axis=-1)
+                else:
+                    model_input = np.concatenate([
+                        model_input_hrrr[:, :, :, :74],
+                        model_input_gfs[0:1, :, :, :],
+                        model_input_hrrr[:, :, :, 74:],
+                        lead_channel], axis=-1)
 
             lats, lons = self.data_loader_hrrr.get_coordinates()
             init_datetime = self.data_loader_hrrr.get_init_datetime()
 
             logger.info(f"Running forecast for {init_datetime} with {lead_hours} hour lead time")
             logger.info(f"Model input shape: {model_input.shape}")
-            
             logger.info(self.metadata)
 
             # Run autoregressive forecast
-            hourly_forecasts, history = self.autoregressive_rollout(model_input, model_input_gfs, model, lead_hours)
-            
+            hourly_forecasts, history = self.autoregressive_rollout(model_input, self.data_loader_gfs.get_model_input(), model, lead_hours)
+
             # Denormalize all outputs
             logger.info("Denormalizing outputs...")
             norm_file = self.metadata['norm_file']
             denorm_outputs = {}
             for hour, forecast in hourly_forecasts.items():
                 denorm_outputs[hour] = self.denormalize(forecast[None, ...], norm_file)
-            
+
             # Stack all timesteps into a single numpy array
             outdata = np.array([denorm_outputs[i] for i in range(0, lead_hours + 1)])
-            
+
             # Create timestamps for each forecast hour
             times = [np.timedelta64(i, 'h') for i in range(0, lead_hours + 1)]
-            
+
             # Convert numpy to xarray
             logger.info("Creating xarray dataset...")
             outdata_xr = self.create_xarray_dataset(init_datetime, times, lats, lons, outdata)
-            
-            # Print the forecast step history
-            logger.info("Forecast schedule:")
-            for hour in range(1, min(lead_hours + 1, 25)):  # Limit output for readability
-                info = history[hour]
-                logger.info(f"Hour {hour:2d}: from hour {info['from']:2d} using step {info['step']}h")
-            
-            if lead_hours > 24:
-                logger.info(f"... (showing first 24 hours of {lead_hours} total)")
-            
+
             # Save output
             init_year = self.metadata['init_year']
             init_month = self.metadata['init_month']
@@ -378,14 +369,16 @@ class WeatherForecaster:
             init_hh = self.metadata['init_hh']
             date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
             Path(f"{output_dir}/{date_str}").mkdir(parents=True, exist_ok=True)
-            
+
             output_file = f"{output_dir}/{date_str}/hrrrcast_{date_str}_mem{self.member}.nc"
             logger.info(f"Saving forecast to {output_file}")
             outdata_xr.to_netcdf(output_file)
-            
+
             logger.info("Forecast completed successfully")
-            return outdata_xr, output_file
-            
+            if return_history:
+                return outdata_xr, output_file, history
+            else:
+                return outdata_xr, output_file
         except Exception as e:
             logger.error(f"Forecast failed: {e}")
             raise
@@ -409,32 +402,20 @@ def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
         raise ValueError(f"Invalid date/time: {e}")
 
 
-def run_weather_forecast(model_path: str, datetime_str: str,
-                        lead_hours: int,
-                        member: int, base_dir: str = "./", output_dir: str = "./", use_diffusion = True):
-    """Main forecasting function."""
+def run_weather_forecast_for_member(forecaster: WeatherForecaster, model: ForecastModel, lead_hours: int, output_dir: str, member: int, print_history: bool = False, model_input=None):
+    """Run forecast for a single member, optionally printing forecast step history. Accepts precomputed model_input."""
     try:
-        # Load preprocessed data
-        init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
-        date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
-        hrrr_preprocessed_file = f"{base_dir}/{date_str}/hrrr_{date_str}.npz"
-        gfs_preprocessed_file = f"{base_dir}/{date_str}/gfs_{date_str}.npz"
-        data_loader_hrrr = PreprocessedDataLoader(hrrr_preprocessed_file)
-        data_loader_gfs = PreprocessedDataLoader(gfs_preprocessed_file)
-        
-        # Load model
-        model = ForecastModel(model_path)
-        
-        # Initialize forecaster
-        forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member, use_diffusion)
-        
-        # Run forecast
-        forecast_dataset, output_file = forecaster.run_forecast(model, lead_hours, output_dir)
-        
+        forecast_dataset, output_file, history = forecaster.run_forecast(model, lead_hours, output_dir, return_history=True, model_input=model_input)
+        if print_history:
+            logger.info("Forecast schedule:")
+            for hour in range(1, min(lead_hours + 1, 25)):
+                info = history[hour]
+                logger.info(f"Hour {hour:2d}: from hour {info['from']:2d} using step {info['step']}h")
+            if lead_hours > 24:
+                logger.info(f"... (showing first 24 hours of {lead_hours} total)")
         return forecast_dataset, output_file
-        
     except Exception as e:
-        logger.error(f"Weather forecast failed: {e}")
+        logger.error(f"Forecast failed for member {member}: {e}")
         raise
 
 
@@ -449,7 +430,7 @@ def parse_arguments():
     parser.add_argument('inittime',
                        help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hours", type=int, help="Lead time in hours")
-    parser.add_argument("member", type=int, default=0, help="Ensemble member ID (0...N)")
+    parser.add_argument("--members", nargs='+', required=True, help="List of ensemble member IDs (e.g., 0 1 2 or 0,1,2)")
     parser.add_argument("--no_diffusion", default=False, action="store_true", help="Turn off diffusion")
     parser.add_argument("--base_dir", default="./", help="Base directory for input preprocessed files")
     parser.add_argument("--output_dir", default="./", help="Output directory for forecast files")
@@ -466,19 +447,61 @@ def main():
         
         # Set logging level
         logging.getLogger().setLevel(getattr(logging, args.log_level))
+
+        # Parse members argument (support space/comma separated and ranges like 0-2)
+        def expand_member_arg(m):
+            result = []
+            for part in m.split(","):
+                part = part.strip()
+                if "-" in part:
+                    start, end = part.split("-")
+                    result.extend(list(range(int(start), int(end)+1)))
+                elif part != "":
+                    result.append(int(part))
+            return result
+        members = []
+        for m in args.members:
+            members.extend(expand_member_arg(m))
+        members = sorted(set(members))  # Remove duplicates and sort
+
+        # Load preprocessed data and model ONCE
+        init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(args.inittime)
+        date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+        hrrr_preprocessed_file = f"{args.base_dir}/{date_str}/hrrr_{date_str}.npz"
+        gfs_preprocessed_file = f"{args.base_dir}/{date_str}/gfs_{date_str}.npz"
+        data_loader_hrrr = PreprocessedDataLoader(hrrr_preprocessed_file)
+        data_loader_gfs = PreprocessedDataLoader(gfs_preprocessed_file)
+        model = ForecastModel(args.model_path)
+
+        # Precompute model_input ONCE
+        model_input_hrrr = data_loader_hrrr.get_model_input()
+        model_input_gfs = data_loader_gfs.get_model_input()
+        lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
+        if not args.no_diffusion:
+            rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 74))
+            step_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
+            model_input = np.concatenate([
+                model_input_hrrr[:, :, :, :74],
+                model_input_gfs[0:1, :, :, :],
+                rand_channel,
+                model_input_hrrr[:, :, :, 74:],
+                step_channel, lead_channel], axis=-1)
+        else:
+            model_input = np.concatenate([
+                model_input_hrrr[:, :, :, :74],
+                model_input_gfs[0:1, :, :, :],
+                model_input_hrrr[:, :, :, 74:],
+                lead_channel], axis=-1)
         
-        # Run forecast
-        forecast_dataset, output_file = run_weather_forecast(
-            model_path=args.model_path,
-            datetime_str=args.inittime,
-            lead_hours=args.lead_hours,
-            member=args.member,
-            base_dir=args.base_dir,
-            output_dir=args.output_dir,
-            use_diffusion=not args.no_diffusion
-        )
-        
-        logger.info(f"Forecast complete. Output saved to: {output_file}")
+        output_files = []
+        for i, member in enumerate(members):
+            forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member, not args.no_diffusion)
+            forecast_dataset, output_file = run_weather_forecast_for_member(
+                forecaster, model, args.lead_hours, args.output_dir, member, print_history=(i==len(members)-1), model_input=model_input
+            )
+            logger.info(f"Forecast complete for member {member}. Output saved to: {output_file}")
+            output_files.append(output_file)
+        logger.info(f"All forecasts complete. Output files: {output_files}")
         
     except Exception as e:
         logger.error(f"Application failed: {e}")
