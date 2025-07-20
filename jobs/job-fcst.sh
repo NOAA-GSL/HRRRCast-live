@@ -8,7 +8,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96
-#SBATCH --time=00:10:00
+#SBATCH --time=00:30:00
 
 # conda
 source etc/env.sh
@@ -25,7 +25,7 @@ hour=`echo $init_time |cut -c12-13`
 
 echo "In fcst, init_time=${init_time}, year/month/day/hour/=${year} ${month} ${day} ${hour}, lead_hour=${lead_hour}, member=${member}, use_diffusion=${use_diffusion}"
 if [ $use_diffusion -eq 0 ]; then
-    python3 src/fcst.py $PWD/net-deterministic/model.keras ${init_time} ${lead_hour} ${member} --no_diffusion
+    python3 src/fcst.py $PWD/net-deterministic/model.keras ${init_time} ${lead_hour} --members ${member} --no_diffusion
 else
-    python3 src/fcst.py $PWD/net-diffusion/model.keras ${init_time} ${lead_hour} ${member}
+    python3 src/fcst.py $PWD/net-diffusion/model.keras ${init_time} ${lead_hour} --members ${member}
 fi
