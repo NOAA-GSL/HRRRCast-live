@@ -115,7 +115,7 @@ def download_file_with_retry(url: str, output_path: str, max_retries: int = Conf
 # GFS Download Functions
 # -------------------------------
 def get_gfs_urls(year: str, month: str, day: str, hour: str, lead_hours: int) -> List[Tuple[str, str]]:
-    """Generate GFS download URLs and filenames for boundary conditions."""
+    """Generate GFS download URLs and filenames for boundary conditions, skipping the 0th hour."""
     urls = []
     hour_int = int(hour)
     cycle_hours = [0, 6, 12, 18]
@@ -149,8 +149,10 @@ def get_gfs_urls(year: str, month: str, day: str, hour: str, lead_hours: int) ->
         else:
             start_forecast_hour = hour_int - init_cycle
     
-    # Generate URLs for all forecast hours from start to start + lead_hours
+    # Generate URLs for all forecast hours from start to start + lead_hours, skipping 0th hour
     for fh in range(start_forecast_hour, start_forecast_hour + lead_hours + 1):
+        if fh == 0:
+            continue  # skip 0th hour
         forecast_str = f"{fh:03d}"
         url = f"{Config.GFS_BASE_URL}/gfs.{init_date_str}/{cycle_str}/atmos/gfs.t{cycle_str}z.pgrb2.0p25.f{forecast_str}"
         

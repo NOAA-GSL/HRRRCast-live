@@ -4,9 +4,9 @@
 #SBATCH --partition=u1-compute
 #SBATCH --account=@[ACCNR]
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
+#SBATCH --ntasks-per-node=@[LEAD_HOUR]
 #SBATCH --time=00:30:00
+#SBATCH --exclusive
 
 # conda
 source etc/env.sh
