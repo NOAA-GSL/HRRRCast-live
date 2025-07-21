@@ -236,10 +236,11 @@ class WeatherForecaster:
             step = hour - from_hour
             
             # setup ICs and BCs
+            # NOTE: BCS (forcing_input) no longer includes 0th hour, so hour=1 -> index 0, hour=2 -> index 1, etc.
             X = tf.concat(
                 [
                     hourly_forecasts[from_hour],
-                    forcing_input[hour:hour+1, :, :, :],
+                    forcing_input[hour-1:hour, :, :, :],
                     X[:, :, :, 102:-1],
                     tf.fill(
                         tf.concat([tf.shape(X)[:-1], [1]], axis=0),
@@ -311,30 +312,9 @@ class WeatherForecaster:
         
         return xr.Dataset(data_vars)
     
-    def run_forecast(self, model: ForecastModel, lead_hours: int, output_dir: str = "./", return_history: bool = False, model_input=None):
-        """Run the complete forecasting pipeline. Accepts precomputed model_input."""
+    def run_forecast(self, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str = "./", return_history: bool = False):
+        """Run the complete forecasting pipeline. Requires precomputed model_input."""
         try:
-            # Use precomputed model_input if provided
-            if model_input is None:
-                model_input_hrrr = self.data_loader_hrrr.get_model_input()
-                model_input_gfs = self.data_loader_gfs.get_model_input()
-                lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
-                if self.use_diffusion:
-                    rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 74))
-                    step_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
-                    model_input = np.concatenate([
-                        model_input_hrrr[:, :, :, :74],
-                        model_input_gfs[0:1, :, :, :],
-                        rand_channel,
-                        model_input_hrrr[:, :, :, 74:],
-                        step_channel, lead_channel], axis=-1)
-                else:
-                    model_input = np.concatenate([
-                        model_input_hrrr[:, :, :, :74],
-                        model_input_gfs[0:1, :, :, :],
-                        model_input_hrrr[:, :, :, 74:],
-                        lead_channel], axis=-1)
-
             lats, lons = self.data_loader_hrrr.get_coordinates()
             init_datetime = self.data_loader_hrrr.get_init_datetime()
 
@@ -402,10 +382,10 @@ def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
         raise ValueError(f"Invalid date/time: {e}")
 
 
-def run_weather_forecast_for_member(forecaster: WeatherForecaster, model: ForecastModel, lead_hours: int, output_dir: str, member: int, print_history: bool = False, model_input=None):
-    """Run forecast for a single member, optionally printing forecast step history. Accepts precomputed model_input."""
+def run_weather_forecast_for_member(forecaster: WeatherForecaster, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str, member: int, print_history: bool = False):
+    """Run forecast for a single member, optionally printing forecast step history. Requires precomputed model_input."""
     try:
-        forecast_dataset, output_file, history = forecaster.run_forecast(model, lead_hours, output_dir, return_history=True, model_input=model_input)
+        forecast_dataset, output_file, history = forecaster.run_forecast(model, lead_hours, model_input, output_dir, return_history=True)
         if print_history:
             logger.info("Forecast schedule:")
             for hour in range(1, min(lead_hours + 1, 25)):
@@ -497,7 +477,7 @@ def main():
         for i, member in enumerate(members):
             forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member, not args.no_diffusion)
             forecast_dataset, output_file = run_weather_forecast_for_member(
-                forecaster, model, args.lead_hours, args.output_dir, member, print_history=(i==len(members)-1), model_input=model_input
+                forecaster, model, args.lead_hours, model_input, args.output_dir, member, print_history=(i==len(members)-1)
             )
             logger.info(f"Forecast complete for member {member}. Output saved to: {output_file}")
             output_files.append(output_file)
