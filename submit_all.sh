@@ -18,7 +18,7 @@ submit_with_check() {
 }
 
 get_ranges() {
-    local N=$1     # total ensembles
+    local N=$1     # number of ensembles
     local Ng=$2    # number of GPUs
 
     local chunk=$(( N / Ng ))
@@ -82,13 +82,15 @@ else
     done
     
     # ensemble PMM
-    MEMBER="_mean"
-    
-    atparse < jobs/job-compute-pmm.sh > logs/job-compute-pmm.sh
-    jobid7=$(submit_with_check sbatch --dependency=afterok:$(IFS=:; echo "${jobids[*]}") --parsable logs/job-compute-pmm.sh)
-    echo "Submitted job: $jobid7"
-    
-    atparse < jobs/job-plot.sh > logs/job-plot-mean.sh
-    jobid8=$(submit_with_check sbatch --dependency=afterok:$jobid7 --parsable logs/job-plot-mean.sh)
-    echo "Submitted job: $jobid8"
+    if [ $N_ENSEMBLES -ge 2 ]; then
+        MEMBER="_mean"
+        
+        atparse < jobs/job-compute-pmm.sh > logs/job-compute-pmm.sh
+        jobid7=$(submit_with_check sbatch --dependency=afterok:$(IFS=:; echo "${jobids[*]}") --parsable logs/job-compute-pmm.sh)
+        echo "Submitted job: $jobid7"
+        
+        atparse < jobs/job-plot.sh > logs/job-plot-mean.sh
+        jobid8=$(submit_with_check sbatch --dependency=afterok:$jobid7 --parsable logs/job-plot-mean.sh)
+        echo "Submitted job: $jobid8"
+    fi
 fi
