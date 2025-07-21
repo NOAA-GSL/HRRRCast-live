@@ -36,6 +36,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import xarray as xr
 import glob
+import utils
 
 # Configure logging
 logging.basicConfig(
@@ -72,14 +73,14 @@ def compute_PMM(fields: xr.DataArray, method=2) -> xr.DataArray:
     # print info for debugging
     if 'lead_time' in fields.coords:
         lt = fields.lead_time.values / np.timedelta64(1, "h")
-        print(f"Lead time {lt}h", end=" ")
+        logger.debug(f"Lead time {lt}h")
     if 'level' in fields.coords:
         lv = fields.level.values
-        print(f"Level {lv}", end=" ")
+        logger.debug(f"Level {lv}")
     if 'time' in fields.coords:
-        print(f"Time {fields.time.values}")
+        logger.debug(f"Time {fields.time.values}")
     else:
-        print()  # Just newline if no time coord
+        logger.debug("")  # Just newline if no time coord
     
     # Load data
     fields = fields.compute()
@@ -185,21 +186,6 @@ def process_variable_mean(var_data: xr.DataArray) -> xr.DataArray:
     processed_var = var_data.mean(dim='member')
     return processed_var
 
-def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
-    """Validate and format any datetime string that Python can parse."""
-    try:
-        # Parse the datetime string using dateutil parser (very flexible)
-        dt = parser.parse(datetime_str)
-        # Format components with proper padding
-        year = f"{dt.year:04d}"
-        month = f"{dt.month:02d}"
-        day = f"{dt.day:02d}"
-        hour = f"{dt.hour:02d}"
-
-        return dt, year, month, day, hour
-    except (ValueError, TypeError, parser.ParserError) as e:
-        raise ValueError(f"Invalid date/time: {e}")
-
 def find_ensemble_files(date_str: str, forecast_dir: str) -> List[str]:
     """Find all ensemble member files for a given date."""
     # Look for files in the date directory
@@ -243,7 +229,7 @@ def compute_ensemble_pmm(datetime_str: str,
     """Main ensemble post-processing function."""
     try:
         # Validate inputs
-        init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
+        init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         
         logger.info(f"Computing ensemble post-processing for initialization time: {date_str}")
@@ -256,7 +242,7 @@ def compute_ensemble_pmm(datetime_str: str,
         
         # Create output directory if it doesn't exist
         output_date_dir = os.path.join(output_dir, date_str)
-        os.makedirs(output_date_dir, exist_ok=True)
+        utils.make_directory(output_date_dir)
         
         # Process each variable with appropriate method
         processed_datasets = {}
