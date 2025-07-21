@@ -25,6 +25,7 @@ import xarray as xr
 from matplotlib.patches import Rectangle
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Configure logging
 logging.basicConfig(
@@ -348,10 +349,34 @@ def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
         raise ValueError(f"Invalid date/time: {e}")
 
 
+def plot_lead_hour(h, ds_path, init_datetime, init_year, init_month, init_day, init_hh, output_dir, date_str, member, config_dict):
+    import xarray as xr
+    import os
+    from pathlib import Path
+    import logging
+    from datetime import timedelta
+    # Reconstruct config and plotter
+    config = ForecastPlotterConfig()
+    for k, v in config_dict.items():
+        setattr(config, k, v)
+    plotter = ForecastPlotter(config)
+    ds = xr.open_dataset(ds_path, decode_timedelta=True)
+    try:
+        valid_datetime = init_datetime + timedelta(hours=h)
+        timestamp_str = f"{init_year}-{init_month}-{init_day} {init_hh}:00 UTC"
+        output_subdir = f"{output_dir}/{date_str}/{date_str}_mem{member}_lead{h:02d}h"
+        Path(output_subdir).mkdir(parents=True, exist_ok=True)
+        plotter.plot_pressure_level_variables(ds, h, output_subdir, timestamp_str)
+        plotter.plot_surface_variables(ds, h, output_subdir, timestamp_str)
+        plotter.create_summary_plot(ds, h, output_subdir, timestamp_str)
+        logging.info(f"Plots for lead hour {h} saved to: {output_subdir}")
+    finally:
+        ds.close()
+
 def plot_forecast_data(datetime_str: str,
                       lead_hour: str, member: str,
                       forecast_dir: str = "./", output_dir: str = "./"):
-    """Main plotting function. Plots all hours from 1 to lead_hour (inclusive)."""
+    """Main plotting function. Plots all hours from 1 to lead_hour (inclusive) in parallel."""
     try:
         # Validate inputs
         init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
@@ -365,35 +390,31 @@ def plot_forecast_data(datetime_str: str,
         if not os.path.exists(forecast_file):
             raise FileNotFoundError(f"Forecast file not found: {forecast_file}")
         
-        # Initialize plotter
+        # Initialize plotter config (for passing to subprocesses)
         config = ForecastPlotterConfig()
-        plotter = ForecastPlotter(config)
+        config_dict = config.__dict__
         
-        # Load forecast data ONCE
-        ds = plotter.load_forecast_data(forecast_file)
+        # Load forecast data ONCE to check max lead
+        ds = xr.open_dataset(forecast_file, decode_timedelta=True)
         max_lead = len(ds.lead_time) - 1
+        ds.close()
         if lead_hour_int > max_lead:
             raise ValueError(f"Lead hour {lead_hour_int} not available in forecast data (max: {max_lead})")
         
-        # Loop over all hours 1 to lead_hour (inclusive)
-        for h in range(1, lead_hour_int + 1):
-            # Calculate forecast valid time
-            valid_datetime = init_datetime + timedelta(hours=h)
-            logger.info(f"Plotting forecast data for {init_datetime} + {h}h (Valid: {valid_datetime})")
-            
-            # Create output directory for this hour
-            timestamp_str = f"{init_year}-{init_month}-{init_day} {init_hh}:00 UTC"
-            output_subdir = f"{output_dir}/{date_str}/{date_str}_mem{member}_lead{h:02d}h"
-            Path(output_subdir).mkdir(parents=True, exist_ok=True)
-            
-            # Plot variables for this hour
-            plotter.plot_pressure_level_variables(ds, h, output_subdir, timestamp_str)
-            plotter.plot_surface_variables(ds, h, output_subdir, timestamp_str)
-            plotter.create_summary_plot(ds, h, output_subdir, timestamp_str)
-            logger.info(f"Plots for lead hour {h} saved to: {output_subdir}")
-        
-        # Close dataset
-        ds.close()
+        n_workers = lead_hour_int
+        logger.info(f"Parallel plotting using {n_workers} workers (one per lead hour)")
+        # Parallel plotting over lead hours
+        args_list = [
+            (h, forecast_file, init_datetime, init_year, init_month, init_day, init_hh, output_dir, date_str, member, config_dict)
+            for h in range(1, lead_hour_int + 1)
+        ]
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = [executor.submit(plot_lead_hour, *args) for args in args_list]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in parallel plotting: {e}")
         logger.info(f"Plotting completed successfully for all hours 1 to {lead_hour_int}.")
         
     except Exception as e:
