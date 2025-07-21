@@ -15,6 +15,7 @@ from typing import List, Tuple
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import utils
 
 # -------------------------------
 # Configuration
@@ -51,27 +52,10 @@ def setup_logging(log_level: str = 'INFO') -> logging.Logger:
 # -------------------------------
 # Utility Functions
 # -------------------------------
-def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
-    """Validate and format any datetime string that Python can parse."""
-    try:
-        # Parse the datetime string using dateutil parser (very flexible)
-        dt = parser.parse(datetime_str)
-        
-        # Format components with proper padding
-        year = f"{dt.year:04d}"
-        month = f"{dt.month:02d}"
-        day = f"{dt.day:02d}"
-        hour = f"{dt.hour:02d}"
-        
-        return dt, year, month, day, hour
-        
-    except (ValueError, TypeError, parser.ParserError) as e:
-        raise ValueError(f"Invalid date/time: {e}")
-
 def create_output_directory(base_dir: str, date_str: str) -> Path:
     """Create output directory if it doesn't exist."""
     output_dir = Path(base_dir) / date_str
-    output_dir.mkdir(parents=True, exist_ok=True)
+    utils.make_directory(output_dir)
     return output_dir
 
 def download_file_with_retry(url: str, output_path: str, max_retries: int = Config.MAX_RETRIES) -> bool:
@@ -168,7 +152,7 @@ def download_hrrr_data(datetime_str: str, base_dir: str = "./") -> dict:
     logger = logging.getLogger(__name__)
     
     # Validate inputs
-    init_datetime, year, month, day, hour = validate_datetime(datetime_str)
+    init_datetime, year, month, day, hour = utils.validate_datetime(datetime_str)
     date_str = f"{year}{month}{day}_{hour}"
     
     # Create output directory

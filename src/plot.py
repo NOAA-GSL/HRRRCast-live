@@ -26,6 +26,7 @@ from matplotlib.patches import Rectangle
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import utils
 
 # Configure logging
 logging.basicConfig(
@@ -331,24 +332,6 @@ class ForecastPlotter:
             logger.error(f"Error creating summary plot: {e}")
 
 
-def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
-    """Validate and format any datetime string that Python can parse."""
-    try:
-        # Parse the datetime string using dateutil parser (very flexible)
-        dt = parser.parse(datetime_str)
-        
-        # Format components with proper padding
-        year = f"{dt.year:04d}"
-        month = f"{dt.month:02d}"
-        day = f"{dt.day:02d}"
-        hour = f"{dt.hour:02d}"
-        
-        return dt, year, month, day, hour
-        
-    except (ValueError, TypeError, parser.ParserError) as e:
-        raise ValueError(f"Invalid date/time: {e}")
-
-
 def plot_lead_hour(h, ds_path, init_datetime, init_year, init_month, init_day, init_hh, output_dir, date_str, member, config_dict):
     import xarray as xr
     import os
@@ -365,7 +348,7 @@ def plot_lead_hour(h, ds_path, init_datetime, init_year, init_month, init_day, i
         valid_datetime = init_datetime + timedelta(hours=h)
         timestamp_str = f"{init_year}-{init_month}-{init_day} {init_hh}:00 UTC"
         output_subdir = f"{output_dir}/{date_str}/{date_str}_mem{member}_lead{h:02d}h"
-        Path(output_subdir).mkdir(parents=True, exist_ok=True)
+        utils.make_directory(output_subdir)
         plotter.plot_pressure_level_variables(ds, h, output_subdir, timestamp_str)
         plotter.plot_surface_variables(ds, h, output_subdir, timestamp_str)
         plotter.create_summary_plot(ds, h, output_subdir, timestamp_str)
@@ -379,7 +362,7 @@ def plot_forecast_data(datetime_str: str,
     """Main plotting function. Plots all hours from 1 to lead_hour (inclusive) in parallel."""
     try:
         # Validate inputs
-        init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
+        init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         lead_hour_int = int(lead_hour)
         

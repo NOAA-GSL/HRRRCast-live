@@ -26,6 +26,8 @@ import pygrib as pg
 import xarray as xr
 import xesmf as xe
 
+import utils
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -386,25 +388,6 @@ class GRIBPreprocessor:
             raise
 
 
-def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
-    """Validate and format any datetime string that Python can parse."""
-    try:
-        # Parse the datetime string using dateutil parser (very flexible)
-        dt = parser.parse(datetime_str)
-        
-        # Format components with proper padding
-        year = f"{dt.year:04d}"
-        month = f"{dt.month:02d}"
-        day = f"{dt.day:02d}"
-        hour = f"{dt.hour:02d}"
-        
-        return dt, year, month, day, hour
-        
-    except (ValueError, TypeError, parser.ParserError) as e:
-        raise ValueError(f"Invalid date/time: {e}")
-
-
-
 def preprocess_grib_data(norm_file: str, datetime_str: str,
                         lead_hours: str,
                         base_dir: str = "./", output_dir: str = "./", 
@@ -422,11 +405,11 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
         logger.info(f"Using {n_workers} worker processes for parallel processing (one per lead hour, skipping 0th hour)")
         
         # Setup paths
-        init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
+        init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         
         # Create output directory if it doesn't exist
-        Path(f"{output_dir}/{date_str}").mkdir(parents=True, exist_ok=True)
+        utils.make_directory(f"{output_dir}/{date_str}")
         output_file = f"{output_dir}/{date_str}/gfs_{date_str}.npz"
         
         # Validate normalization file exists
