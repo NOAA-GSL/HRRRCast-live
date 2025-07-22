@@ -13,6 +13,8 @@ source etc/env.sh
 
 # set vars
 init_time="@[INIT_TIME]"
+PACKAGEROOT=[PACKAGEROOT]
+DATAROOT=@[DATAROOT]
 year=`echo $init_time |cut -c1-4`
 month=`echo $init_time |cut -c6-7`
 day=`echo $init_time |cut -c9-10`
@@ -20,4 +22,4 @@ hour=`echo $init_time |cut -c12-13`
 
 # make ics
 echo "In make_ics, init_time=${init_time}, year/month/day/hour/,${year} ${month} ${day} ${hour}"
-python3 src/make_ics.py net-diffusion/normalize.nc ${init_time}
+python3 ${PACKAGEROOT}/src/make_ics.py net-diffusion/normalize.nc ${init_time} --base_dir ${DATAROOT} --output_dir ${DATAROOT}

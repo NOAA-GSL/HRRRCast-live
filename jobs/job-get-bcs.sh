@@ -14,10 +14,12 @@ source etc/env.sh
 # set vars
 init_time="@[INIT_TIME]"
 lead_hour=@[LEAD_HOUR]
+PACKAGEROOT=[PACKAGEROOT]
+DATAROOT=@[DATAROOT]
 year=`echo $init_time |cut -c1-4`
 month=`echo $init_time |cut -c6-7`
 day=`echo $init_time |cut -c9-10`
 hour=`echo $init_time |cut -c12-13`
  
 echo "In get_bcs, init_time=${init_time}, year/month/day/hour/,${year} ${month} ${day} ${hour}, lead_hour=${lead_hour}"
-python3 src/get_bcs.py ${init_time} ${lead_hour}
+python3 ${PACKAGEROOT}/src/get_bcs.py ${init_time} ${lead_hour} --base_dir ${DATAROOT}

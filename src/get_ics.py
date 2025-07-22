@@ -163,7 +163,7 @@ def download_hrrr_files(year: str, month: str, day: str, hour: str, output_dir: 
 # -------------------------------
 # Main Functions
 # -------------------------------
-def download_hrrr_data(datetime_str: str, base_dir: str = "./") -> dict:
+def download_hrrr_data(datetime_str: str, base_dir: str = "{DATAROOT}/") -> dict:
     """Download HRRR initial condition data for specified date and time."""
     logger = logging.getLogger(__name__)
     
@@ -195,15 +195,15 @@ def main():
         epilog="""
 Examples:
   python get_ics.py 2024-01-15T12
-  python get_ics.py 2024-01-15T12 --base-dir /data/weather
-  python get_ics.py 2024-01-15T12 --log-level DEBUG
+  python get_ics.py 2024-01-15T12 --base_dir /data/weather
+  python get_ics.py 2024-01-15T12 --log_level DEBUG
         """
     )
     
     parser.add_argument('inittime',
                        help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
-    parser.add_argument('--base-dir', default='./', help='Base directory for downloads (default: ./)')
-    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+    parser.add_argument('--base_dir', default='./', help='Base directory for downloads (default: ./)')
+    parser.add_argument('--log_level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        help='Set logging level (default: INFO)')
     
     args = parser.parse_args()

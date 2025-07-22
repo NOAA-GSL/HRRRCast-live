@@ -23,6 +23,7 @@ import xarray as xr
 from tqdm import tqdm
 
 from nc2grib import Netcdf2Grib
+from data_dissm import FTPClient
 
 # Import custom modules (assuming they exist)
 try:

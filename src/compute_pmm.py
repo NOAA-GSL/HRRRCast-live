@@ -37,6 +37,8 @@ import numpy as np
 import xarray as xr
 import glob
 
+from nc2grib import Netcdf2Grib
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -298,6 +300,10 @@ def compute_ensemble_pmm(datetime_str: str,
         
         logger.info(f"Saving processed ensemble data to: {output_path}")
         processed_ds.to_netcdf(output_path)
+
+        #conver to grib2 files:
+        converter = Netcdf2Grib()
+        converter.save_grib2(init_datetime, processed_ds, self.member, output_date_dir)
         
         logger.info(f"Ensemble post-processing completed successfully")
         

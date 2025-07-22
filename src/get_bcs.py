@@ -233,16 +233,16 @@ def main():
 Examples:
   python get_lbcs.py 2024-01-15T12 0    # Single file
   python get_lbcs.py 2024-01-15T12 24   # 24-hour boundary conditions
-  python get_lbcs.py 2024-01-15T12 48 --base-dir /data/weather
-  python get_lbcs.py 2024-01-15T12 36 --log-level DEBUG
+  python get_lbcs.py 2024-01-15T12 48 --base_dir /data/weather
+  python get_lbcs.py 2024-01-15T12 36 --log_level DEBUG
         """
     )
     
     parser.add_argument('inittime',
                        help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument('lead_hours', type=int, help='Lead time in hours for boundary conditions')
-    parser.add_argument('--base-dir', default='./', help='Base directory for downloads (default: ./)')
-    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+    parser.add_argument('--base_dir', default='./', help='Base directory for downloads (default: ./)')
+    parser.add_argument('--log_level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        help='Set logging level (default: INFO)')
     
     args = parser.parse_args()
