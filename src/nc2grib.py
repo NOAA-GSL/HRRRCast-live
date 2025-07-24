@@ -5,6 +5,7 @@
 """
 
 import os
+import logging
 from datetime import datetime, timedelta
 import glob
 import subprocess
@@ -14,6 +15,13 @@ import iris
 from iris.coords import DimCoord
 import iris_grib
 import eccodes
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 class Netcdf2Grib:
     def __init__(self):
@@ -60,11 +68,9 @@ class Netcdf2Grib:
             Returns:
               No return values, will save to grib2 file
         """
-        #forecast_starttime = forecasts.time.values[0].astype('M8[ms]').astype(datetime)
-        #forecasts = forecasts.isel(time=0, drop=True)
-        forecasts = forecasts.rename({'time': 'init_time'})
+        forecasts = forecasts.isel(time=0, drop=True)
+        #forecasts = forecasts.rename({'time': 'init_time'})
         forecasts = forecasts.rename({'lead_time': 'time'})
-        forecasts['longitude'] = forecasts['longitude'] #+ 360.0
 
         #dx, dy
         ny, nx = forecasts.latitude.shape
@@ -127,9 +133,9 @@ class Netcdf2Grib:
 
         times = cubes[0].coord('time').points
         cycle = forecast_starttime.hour
-        print(f'Forecast start time is {forecast_starttime}')
+        logging.info(f'Forecast start time is {forecast_starttime}')
 
-        datevectors = [forecast_starttime + timedelta(hours=int(t)) for t in times]
+        datevectors = [forecast_starttime + timedelta(seconds=int(t)) for t in times]
 
         time_fmt_str = '00:00:00'
         time_unit_str = f"Hours since {forecast_starttime.strftime('%Y-%m-%d %H:00:00')}"
@@ -139,18 +145,17 @@ class Netcdf2Grib:
         new_time_coord = iris.coords.DimCoord(new_time_points, standard_name='time', units=new_time_unit)
 
         for idate, date in enumerate(datevectors):
-            print(f"Processing for time {date.strftime('%Y-%m-%d %H:00:00')}")
+            logging.info(f"Processing for time {date.strftime('%Y-%m-%d %H:00:00')}")
             hrs = int((date - forecast_starttime).total_seconds() // 3600)
-            #outfile = os.path.join(outdir, f'graphcastgfs.t{cycle:02d}z.pgrb2.0p25.f{hrs:03d}')
+
             if member == "avg":
                 outfile = os.path.join(outdir, f'hrrrcast.avg.t{cycle:02d}z.pgrb2.0p25.f{hrs:03d}')
             else:
                 outfile = os.path.join(outdir, f'hrrrcast.m{member:02d}.t{cycle:02d}z.pgrb2.0p25.f{hrs:03d}')
-            print(outfile)
+            logging.info(f"grib2 file name: {outfile}")
 
             for cube in sorted(cubes, key=lambda cube: cube.name()):
                 var_name = cube.name()
-                print(var_name)
 
                 # Adjust cube for different variables
                 time_coord_dim = cube.coord_dims('time')
@@ -218,13 +223,12 @@ class Netcdf2Grib:
                     # Execute the wgrib2 command and redirect stdout to the output file
                     subprocess.run(wgrib2_command, stdout=f_out, check=True)
             
-                print(f"Index file created successfully: {output_idx_file}")
+                logging.info(f"Index file created successfully: {output_idx_file}")
             
             except subprocess.CalledProcessError as e:
-                print(f"Error running wgrib2 command: {e}")
+                logging.info(f"Error running wgrib2 command: {e}")
     
-
         # Remove intermediate netCDF file
-        #if os.path.isfile(filename):
-        #    print(f'Deleting intermediate nc file {filename}: ')
-        #    os.remove(filename)
+        if os.path.isfile(filename):
+            logging.info(f'Deleting intermediate nc file {filename}: ')
+            os.remove(filename)

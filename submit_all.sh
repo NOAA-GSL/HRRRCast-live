@@ -56,8 +56,7 @@ if [ $USE_DIFFUSION -eq 0 ]; then
 else
     # run two ensemble members
     jobids=()
-    ###for MEMBER in {0..2}; do
-    for MEMBER in {0..0}; do
+    for MEMBER in {0..2}; do
         atparse < $PACKAGEROOT/jobs/job-fcst.sh > $DATAROOT/logs/job-fcst-${MEMBER}.sh
         jobid5=$(submit_with_check sbatch --dependency=afterok:$jobid3:$jobid4 --parsable $DATAROOT/logs/job-fcst-${MEMBER}.sh)
         jobids+=($jobid5)

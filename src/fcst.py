@@ -377,23 +377,23 @@ class WeatherForecaster:
             init_month = self.metadata['init_month']
             init_day = self.metadata['init_day']
             init_hh = self.metadata['init_hh']
-            logger.info(f"init date is {init_year}, {init_month}, {init_day}, {init_hh}")
-            #date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+            date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
 
-            #outdir = f'./hrrrcast.{init_year}{init_month}{init_day}/{init_hh}'
-            outdir = f'./{init_year}{init_month}{init_day}/{init_hh}'
-            logger.info(f" outdir is {outdir}")
-            Path(outdir).mkdir(parents=True, exist_ok=True)
-            
-            #output_file = f"{output_dir}/{date_str}/hrrrcast_{date_str}_mem{self.member}.nc"
-            logger.info(f"Saving forecast to {outdir}")
-            #outdata_xr.to_netcdf(output_file)
+            # Create a new directory for grib2 files
+            outdir = Path(f"{output_dir}/hrrrcast.{date_str}")
+            outdir.mkdir(parents=True, exist_ok=True)
+
+            # Save a seperate netCDF file to post-processing, this file doesn't work for nc2grib
+            output_file = f"{outdir}/hrrrcast_mem{self.member}.nc"
+            logger.info(f"Saving forecast to {output_file} for compute pmm!")
+            outdata_xr.to_netcdf(output_file)
 
             converter = Netcdf2Grib()
             converter.save_grib2(init_datetime, outdata_xr, self.member, outdir)
             
             logger.info("Forecast completed successfully")
-            return outdata_xr, outdir
+
+            return outdata_xr, output_file
             
         except Exception as e:
             logger.error(f"Forecast failed: {e}")
@@ -419,9 +419,9 @@ def run_weather_forecast(model_path: str, init_year: str, init_month: str,
         forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member)
         
         # Run forecast
-        forecast_dataset, outdir = forecaster.run_forecast(model, lead_hours, output_dir)
+        forecast_dataset, output_file = forecaster.run_forecast(model, lead_hours, output_dir)
         
-        return forecast_dataset, outdir
+        return forecast_dataset, output_file
         
     except Exception as e:
         logger.error(f"Weather forecast failed: {e}")
@@ -459,7 +459,7 @@ def main():
         logging.getLogger().setLevel(getattr(logging, args.log_level))
         
         # Run forecast
-        forecast_dataset, outdir = run_weather_forecast(
+        forecast_dataset, output_file = run_weather_forecast(
             model_path=args.model_path,
             init_year=args.init_year,
             init_month=args.init_month,
@@ -471,7 +471,7 @@ def main():
             output_dir=args.output_dir
         )
         
-        logger.info(f"Forecast complete. Output saved to: {outdir}")
+        logger.info(f"Forecast complete. Output saved to: {output_file}")
         
     except Exception as e:
         logger.error(f"Application failed: {e}")

@@ -194,8 +194,7 @@ class ForecastPlotter:
                 try:
                     # Extract data for this variable and level
                     # Use lead_time dimension and select first time step (time=0)
-                    #data = ds[var_name].isel(time=0, lead_time=lead_hour, level=level_idx).values
-                    data = ds[var_name].isel(init_time=0, time=lead_hour, level=level_idx).values
+                    data = ds[var_name].isel(time=0, lead_time=lead_hour, level=level_idx).values
                     
                     # Create plot
                     fig = self.create_plot(data, lats, lons, var_name, level, title_suffix)
@@ -234,8 +233,7 @@ class ForecastPlotter:
             try:
                 # Extract data for this variable
                 # Use lead_time dimension and select first time step (time=0)
-                #data = ds[var_name].isel(time=0, lead_time=lead_hour).values
-                data = ds[var_name].isel(init_time=0, time=lead_hour).values
+                data = ds[var_name].isel(time=0, lead_time=lead_hour).values
                 
                 # Create plot
                 fig = self.create_plot(data, lats, lons, var_name, None, title_suffix)
@@ -294,10 +292,9 @@ class ForecastPlotter:
                 if level is not None:
                     # Find level index
                     level_idx = self.config.levels.index(level) if level in self.config.levels else 0
-                    #data = ds[var_name].isel(time=0, lead_time=lead_hour, level=level_idx).values
-                    data = ds[var_name].isel(init_time=0, time=lead_hour, level=level_idx).values
+                    data = ds[var_name].isel(time=0, lead_time=lead_hour, level=level_idx).values
                 else:
-                    data = ds[var_name].isel(init_time=0, time=lead_hour).values
+                    data = ds[var_name].isel(time=0, lead_time=lead_hour).values
                 
                 # Get colormap
                 var_config = self.config.var_configs.get(var_display, {})
@@ -368,12 +365,7 @@ def plot_forecast_data(datetime_str: str,
         logger.info(f"Valid time: {valid_datetime}")
         
         # Setup paths
-        #forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_{date_str}_mem{member}.nc"
-        if member == "avg":
-            forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_avg.nc"
-        else:
-            ensmem = int(member)
-            forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_m{ensmem:02d}.nc"
+        forecast_file = f"{forecast_dir}/hrrrcast.{date_str}/hrrrcast_mem{member}.nc"
 
         logger.info(f"Forecast file: {forecast_file}")
         
@@ -394,8 +386,7 @@ def plot_forecast_data(datetime_str: str,
         ds = plotter.load_forecast_data(forecast_file)
         
         # Validate lead hour exists in data
-        #if lead_hour_int >= len(ds.lead_time):
-        if lead_hour_int >= len(ds.time):
+        if lead_hour_int >= len(ds.lead_time):
             raise ValueError(f"Lead hour {lead_hour_int} not available in forecast data (max: {len(ds.time)-1})")
         
         # Plot variables
