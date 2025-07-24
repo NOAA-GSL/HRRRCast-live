@@ -194,7 +194,8 @@ class ForecastPlotter:
                 try:
                     # Extract data for this variable and level
                     # Use lead_time dimension and select first time step (time=0)
-                    data = ds[var_name].isel(time=0, lead_time=lead_hour, level=level_idx).values
+                    #data = ds[var_name].isel(time=0, lead_time=lead_hour, level=level_idx).values
+                    data = ds[var_name].isel(init_time=0, time=lead_hour, level=level_idx).values
                     
                     # Create plot
                     fig = self.create_plot(data, lats, lons, var_name, level, title_suffix)
@@ -233,7 +234,8 @@ class ForecastPlotter:
             try:
                 # Extract data for this variable
                 # Use lead_time dimension and select first time step (time=0)
-                data = ds[var_name].isel(time=0, lead_time=lead_hour).values
+                #data = ds[var_name].isel(time=0, lead_time=lead_hour).values
+                data = ds[var_name].isel(init_time=0, time=lead_hour).values
                 
                 # Create plot
                 fig = self.create_plot(data, lats, lons, var_name, None, title_suffix)
@@ -292,9 +294,10 @@ class ForecastPlotter:
                 if level is not None:
                     # Find level index
                     level_idx = self.config.levels.index(level) if level in self.config.levels else 0
-                    data = ds[var_name].isel(time=0, lead_time=lead_hour, level=level_idx).values
+                    #data = ds[var_name].isel(time=0, lead_time=lead_hour, level=level_idx).values
+                    data = ds[var_name].isel(init_time=0, time=lead_hour, level=level_idx).values
                 else:
-                    data = ds[var_name].isel(time=0, lead_time=lead_hour).values
+                    data = ds[var_name].isel(init_time=0, time=lead_hour).values
                 
                 # Get colormap
                 var_config = self.config.var_configs.get(var_display, {})
@@ -355,7 +358,7 @@ def plot_forecast_data(datetime_str: str,
     try:
         # Validate inputs
         init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
-        date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+        date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
         lead_hour_int = int(lead_hour)
         
         # Calculate forecast valid time
@@ -365,11 +368,18 @@ def plot_forecast_data(datetime_str: str,
         logger.info(f"Valid time: {valid_datetime}")
         
         # Setup paths
-        forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_{date_str}_mem{member}.nc"
+        #forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_{date_str}_mem{member}.nc"
+        if member == "avg":
+            forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_avg.nc"
+        else:
+            ensmem = int(member)
+            forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_m{ensmem:02d}.nc"
+
+        logger.info(f"Forecast file: {forecast_file}")
         
         # Create output directory
         timestamp_str = f"{init_year}-{init_month}-{init_day} {init_hh}:00 UTC"
-        output_subdir = f"{output_dir}/{date_str}/{date_str}_mem{member}_lead{lead_hour_int:02d}h"
+        output_subdir = f"{output_dir}/{date_str}/mem{member}_lead{lead_hour_int:02d}h"
         Path(output_subdir).mkdir(parents=True, exist_ok=True)
         
         # Validate forecast file exists
@@ -384,8 +394,9 @@ def plot_forecast_data(datetime_str: str,
         ds = plotter.load_forecast_data(forecast_file)
         
         # Validate lead hour exists in data
-        if lead_hour_int >= len(ds.lead_time):
-            raise ValueError(f"Lead hour {lead_hour_int} not available in forecast data (max: {len(ds.lead_time)-1})")
+        #if lead_hour_int >= len(ds.lead_time):
+        if lead_hour_int >= len(ds.time):
+            raise ValueError(f"Lead hour {lead_hour_int} not available in forecast data (max: {len(ds.time)-1})")
         
         # Plot variables
         plotter.plot_pressure_level_variables(ds, lead_hour_int, output_subdir, timestamp_str)

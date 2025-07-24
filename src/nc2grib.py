@@ -61,7 +61,8 @@ class Netcdf2Grib:
               No return values, will save to grib2 file
         """
         #forecast_starttime = forecasts.time.values[0].astype('M8[ms]').astype(datetime)
-        forecasts = forecasts.isel(time=0, drop=True)
+        #forecasts = forecasts.isel(time=0, drop=True)
+        forecasts = forecasts.rename({'time': 'init_time'})
         forecasts = forecasts.rename({'lead_time': 'time'})
         forecasts['longitude'] = forecasts['longitude'] #+ 360.0
 
@@ -102,7 +103,11 @@ class Netcdf2Grib:
             'standard_name': 'longitude',       
         }
 
-        filename = os.path.join(outdir, f"forecast_to_grib2_{member}.nc")
+        if member == "avg":
+            filename = os.path.join(outdir, f"hrrrcast_avg.nc")
+        else:
+            filename = os.path.join(outdir, f"hrrrcast_m{member:02d}.nc")
+        # write to netCDF file
         forecasts.to_netcdf(filename)
 
         # Load cubes from netCDF file
@@ -137,7 +142,10 @@ class Netcdf2Grib:
             print(f"Processing for time {date.strftime('%Y-%m-%d %H:00:00')}")
             hrs = int((date - forecast_starttime).total_seconds() // 3600)
             #outfile = os.path.join(outdir, f'graphcastgfs.t{cycle:02d}z.pgrb2.0p25.f{hrs:03d}')
-            outfile = os.path.join(outdir, f'hrrrcast.m{member}.t{cycle:02d}z.pgrb2.0p25.f{hrs:03d}')
+            if member == "avg":
+                outfile = os.path.join(outdir, f'hrrrcast.avg.t{cycle:02d}z.pgrb2.0p25.f{hrs:03d}')
+            else:
+                outfile = os.path.join(outdir, f'hrrrcast.m{member:02d}.t{cycle:02d}z.pgrb2.0p25.f{hrs:03d}')
             print(outfile)
 
             for cube in sorted(cubes, key=lambda cube: cube.name()):
@@ -217,6 +225,6 @@ class Netcdf2Grib:
     
 
         # Remove intermediate netCDF file
-        if os.path.isfile(filename):
-            print(f'Deleting intermediate nc file {filename}: ')
-            os.remove(filename)
+        #if os.path.isfile(filename):
+        #    print(f'Deleting intermediate nc file {filename}: ')
+        #    os.remove(filename)

@@ -20,8 +20,12 @@ submit_with_check() {
 }
 
 source ./atparse.bash
-mkdir -p $DATAROOT/logs
+if [ ! -d "$DIRECTORY" ]; then
+    mkdir -p $DATAROOT/logs
+fi
 cd $DATAROOT
+
+echo "PACKAGEROOT=$PACKAGEROOT,DATAROOT=$DATAROOT"
 
 atparse < $PACKAGEROOT/jobs/job-get-ics.sh > $DATAROOT/logs/job-get-ics.sh
 jobid1=$(submit_with_check sbatch --parsable $DATAROOT/logs/job-get-ics.sh)
@@ -52,7 +56,8 @@ if [ $USE_DIFFUSION -eq 0 ]; then
 else
     # run two ensemble members
     jobids=()
-    for MEMBER in {0..2}; do
+    ###for MEMBER in {0..2}; do
+    for MEMBER in {0..0}; do
         atparse < $PACKAGEROOT/jobs/job-fcst.sh > $DATAROOT/logs/job-fcst-${MEMBER}.sh
         jobid5=$(submit_with_check sbatch --dependency=afterok:$jobid3:$jobid4 --parsable $DATAROOT/logs/job-fcst-${MEMBER}.sh)
         jobids+=($jobid5)
@@ -64,7 +69,7 @@ else
     done
     
     # ensemble PMM
-    MEMBER="_mean"
+    MEMBER="avg"
     
     atparse < $PACKAGEROOT/jobs/job-compute-pmm.sh > $DATAROOT/logs/job-compute-pmm.sh
     jobid7=$(submit_with_check sbatch --dependency=afterok:$(IFS=:; echo "${jobids[*]}") --parsable $DATAROOT/logs/job-compute-pmm.sh)

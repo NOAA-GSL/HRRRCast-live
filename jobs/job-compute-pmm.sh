@@ -8,19 +8,19 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --time=00:10:00
 
-# conda
-source etc/env.sh
-
 #set vars
 init_time="@[INIT_TIME]"
 lead_hour=@[LEAD_HOUR]
 member=@[MEMBER]
-PACKAGEROOT=[PACKAGEROOT]
-DATAROOT=[DATAROOT]
+PACKAGEROOT=@[PACKAGEROOT]
+DATAROOT=@[DATAROOT]
 year=`echo $init_time |cut -c1-4`
 month=`echo $init_time |cut -c6-7`
 day=`echo $init_time |cut -c9-10`
 hour=`echo $init_time |cut -c12-13`
+
+# conda
+source ${PACKAGEROOT}/etc/env.sh
 
 echo "In compute_pmm, init_time=${init_time}, year/month/day/hour/=${year} ${month} ${day} ${hour}"
 python3 ${PACKAGEROOT}/src/compute_pmm.py ${init_time} --forecast_dir ${DATAROOT} --output_dir ${DATAROOT}

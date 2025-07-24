@@ -210,7 +210,8 @@ def find_ensemble_files(date_str: str, forecast_dir: str) -> List[str]:
         raise FileNotFoundError(f"Directory {date_dir} does not exist")
     
     # Pattern for ensemble files
-    pattern = os.path.join(date_dir, f"hrrrcast_{date_str}_mem*.nc")
+    #pattern = os.path.join(date_dir, f"hrrrcast_{date_str}_mem*.nc")
+    pattern = os.path.join(date_dir, f"hrrrcast_m*.nc")
     files = glob.glob(pattern)
     
     if not files:
@@ -246,7 +247,7 @@ def compute_ensemble_pmm(datetime_str: str,
     try:
         # Validate inputs
         init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
-        date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+        date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
         
         logger.info(f"Computing ensemble post-processing for initialization time: {date_str}")
         
@@ -295,11 +296,11 @@ def compute_ensemble_pmm(datetime_str: str,
         processed_ds.attrs['source_files'] = [os.path.basename(f) for f in ensemble_files]
         
         # Save processed result
-        output_filename = f"hrrrcast_{date_str}_mem_mean.nc"
+        output_filename = f"hrrrcast.avg.nc"
         output_path = os.path.join(output_date_dir, output_filename)
         
         logger.info(f"Saving processed ensemble data to: {output_path}")
-        processed_ds.to_netcdf(output_path)
+        #processed_ds.to_netcdf(output_path)
 
         #conver to grib2 files:
         converter = Netcdf2Grib()
