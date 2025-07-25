@@ -17,10 +17,10 @@ underestimated extremes. PMM preserves the distribution of the ensemble mean whi
 maintaining the spatial structure of individual ensemble members.
 
 Input files should follow the naming convention:
-  YYYYMMDD_HH/hrrrcast_YYYYMMDD_HH_memN.nc
+  YYYYMMDD/HH/hrrrcast_memN.nc
 
 Output files are saved as:
-  YYYYMMDD_HH/hrrrcast_YYYYMMDD_HH_processed.nc
+  YYYYMMDD/HH/hrrrcast_memavg.nc
 
 Usage:
   python ensemble_postprocess.py "2024-05-06T23" --forecast_dir /path/to/data
@@ -246,7 +246,7 @@ def compute_ensemble_pmm(datetime_str: str,
     try:
         # Validate inputs
         init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
-        date_str = f"hrrrcast.{init_year}{init_month}{init_day}/{init_hh}"
+        date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
         
         logger.info(f"Computing ensemble post-processing for initialization time: {date_str}")
         

@@ -7,7 +7,7 @@ by the forecasting model. This stage is CPU-intensive and handles all the
 GRIB file parsing and normalization.
 
 Usage:
-    python preprocess_grib.py <norm_file> <year> <month> <day> <hour> [--base_dir DIR] [--output_dir DIR]
+    python preprocess_grib.py <norm_file> <inittime> [--base_dir DIR] [--output_dir DIR]
 """
 
 import argparse
@@ -206,13 +206,14 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
         
         # Setup paths
         init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
-        date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
-        hrrr_pres_file = f"{base_dir}/{date_str}/hrrr_{date_str}_pressure.grib2"
-        hrrr_sfc_file = f"{base_dir}/{date_str}/hrrr_{date_str}_surface.grib2"
+        date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
+        date_string = f"{init_year}{init_month}{init_day}_{init_hh}"
+        hrrr_pres_file = f"{base_dir}/{date_str}/hrrr_{date_string}_pressure.grib2"
+        hrrr_sfc_file = f"{base_dir}/{date_str}/hrrr_{date_string}_surface.grib2"
         
         # Create output directory if it doesn't exist
         Path(f"{output_dir}/{date_str}").mkdir(parents=True, exist_ok=True)
-        output_file = f"{output_dir}/{date_str}/hrrr_{date_str}.npz"
+        output_file = f"{output_dir}/{date_str}/hrrr_{date_string}.npz"
         
         # Validate required files exist
         for file_path in [norm_file, hrrr_pres_file, hrrr_sfc_file]:

@@ -169,7 +169,7 @@ def download_hrrr_data(datetime_str: str, base_dir: str = "{DATAROOT}/") -> dict
     
     # Validate inputs
     init_datetime, year, month, day, hour = validate_datetime(datetime_str)
-    date_str = f"{year}{month}{day}_{hour}"
+    date_str = f"{year}{month}{day}/{hour}"
     
     # Create output directory
     output_dir = create_output_directory(base_dir, date_str)

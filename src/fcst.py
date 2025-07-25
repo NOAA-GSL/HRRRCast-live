@@ -380,7 +380,7 @@ class WeatherForecaster:
             date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
 
             # Create a new directory for grib2 files
-            outdir = Path(f"{output_dir}/hrrrcast.{date_str}")
+            outdir = Path(f"{output_dir}/{date_str}")
             outdir.mkdir(parents=True, exist_ok=True)
 
             # Save a seperate netCDF file to post-processing, this file doesn't work for nc2grib
@@ -406,9 +406,10 @@ def run_weather_forecast(model_path: str, init_year: str, init_month: str,
     """Main forecasting function."""
     try:
         # Load preprocessed data
-        date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
-        hrrr_preprocessed_file = f"{base_dir}/{date_str}/hrrr_{date_str}.npz"
-        gfs_preprocessed_file = f"{base_dir}/{date_str}/gfs_{date_str}.npz"
+        date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
+        date_string = f"{init_year}{init_month}{init_day}_{init_hh}"
+        hrrr_preprocessed_file = f"{base_dir}/{date_str}/hrrr_{date_string}.npz"
+        gfs_preprocessed_file = f"{base_dir}/{date_str}/gfs_{date_string}.npz"
         data_loader_hrrr = PreprocessedDataLoader(hrrr_preprocessed_file)
         data_loader_gfs = PreprocessedDataLoader(gfs_preprocessed_file)
         

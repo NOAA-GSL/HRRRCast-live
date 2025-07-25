@@ -6,7 +6,7 @@ This script plots each variable from the forecast output and saves them as separ
 It handles both pressure level and surface variables from the HRRR forecast data.
 
 Usage:
-    python plot_forecast.py <init_year> <init_month> <init_day> <init_hh> <lead_hour> [--forecast_dir DIR] [--output_dir DIR]
+    python plot_forecast.py <init_time> <lead_hour> <member> [--forecast_dir DIR] [--output_dir DIR]
 """
 
 import argparse

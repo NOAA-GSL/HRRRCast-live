@@ -17,7 +17,7 @@ year=`echo $init_time |cut -c1-4`
 month=`echo $init_time |cut -c6-7`
 day=`echo $init_time |cut -c9-10`
 hour=`echo $init_time |cut -c12-13`
-date_str="${year}${month}${day}_${hour}"
+date_str="${year}${month}${day}/${hour}"
 
 # conda
 source ${PACKAGEROOT}/etc/env.sh
