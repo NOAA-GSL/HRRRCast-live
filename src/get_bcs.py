@@ -15,6 +15,7 @@ from typing import List, Tuple
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import utils
 
 # -------------------------------
 # Configuration
@@ -45,27 +46,10 @@ def setup_logging(log_level: str = 'INFO') -> logging.Logger:
 # -------------------------------
 # Utility Functions
 # -------------------------------
-def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
-    """Validate and format any datetime string that Python can parse."""
-    try:
-        # Parse the datetime string using dateutil parser (very flexible)
-        dt = parser.parse(datetime_str)
-        
-        # Format components with proper padding
-        year = f"{dt.year:04d}"
-        month = f"{dt.month:02d}"
-        day = f"{dt.day:02d}"
-        hour = f"{dt.hour:02d}"
-        
-        return dt, year, month, day, hour
-        
-    except (ValueError, TypeError, parser.ParserError) as e:
-        raise ValueError(f"Invalid date/time: {e}")
-
 def create_output_directory(base_dir: str, date_str: str) -> Path:
     """Create output directory if it doesn't exist."""
     output_dir = Path(base_dir) / date_str
-    output_dir.mkdir(parents=True, exist_ok=True)
+    utils.make_directory(output_dir)
     return output_dir
 
 def download_file_with_retry(url: str, output_path: str, max_retries: int = Config.MAX_RETRIES) -> bool:
@@ -115,7 +99,7 @@ def download_file_with_retry(url: str, output_path: str, max_retries: int = Conf
 # GFS Download Functions
 # -------------------------------
 def get_gfs_urls(year: str, month: str, day: str, hour: str, lead_hours: int) -> List[Tuple[str, str]]:
-    """Generate GFS download URLs and filenames for boundary conditions."""
+    """Generate GFS download URLs and filenames for boundary conditions, skipping the 0th hour."""
     urls = []
     hour_int = int(hour)
     cycle_hours = [0, 6, 12, 18]
@@ -149,8 +133,10 @@ def get_gfs_urls(year: str, month: str, day: str, hour: str, lead_hours: int) ->
         else:
             start_forecast_hour = hour_int - init_cycle
     
-    # Generate URLs for all forecast hours from start to start + lead_hours
+    # Generate URLs for all forecast hours from start to start + lead_hours, skipping 0th hour
     for fh in range(start_forecast_hour, start_forecast_hour + lead_hours + 1):
+        if fh == 0:
+            continue  # skip 0th hour
         forecast_str = f"{fh:03d}"
         url = f"{Config.GFS_BASE_URL}/gfs.{init_date_str}/{cycle_str}/atmos/gfs.t{cycle_str}z.pgrb2.0p25.f{forecast_str}"
         
@@ -205,7 +191,7 @@ def download_gfs_data(datetime_str: str, lead_hours: int, base_dir: str = "./") 
     logger = logging.getLogger(__name__)
     
     # Validate inputs
-    init_datetime, year, month, day, hour = validate_datetime(datetime_str)
+    init_datetime, year, month, day, hour = utils.validate_datetime(datetime_str)
     date_str = f"{year}{month}{day}/{hour}"
     
     # Create output directory

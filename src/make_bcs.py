@@ -18,11 +18,15 @@ from datetime import datetime, timedelta
 from dateutil import parser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
 
 import numpy as np
 import pygrib as pg
 import xarray as xr
 import xesmf as xe
+
+import utils
 
 # Configure logging
 logging.basicConfig(
@@ -106,8 +110,7 @@ class GridInterpolator:
                 "lon": ("x", gfs_lons[0, :])
             })
             filename = "gfs_to_hrrr_weights.nc"
-            reuse = False if self.regridder is None else os.path.exists(filename)
-            self.regridder = xe.Regridder(src_ds, self.hrrr_ds, "bilinear", reuse_weights=reuse, filename=filename)
+            self.regridder = xe.Regridder(src_ds, self.hrrr_ds, "bilinear", reuse_weights=True, filename=filename)
         return self.regridder
 
     def interpolate_to_hrrr_grid(self, gfs_data: np.ndarray, gfs_lats: np.ndarray,
@@ -119,6 +122,106 @@ class GridInterpolator:
         regridder = self.get_regridder(gfs_lats, gfs_lons)
         regridded = regridder(da)
         return regridded.values
+
+
+def process_single_lead_hour(args):
+    """Process a single lead hour for both pressure and surface variables."""
+    lead_time, init_datetime, base_dir, norm_file, hrrr_grid_file = args
+    
+    # Create a new preprocessor instance for this process
+    config = WeatherPreprocessConfig(hrrr_grid_file)
+    preprocessor = GRIBPreprocessor(config)
+    
+    # Get filename for this lead time
+    gfs_file = preprocessor.get_valid_time_filename(init_datetime, lead_time, base_dir)
+    
+    if not os.path.exists(gfs_file):
+        raise FileNotFoundError(f"GFS file not found for lead time {lead_time}h: {gfs_file}")
+    
+    logger.info(f"Processing lead time {lead_time}h from file: {os.path.basename(gfs_file)}")
+    
+    # Load normalization data
+    norms = xr.open_dataset(norm_file)['UGRD'].values
+    
+    # Process pressure level variables
+    varnames = ['gh', 'q', 't', 'u', 'v', 'w']
+    grbs = pg.open(gfs_file)
+    
+    # Get GFS grid coordinates
+    first_grb = grbs.select(shortName='gh', level=config.levels[0])[0]
+    gfs_lats, gfs_lons = first_grb.latlons()
+    
+    normalized_vals, raw_vals = [], []
+    
+    for v_idx, var in enumerate(varnames):
+        selected = grbs.select(shortName=var, level=config.levels)
+        
+        if len(selected) != len(config.levels):
+            logger.warning(f"Expected {len(config.levels)} levels for {var} at lead {lead_time}h, got {len(selected)}")
+        
+        for l_idx, grb in enumerate(selected):
+            # Get original GFS data
+            gfs_vals = grb.values
+            
+            # Interpolate to HRRR grid
+            hrrr_vals = preprocessor.interpolator.interpolate_to_hrrr_grid(gfs_vals, gfs_lats, gfs_lons)
+            
+            # Downsample the HRRR grid
+            base_idx = 74
+            idx = base_idx + v_idx * len(config.levels) + l_idx
+            
+            if idx < len(norms[0]):
+                mean, std = norms[0, idx], norms[1, idx]
+                raw_vals.append(hrrr_vals)
+                normalized_vals.append(preprocessor.normalize(hrrr_vals, mean, std))
+            else:
+                logger.error(f"Normalization index {idx} out of bounds")
+                raise IndexError(f"Normalization index {idx} out of bounds")
+    
+    grbs.close()
+    pres_norm = np.array(normalized_vals)
+    pres_raw = np.array(raw_vals)
+    
+    # Process surface variables
+    base_idx = 74 + len(config.pl_vars) * len(config.levels)
+    mslet_mean, mslet_std = norms[0, base_idx], norms[1, base_idx]
+    pres_mean, pres_std = norms[0, base_idx + 1], norms[1, base_idx + 1]
+    prmsl_mean, prmsl_std = norms[0, base_idx + 2], norms[1, base_idx + 2]
+    refc_mean, refc_std = norms[0, base_idx + 3], norms[1, base_idx + 3]
+    
+    grbs = pg.open(gfs_file)
+    
+    # Extract GFS variables and interpolate to HRRR grid
+    mslet_gfs = grbs.select(shortName="mslet")[0].values
+    mslet_hrrr = preprocessor.interpolator.interpolate_to_hrrr_grid(mslet_gfs, gfs_lats, gfs_lons)
+    mslet_vals = mslet_hrrr
+    
+    pres_gfs = grbs.select(shortName="sp")[0].values
+    pres_hrrr = preprocessor.interpolator.interpolate_to_hrrr_grid(pres_gfs, gfs_lats, gfs_lons)
+    pres_vals = pres_hrrr
+    
+    prmsl_gfs = grbs.select(shortName="prmsl")[0].values
+    prmsl_hrrr = preprocessor.interpolator.interpolate_to_hrrr_grid(prmsl_gfs, gfs_lats, gfs_lons)
+    prmsl_vals = prmsl_hrrr
+    
+    refc_gfs = grbs.select(shortName="refc")[0].values
+    refc_hrrr = preprocessor.interpolator.interpolate_to_hrrr_grid(refc_gfs, gfs_lats, gfs_lons)
+    refc_vals = refc_hrrr
+    refc_vals = np.maximum(refc_vals, 0)  # Remove invalid reflectivity values
+    
+    # Normalize extracted variables
+    sfc_norm = [
+        preprocessor.normalize(mslet_vals, mslet_mean, mslet_std),
+        preprocessor.normalize(pres_vals, pres_mean, pres_std),
+        preprocessor.normalize(prmsl_vals, prmsl_mean, prmsl_std),
+        preprocessor.normalize(refc_vals, refc_mean, refc_std),
+    ]
+    
+    sfc_raw = [mslet_vals, pres_vals, prmsl_vals, refc_vals]
+    
+    grbs.close()
+    
+    return lead_time, pres_norm, pres_raw, np.array(sfc_norm), np.array(sfc_raw)
 
 
 class GRIBPreprocessor:
@@ -143,66 +246,41 @@ class GRIBPreprocessor:
         valid_date_str = valid_datetime.strftime("%Y%m%d_%H")
         return f"{base_dir}/{init_date_str}/gfs_{valid_date_str}.grib2"
     
-    def process_pressure_levels(self, init_datetime: datetime, base_dir: str, norm_file: str, max_lead_hours: int) -> Tuple[np.ndarray, np.ndarray]:
+    def process_pressure_levels(self, init_datetime: datetime, base_dir: str, norm_file: str, max_lead_hours: int, n_workers: int = 1, skip_zero: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """Load, interpolate to HRRR grid, and normalize pressure-level variables from separate GFS files for all lead times."""
         try:
-            norms = xr.open_dataset(norm_file)['UGRD'].values
+            logger.info(f"Processing pressure level variables for lead times {'1' if skip_zero else '0'} to {max_lead_hours}h using {n_workers} workers...")
             
-            # GFS variable short names (without GFS prefix)
-            varnames = ['gh', 'q', 't', 'u', 'v', 'w']
+            # Prepare arguments for parallel processing
+            if skip_zero:
+                args_list = [(lead_time, init_datetime, base_dir, norm_file, self.config.hrrr_grid_file) 
+                            for lead_time in range(1, max_lead_hours + 1)]
+            else:
+                args_list = [(lead_time, init_datetime, base_dir, norm_file, self.config.hrrr_grid_file) 
+                            for lead_time in range(max_lead_hours + 1)]
             
-            all_normalized_vals, all_raw_vals = [], []
-            gfs_lats, gfs_lons = None, None  # Will be loaded from first file
+            all_normalized_vals = [None] * len(args_list)
+            all_raw_vals = [None] * len(args_list)
             
-            logger.info(f"Processing pressure level variables for lead times 0 to {max_lead_hours}h...")
-            
-            for lead_time in range(max_lead_hours + 1):
-                gfs_file = self.get_valid_time_filename(init_datetime, lead_time, base_dir)
-                
-                if not os.path.exists(gfs_file):
-                    logger.error(f"GFS file not found for lead time {lead_time}h: {gfs_file}")
-                    raise FileNotFoundError(f"GFS file not found: {gfs_file}")
-                
-                logger.info(f"Processing lead time {lead_time}h from file: {os.path.basename(gfs_file)}")
-                
-                grbs = pg.open(gfs_file)
-                
-                # Get GFS grid coordinates from first file
-                if gfs_lats is None or gfs_lons is None:
-                    first_grb = grbs.select(shortName='gh', level=self.config.levels[0])[0]
-                    gfs_lats, gfs_lons = first_grb.latlons()
-                    logger.info(f"Original GFS grid shape: {gfs_lats.shape}")
-                
-                normalized_vals, raw_vals = [], []
-                
-                for v_idx, var in enumerate(varnames):
-                    selected = grbs.select(shortName=var, level=self.config.levels)
+            if n_workers == 1:
+                # Sequential processing
+                for i, args in enumerate(args_list):
+                    lead_time, pres_norm, pres_raw, _, _ = process_single_lead_hour(args)
+                    all_normalized_vals[i] = pres_norm
+                    all_raw_vals[i] = pres_raw
+            else:
+                # Parallel processing
+                with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                    # Submit all jobs
+                    future_to_idx = {executor.submit(process_single_lead_hour, args): i for i, args in enumerate(args_list)}
                     
-                    if len(selected) != len(self.config.levels):
-                        logger.warning(f"Expected {len(self.config.levels)} levels for {var} at lead {lead_time}h, got {len(selected)}")
-                    
-                    for l_idx, grb in enumerate(selected):
-                        # Get original GFS data
-                        gfs_vals = grb.values
-                        
-                        # Interpolate to HRRR grid
-                        hrrr_vals = self.interpolator.interpolate_to_hrrr_grid(gfs_vals, gfs_lats, gfs_lons)
-                        
-                        # Downsample the HRRR grid
-                        base_idx = 74
-                        idx = base_idx + v_idx * len(self.config.levels) + l_idx
-                        
-                        if idx < len(norms[0]):
-                            mean, std = norms[0, idx], norms[1, idx]
-                            raw_vals.append(hrrr_vals)
-                            normalized_vals.append(self.normalize(hrrr_vals, mean, std))
-                        else:
-                            logger.error(f"Normalization index {idx} out of bounds")
-                            raise IndexError(f"Normalization index {idx} out of bounds")
-                
-                grbs.close()
-                all_normalized_vals.append(np.array(normalized_vals))
-                all_raw_vals.append(np.array(raw_vals))
+                    # Collect results as they complete
+                    for future in as_completed(future_to_idx):
+                        i = future_to_idx[future]
+                        lead_time, pres_norm, pres_raw, _, _ = future.result()
+                        all_normalized_vals[i] = pres_norm
+                        all_raw_vals[i] = pres_raw
+                        logger.info(f"Completed processing lead time {lead_time}h")
             
             return np.array(all_normalized_vals), np.array(all_raw_vals)
             
@@ -210,20 +288,10 @@ class GRIBPreprocessor:
             logger.error(f"Error processing pressure levels: {e}")
             raise
     
-    def process_surface_variables(self, init_datetime: datetime, base_dir: str, norm_file: str, max_lead_hours: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def process_surface_variables(self, init_datetime: datetime, base_dir: str, norm_file: str, max_lead_hours: int, n_workers: int = 1, skip_zero: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Load, interpolate to HRRR grid, and normalize surface variables from separate GFS files for all lead times."""
         try:
-            norms = xr.open_dataset(norm_file)['UGRD'].values
-            
-            # Mean/std for surface variables (assuming indices based on variable count)
-            base_idx = 74 + len(self.config.pl_vars) * len(self.config.levels)
-            mslet_mean, mslet_std = norms[0, base_idx], norms[1, base_idx]
-            pres_mean, pres_std = norms[0, base_idx + 1], norms[1, base_idx + 1]
-            prmsl_mean, prmsl_std = norms[0, base_idx + 2], norms[1, base_idx + 2]
-            refc_mean, refc_std = norms[0, base_idx + 3], norms[1, base_idx + 3]
-            
-            all_normalized, all_raw = [], []
-            gfs_lats, gfs_lons = None, None  # Will be loaded from first file
+            logger.info(f"Processing surface variables for lead times {'1' if skip_zero else '0'} to {max_lead_hours}h using {n_workers} workers...")
             
             # Get HRRR coordinates for output (downsampled)
             if not self.interpolator.hrrr_coords_loaded:
@@ -236,56 +304,38 @@ class GRIBPreprocessor:
             hrrr_lats_ds = self.config.hrrr_lats
             hrrr_lons_ds = self.config.hrrr_lons
             
-            logger.info(f"Processing surface variables for lead times 0 to {max_lead_hours}h...")
             logger.info(f"Final grid shape after HRRR interpolation and downsampling: {hrrr_lats_ds.shape}")
             
-            for lead_time in range(max_lead_hours + 1):
-                gfs_file = self.get_valid_time_filename(init_datetime, lead_time, base_dir)
-                
-                if not os.path.exists(gfs_file):
-                    logger.error(f"GFS file not found for lead time {lead_time}h: {gfs_file}")
-                    raise FileNotFoundError(f"GFS file not found: {gfs_file}")
-                
-                logger.info(f"Processing surface variables for lead time {lead_time}h from file: {os.path.basename(gfs_file)}")
-                
-                grbs = pg.open(gfs_file)
-                
-                # Get GFS grid coordinates from first file
-                if gfs_lats is None or gfs_lons is None:
-                    first_grb = grbs[1]
-                    gfs_lats, gfs_lons = first_grb.latlons()
-                
-                # Extract GFS variables and interpolate to HRRR grid
-                mslet_gfs = grbs.select(shortName="mslet")[0].values
-                mslet_hrrr = self.interpolator.interpolate_to_hrrr_grid(mslet_gfs, gfs_lats, gfs_lons)
-                mslet_vals = mslet_hrrr
-                
-                pres_gfs = grbs.select(shortName="sp")[0].values
-                pres_hrrr = self.interpolator.interpolate_to_hrrr_grid(pres_gfs, gfs_lats, gfs_lons)
-                pres_vals = pres_hrrr
-                
-                prmsl_gfs = grbs.select(shortName="prmsl")[0].values
-                prmsl_hrrr = self.interpolator.interpolate_to_hrrr_grid(prmsl_gfs, gfs_lats, gfs_lons)
-                prmsl_vals = prmsl_hrrr
-                
-                refc_gfs = grbs.select(shortName="refc")[0].values
-                refc_hrrr = self.interpolator.interpolate_to_hrrr_grid(refc_gfs, gfs_lats, gfs_lons)
-                refc_vals = refc_hrrr
-                refc_vals = np.maximum(refc_vals, 0)  # Remove invalid reflectivity values
-                
-                # Normalize extracted variables
-                normalized = [
-                    self.normalize(mslet_vals, mslet_mean, mslet_std),
-                    self.normalize(pres_vals, pres_mean, pres_std),
-                    self.normalize(prmsl_vals, prmsl_mean, prmsl_std),
-                    self.normalize(refc_vals, refc_mean, refc_std),
-                ]
-                
-                raw = [mslet_vals, pres_vals, prmsl_vals, refc_vals]
-                
-                grbs.close()
-                all_normalized.append(np.array(normalized))
-                all_raw.append(np.array(raw))
+            # Prepare arguments for parallel processing
+            if skip_zero:
+                args_list = [(lead_time, init_datetime, base_dir, norm_file, self.config.hrrr_grid_file) 
+                            for lead_time in range(1, max_lead_hours + 1)]
+            else:
+                args_list = [(lead_time, init_datetime, base_dir, norm_file, self.config.hrrr_grid_file) 
+                            for lead_time in range(max_lead_hours + 1)]
+            
+            all_normalized = [None] * len(args_list)
+            all_raw = [None] * len(args_list)
+            
+            if n_workers == 1:
+                # Sequential processing
+                for i, args in enumerate(args_list):
+                    lead_time, _, _, sfc_norm, sfc_raw = process_single_lead_hour(args)
+                    all_normalized[i] = sfc_norm
+                    all_raw[i] = sfc_raw
+            else:
+                # Parallel processing
+                with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                    # Submit all jobs
+                    future_to_idx = {executor.submit(process_single_lead_hour, args): i for i, args in enumerate(args_list)}
+                    
+                    # Collect results as they complete
+                    for future in as_completed(future_to_idx):
+                        i = future_to_idx[future]
+                        lead_time, _, _, sfc_norm, sfc_raw = future.result()
+                        all_normalized[i] = sfc_norm
+                        all_raw[i] = sfc_raw
+                        logger.info(f"Completed processing surface variables for lead time {lead_time}h")
             
             return np.array(all_normalized), np.array(all_raw), hrrr_lats_ds, hrrr_lons_ds
             
@@ -338,44 +388,29 @@ class GRIBPreprocessor:
             raise
 
 
-def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
-    """Validate and format any datetime string that Python can parse."""
-    try:
-        # Parse the datetime string using dateutil parser (very flexible)
-        dt = parser.parse(datetime_str)
-        
-        # Format components with proper padding
-        year = f"{dt.year:04d}"
-        month = f"{dt.month:02d}"
-        day = f"{dt.day:02d}"
-        hour = f"{dt.hour:02d}"
-        
-        return dt, year, month, day, hour
-        
-    except (ValueError, TypeError, parser.ParserError) as e:
-        raise ValueError(f"Invalid date/time: {e}")
-
-
-
 def preprocess_grib_data(norm_file: str, datetime_str: str,
                         lead_hours: str,
                         base_dir: str = "./", output_dir: str = "./", 
                         hrrr_grid_file: Optional[str] = None):
-    """Main preprocessing function for GFS data with HRRR grid interpolation - processes all lead times from separate files."""
+    """Main preprocessing function for GFS data with HRRR grid interpolation - processes all lead times from separate files (skipping 0th hour)."""
     try:
         # Validate inputs
         max_lead_time = int(lead_hours)
-        logger.info(f"Preprocessing GFS data initialized at {datetime_str} with lead times 0 to {max_lead_time}h")
+        logger.info(f"Preprocessing GFS data initialized at {datetime_str} with lead times 1 to {max_lead_time}h (skipping 0th hour)")
         logger.info("Data will be interpolated to HRRR grid before downsampling")
         logger.info("Reading from separate GRIB files for each lead time based on valid time")
         
+        # Set n_workers to number of lead hours (1 to max_lead_time inclusive)
+        n_workers = max_lead_time if max_lead_time > 0 else 1
+        logger.info(f"Using {n_workers} worker processes for parallel processing (one per lead hour, skipping 0th hour)")
+        
         # Setup paths
-        init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
+        init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
         date_string = f"{init_year}{init_month}{init_day}_{init_hh}"
         
         # Create output directory if it doesn't exist
-        Path(f"{output_dir}/{date_str}").mkdir(parents=True, exist_ok=True)
+        utils.make_directory(f"{output_dir}/{date_str}")
         output_file = f"{output_dir}/{date_str}/gfs_{date_string}.npz"
         
         # Validate normalization file exists
@@ -386,7 +421,7 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
         missing_files = []
         preprocessor = GRIBPreprocessor(WeatherPreprocessConfig(hrrr_grid_file))
         
-        for lead_time in range(max_lead_time + 1):
+        for lead_time in range(1, max_lead_time + 1):
             gfs_file = preprocessor.get_valid_time_filename(init_datetime, lead_time, base_dir)
             if not os.path.exists(gfs_file):
                 missing_files.append(f"Lead {lead_time}h: {gfs_file}")
@@ -397,18 +432,46 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
                 logger.error(f"  {missing}")
             raise FileNotFoundError(f"Missing {len(missing_files)} GRIB files")
         
-        logger.info(f"All required GRIB files found for lead times 0 to {max_lead_time}h")
+        logger.info(f"All required GRIB files found for lead times 1 to {max_lead_time}h")
+        
+        # --- Ensure xESMF weights file exists before parallel jobs ---
+        weights_file = "gfs_to_hrrr_weights.nc"
+        if not os.path.exists(weights_file):
+            logger.info(f"Weights file {weights_file} not found. Creating it serially before parallel processing...")
+            # Use the first available GFS file to get grid info
+            first_gfs_file = preprocessor.get_valid_time_filename(init_datetime, 1, base_dir)
+            grbs = pg.open(first_gfs_file)
+            first_grb = grbs.select(shortName='gh', level=preprocessor.config.levels[0])[0]
+            gfs_lats, gfs_lons = first_grb.latlons()
+            grbs.close()
+            # Create src_ds and tgt_ds
+            src_ds = xr.Dataset({
+                "lat": ("y", gfs_lats[:, 0]),
+                "lon": ("x", gfs_lons[0, :])
+            })
+            # Load HRRR grid
+            lats_ds, lons_ds = preprocessor.interpolator.load_hrrr_grid_coordinates(preprocessor.config.hrrr_grid_file)
+            tgt_ds = xr.Dataset({
+                "lat": (("y", "x"), lats_ds),
+                "lon": (("y", "x"), lons_ds)
+            })
+            # Create weights file
+            xe.Regridder(src_ds, tgt_ds, "bilinear", filename=weights_file, reuse_weights=False)
+            logger.info(f"Weights file {weights_file} created successfully.")
+        else:
+            logger.info(f"Weights file {weights_file} already exists. Will be reused by all parallel jobs.")
+        # --- End weights file creation ---
         
         # Initialize preprocessor with HRRR grid configuration
         config = WeatherPreprocessConfig(hrrr_grid_file)
         preprocessor = GRIBPreprocessor(config)
         
-        # Process GRIB data for all lead times
+        # Process GRIB data for all lead times (skipping 0th hour)
         logger.info("Processing pressure level data for all lead times with HRRR grid interpolation...")
-        pres_norm, pres_raw = preprocessor.process_pressure_levels(init_datetime, base_dir, norm_file, max_lead_time)
+        pres_norm, pres_raw = preprocessor.process_pressure_levels(init_datetime, base_dir, norm_file, max_lead_time, n_workers, skip_zero=True)
         
         logger.info("Processing surface data for all lead times with HRRR grid interpolation...")
-        sfc_norm, sfc_raw, lats, lons = preprocessor.process_surface_variables(init_datetime, base_dir, norm_file, max_lead_time)
+        sfc_norm, sfc_raw, lats, lons = preprocessor.process_surface_variables(init_datetime, base_dir, norm_file, max_lead_time, n_workers, skip_zero=True)
         
         # Validate grid dimensions
         expected_shape = (config.grid_height, config.grid_width)
@@ -422,7 +485,7 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
             'init_day': init_day,
             'init_hh': init_hh,
             'max_lead_hours': lead_hours,
-            'lead_times': list(range(max_lead_time + 1)),
+            'lead_times': list(range(1, max_lead_time + 1)),
             'init_datetime': init_datetime.isoformat(),
             'pl_vars': config.pl_vars,
             'sfc_vars': config.sfc_vars,

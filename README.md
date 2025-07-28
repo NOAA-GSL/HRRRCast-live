@@ -58,13 +58,60 @@ This script handles CUDA availability simulation on login nodes.
 Use the provided submission script to run forecasts:
 
 ```bash
-./submit_all.sh <YYYY-MM-DDTHH> <LEAD_HOURS>
+./submit_all.sh <INIT_TIME> <LEAD_HOUR> <USE_DIFFUSION> <N_ENSEMBLES> <N_GPUS> <ACCNR>
 ```
 
-**Example**: Run a 6-hour forecast starting from May 6, 2024 at 23:00 UTC:
+- `INIT_TIME`: Initialization time in format `YYYY-MM-DDTHH` (e.g., `2024-05-06T23`)
+- `LEAD_HOUR`: Number of forecast hours (e.g., `6`)
+- `USE_DIFFUSION`: Set to `1` for probabilistic/ensemble (diffusion) forecast, `0` for deterministic
+- `N_ENSEMBLES`: Number of ensemble members to run (default: `1`)
+- `N_GPUS`: Number of GPUs to use for parallel forecast jobs (default: `1`)
+- `ACCNR`: (Optional) Account number for SLURM jobs (default: `gsd-hpcs`)
+
+**Example**: Run a 6-hour ensemble forecast with 10 members on 2 GPUs starting from May 6, 2024 at 23:00 UTC:
 ```bash
-./submit_all.sh 2024-05-06T23 6
+./submit_all.sh 2024-05-06T23 6 1 10 2
 ```
+
+### Manual Forecast and Plotting
+
+#### Forecast
+
+You can run the forecast script directly:
+
+```bash
+python src/fcst.py <model_path> <inittime> <lead_hours> --members 0-2 --output_dir <output_dir> [--no_diffusion] [--base_dir <dir>]
+```
+
+- `model_path`: Path to the trained model (e.g., `net-diffusion/model.keras`)
+- `inittime`: Initialization time (e.g., `2024-05-06T23`)
+- `lead_hours`: Number of forecast hours (e.g., `6`)
+- `--members`: List or range of ensemble member IDs (e.g., `0-2 4 6-7`)
+- `--no_diffusion`: Use deterministic model (default is diffusion/ensemble)
+- `--base_dir`: Base directory for input files (default: `./`)
+- `--output_dir`: Output directory for forecast files (default: `./`)
+
+#### Plotting
+
+To plot the forecast output for all hours 1 to N for each member:
+
+```bash
+python src/plot.py <inittime> <lead_hour> --members 0-2 --forecast_dir <forecast_dir> --output_dir <output_dir>
+```
+
+- `inittime`: Initialization time (e.g., `2024-05-06T23`)
+- `lead_hour`: Maximum forecast hour to plot (e.g., `6`)
+- `--members`: List or range of member IDs (e.g., `0-2 4 pmm`)
+- `--forecast_dir`: Directory containing forecast files (default: `./`)
+- `--output_dir`: Output directory for plots (default: `./`)
+
+**Note:** This will generate plots for all hours from 1 to `lead_hour` (inclusive) for each member, saving each hour's plots in a separate subdirectory.
+
+## Ensemble and PMM Support
+
+- For diffusion/ensemble forecasts, use `--members` to specify which ensemble members to run and plot.
+- The system supports ranges (e.g., `0-2`), comma-separated, and non-integer IDs (e.g., `pmm` for ensemble mean).
+- The PMM (Probability-Matched Mean) is computed and plotted automatically when running in ensemble mode.
 
 ## Model Usage
 
@@ -148,8 +195,7 @@ For forecasts beyond 6 hours, use rollout prediction:
 
 **Example**: 16-hour forecast decomposition:
 - 2 × 6-hour steps
-- 1 × 3-hour step  
-- 1 × 1-hour step
+- 1 × 4-hour step  
 
 ## Available Models
 
@@ -193,10 +239,8 @@ def rollout_forecast(model, initial_state, target_hours):
     while remaining_hours > 0:
         if remaining_hours >= 6:
             lead_time = 6
-        elif remaining_hours >= 3:
-            lead_time = 3
         else:
-            lead_time = 1
+            lead_time = remaining_hours
             
         # Set lead time channel
         current_state[:, :, :, -1] = lead_time / 6.0
@@ -241,7 +285,17 @@ def rollout_forecast(model, initial_state, target_hours):
 
 ## Citation
 
-[Add citation information if this is research code]
+If you use HRRRCast in your research, please cite:
+
+    @misc{abdi2025hrrrcastdatadrivenemulatorregional,
+          title={HRRRCast: a data-driven emulator for regional weather forecasting at convection allowing scales}, 
+          author={Daniel Abdi and Isidora Jankov and Paul Madden and Vanderlei Vargas and Timothy A. Smith and Sergey Frolov and Montgomery Flora and Corey Potvin},
+          year={2025},
+          eprint={2507.05658},
+          archivePrefix={arXiv},
+          primaryClass={physics.ao-ph},
+          url={https://arxiv.org/abs/2507.05658}, 
+    }
 
 ## Support
 

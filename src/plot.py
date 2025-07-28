@@ -25,6 +25,8 @@ import xarray as xr
 from matplotlib.patches import Rectangle
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import utils
 
 # Configure logging
 logging.basicConfig(
@@ -330,74 +332,74 @@ class ForecastPlotter:
             logger.error(f"Error creating summary plot: {e}")
 
 
-def validate_datetime(datetime_str: str) -> Tuple[str, str, str, str]:
-    """Validate and format any datetime string that Python can parse."""
+def plot_lead_hour(h, ds_path, init_datetime, init_year, init_month, init_day, init_hh, output_dir, date_str, member, config_dict):
+    import xarray as xr
+    import os
+    from pathlib import Path
+    import logging
+    from datetime import timedelta
+    # Reconstruct config and plotter
+    config = ForecastPlotterConfig()
+    for k, v in config_dict.items():
+        setattr(config, k, v)
+    plotter = ForecastPlotter(config)
+    ds = xr.open_dataset(ds_path, decode_timedelta=True)
     try:
-        # Parse the datetime string using dateutil parser (very flexible)
-        dt = parser.parse(datetime_str)
-        
-        # Format components with proper padding
-        year = f"{dt.year:04d}"
-        month = f"{dt.month:02d}"
-        day = f"{dt.day:02d}"
-        hour = f"{dt.hour:02d}"
-        
-        return dt, year, month, day, hour
-        
-    except (ValueError, TypeError, parser.ParserError) as e:
-        raise ValueError(f"Invalid date/time: {e}")
-
+        valid_datetime = init_datetime + timedelta(hours=h)
+        timestamp_str = f"{init_year}-{init_month}-{init_day} {init_hh}:00 UTC"
+        output_subdir = f"{output_dir}/{date_str}/mem{member}_lead{h:02d}h"
+        utils.make_directory(output_subdir)
+        plotter.plot_pressure_level_variables(ds, h, output_subdir, timestamp_str)
+        plotter.plot_surface_variables(ds, h, output_subdir, timestamp_str)
+        plotter.create_summary_plot(ds, h, output_subdir, timestamp_str)
+        logging.info(f"Plots for lead hour {h} saved to: {output_subdir}")
+    finally:
+        ds.close()
 
 def plot_forecast_data(datetime_str: str,
                       lead_hour: str, member: str,
                       forecast_dir: str = "./", output_dir: str = "./"):
-    """Main plotting function."""
+    """Main plotting function. Plots all hours from 1 to lead_hour (inclusive) in parallel."""
     try:
         # Validate inputs
-        init_datetime, init_year, init_month, init_day, init_hh = validate_datetime(datetime_str)
+        init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
         lead_hour_int = int(lead_hour)
         
-        # Calculate forecast valid time
-        valid_datetime = init_datetime + timedelta(hours=lead_hour_int)
-        
-        logger.info(f"Plotting forecast data for {init_datetime} + {lead_hour_int}h")
-        logger.info(f"Valid time: {valid_datetime}")
-        
         # Setup paths
-        forecast_file = f"{forecast_dir}/hrrrcast.{date_str}/hrrrcast_mem{member}.nc"
-
+        forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_mem{member}.nc"
         logger.info(f"Forecast file: {forecast_file}")
-        
-        # Create output directory
-        timestamp_str = f"{init_year}-{init_month}-{init_day} {init_hh}:00 UTC"
-        output_subdir = f"{output_dir}/{date_str}/mem{member}_lead{lead_hour_int:02d}h"
-        Path(output_subdir).mkdir(parents=True, exist_ok=True)
         
         # Validate forecast file exists
         if not os.path.exists(forecast_file):
             raise FileNotFoundError(f"Forecast file not found: {forecast_file}")
         
-        # Initialize plotter
+        # Initialize plotter config (for passing to subprocesses)
         config = ForecastPlotterConfig()
-        plotter = ForecastPlotter(config)
+        config_dict = config.__dict__
         
-        # Load forecast data
-        ds = plotter.load_forecast_data(forecast_file)
-        
-        # Validate lead hour exists in data
-        if lead_hour_int >= len(ds.lead_time):
-            raise ValueError(f"Lead hour {lead_hour_int} not available in forecast data (max: {len(ds.time)-1})")
-        
-        # Plot variables
-        plotter.plot_pressure_level_variables(ds, lead_hour_int, output_subdir, timestamp_str)
-        plotter.plot_surface_variables(ds, lead_hour_int, output_subdir, timestamp_str)
-        plotter.create_summary_plot(ds, lead_hour_int, output_subdir, timestamp_str)
-        
-        # Close dataset
+        # Load forecast data ONCE to check max lead
+        ds = xr.open_dataset(forecast_file, decode_timedelta=True)
+        max_lead = len(ds.lead_time) - 1
         ds.close()
+        if lead_hour_int > max_lead:
+            raise ValueError(f"Lead hour {lead_hour_int} not available in forecast data (max: {max_lead})")
         
-        logger.info(f"Plotting completed successfully. Plots saved to: {output_subdir}")
+        n_workers = lead_hour_int
+        logger.info(f"Parallel plotting using {n_workers} workers (one per lead hour)")
+        # Parallel plotting over lead hours
+        args_list = [
+            (h, forecast_file, init_datetime, init_year, init_month, init_day, init_hh, output_dir, date_str, member, config_dict)
+            for h in range(1, lead_hour_int + 1)
+        ]
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = [executor.submit(plot_lead_hour, *args) for args in args_list]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error in parallel plotting: {e}")
+        logger.info(f"Plotting completed successfully for all hours 1 to {lead_hour_int}.")
         
     except Exception as e:
         logger.error(f"Plotting failed: {e}")
@@ -414,7 +416,7 @@ def parse_arguments():
     parser.add_argument('inittime',
                        help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hour", help="Lead hour for forecast (0, 1, 2, ...)")
-    parser.add_argument("member",  help="Member identifier mem0, mem1 etc... or pmm")
+    parser.add_argument("--members", nargs='+', required=True, help="List/range of member IDs (e.g., 0-2 4 6-7 pmm)")
     parser.add_argument("--forecast_dir", default="./", help="Directory containing forecast files")
     parser.add_argument("--output_dir", default="./", help="Output directory for plots")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -430,15 +432,31 @@ def main():
         
         # Set logging level
         logging.getLogger().setLevel(getattr(logging, args.log_level))
-        
-        # Run plotting
-        plot_forecast_data(
-            datetime_str=args.inittime,
-            lead_hour=args.lead_hour,
-            member=args.member,
-            forecast_dir=args.forecast_dir,
-            output_dir=args.output_dir
-        )
+
+        # Parse members argument (support space/comma separated and ranges like 0-2, and allow non-integer like 'pmm')
+        def expand_member_arg(m):
+            result = []
+            for part in m.split(","):
+                part = part.strip()
+                if "-" in part and part.replace("-", "").isdigit():
+                    start, end = part.split("-")
+                    result.extend([str(i) for i in range(int(start), int(end)+1)])
+                elif part != "":
+                    result.append(part)
+            return result
+        members = []
+        for m in args.members:
+            members.extend(expand_member_arg(m))
+        members = sorted(set(members), key=lambda x: (not x.isdigit(), x))  # Sort numerically, then non-numeric
+
+        for member in members:
+            plot_forecast_data(
+                datetime_str=args.inittime,
+                lead_hour=args.lead_hour,
+                member=member,
+                forecast_dir=args.forecast_dir,
+                output_dir=args.output_dir
+            )
         
     except Exception as e:
         logger.error(f"Application failed: {e}")
