@@ -149,9 +149,9 @@ class Netcdf2Grib:
             hrs = int((date - forecast_starttime).total_seconds() // 3600)
 
             if member == "avg":
-                outfile = os.path.join(outdir, f'hrrrcast.avg.t{cycle:02d}z.pgrb2.0p25.f{hrs:03d}')
+                outfile = os.path.join(outdir, f'hrrrcast.avg.t{cycle:02d}z.pgrb2.f{hrs:03d}')
             else:
-                outfile = os.path.join(outdir, f'hrrrcast.m{member:02d}.t{cycle:02d}z.pgrb2.0p25.f{hrs:03d}')
+                outfile = os.path.join(outdir, f'hrrrcast.m{member:02d}.t{cycle:02d}z.pgrb2.f{hrs:03d}')
             logging.info(f"grib2 file name: {outfile}")
 
             for cube in sorted(cubes, key=lambda cube: cube.name()):
