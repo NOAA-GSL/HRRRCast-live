@@ -18,12 +18,8 @@ lead_hour=@[LEAD_HOUR]
 member=@[MEMBER]
 PACKAGEROOT=@[PACKAGEROOT]
 DATAROOT=@[DATAROOT]
-year=`echo $init_time |cut -c1-4`
-month=`echo $init_time |cut -c6-7`
-day=`echo $init_time |cut -c9-10`
-hour=`echo $init_time |cut -c12-13`
 
 source ${PACKAGEROOT}/etc/env.sh
 
-echo "In compute_pmm, init_time=${init_time}, year/month/day/hour/=${year} ${month} ${day} ${hour}"
+echo "In compute_pmm, init_time=${init_time}"
 python ${PACKAGEROOT}/src/compute_pmm.py ${init_time} --forecast_dir ${DATAROOT} --output_dir ${DATAROOT}

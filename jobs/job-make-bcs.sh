@@ -13,14 +13,9 @@ init_time="@[INIT_TIME]"
 lead_hour=@[LEAD_HOUR]
 PACKAGEROOT=@[PACKAGEROOT]
 DATAROOT=@[DATAROOT]
-year=`echo $init_time |cut -c1-4`
-month=`echo $init_time |cut -c6-7`
-day=`echo $init_time |cut -c9-10`
-hour=`echo $init_time |cut -c12-13`
-date_str="${year}${month}${day}/${hour}"
 
 # conda
 source ${PACKAGEROOT}/etc/env.sh
 
-echo "In make_bcs, init_time=${init_time}, year/month/day/hour/,${year} ${month} ${day} ${hour}, lead_hour=${lead_hour}"
+echo "In make_bcs, init_time=${init_time}, lead_hour=${lead_hour}"
 python3 ${PACKAGEROOT}/src/make_bcs.py ${PACKAGEROOT}/net-diffusion/normalize.nc ${init_time} ${lead_hour} --base_dir ${DATAROOT} --output_dir ${DATAROOT} --hrrr_grid_file "${date_str}/hrrr_${date_str}_surface.grib2"
