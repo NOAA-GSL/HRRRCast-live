@@ -33,7 +33,6 @@ except ImportError as e:
     logging.warning(f"Could not import custom modules: {e}")
 
 from diffusion_params import (
-    USE_DIFFUSION,
     NUM_DIFFUSION_STEPS,
     NUM_INFERENCE_STEPS,
     INFERENCE_STEPS,
@@ -146,11 +145,12 @@ class ForecastModel:
 class WeatherForecaster:
     """Handles the forecasting pipeline."""
     
-    def __init__(self, data_loader_hrrr: PreprocessedDataLoader, data_loader_gfs: PreprocessedDataLoader, member: int):
+    def __init__(self, data_loader_hrrr: PreprocessedDataLoader, data_loader_gfs: PreprocessedDataLoader, member: int, use_diffusion: bool):
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
         self.metadata = data_loader_hrrr.metadata
         self.member = member
+        self.use_diffusion = use_diffusion
     
     @staticmethod
     def denormalize(output: np.ndarray, norm_file: str) -> np.ndarray:
@@ -165,7 +165,7 @@ class WeatherForecaster:
             raise
     
     def predict(self, model: ForecastModel, X: tf.Tensor):
-        if USE_DIFFUSION:
+        if use_diffusion:
             num_output_channels = 74
             start = 102
             batch_size = 1
@@ -401,6 +401,7 @@ def parse_arguments():
     parser.add_argument('inittime', help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hours", type=int, help="Lead time in hours")
     parser.add_argument("--members", nargs='+', required=True, help="List of ensemble member IDs (e.g., 0 1 2 or 0,1,2)")
+    parser.add_argument("--no_diffusion", default=False, action="store_true", help="Turn off diffusion")
     parser.add_argument("--base_dir", default="./", help="Base directory for input preprocessed files")
     parser.add_argument("--output_dir", default="./", help="Output directory for forecast files")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -447,7 +448,7 @@ def main():
         model_input_hrrr = data_loader_hrrr.get_model_input()
         model_input_gfs = data_loader_gfs.get_model_input()
         lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
-        if USE_DIFFUSION:
+        if not args.no_diffusion:
             rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 74))
             step_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
             model_input = np.concatenate([
@@ -465,7 +466,7 @@ def main():
         
         output_files = []
         for i, member in enumerate(members):
-            forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member)
+            forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member, not args.no_diffusion)
             forecast_dataset, output_file = run_weather_forecast_for_member(
                 forecaster, model, args.lead_hours, model_input, args.output_dir, member, print_history=(i==len(members)-1)
             )
