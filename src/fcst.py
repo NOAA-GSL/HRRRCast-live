@@ -165,7 +165,7 @@ class WeatherForecaster:
             raise
     
     def predict(self, model: ForecastModel, X: tf.Tensor):
-        if use_diffusion:
+        if self.use_diffusion:
             num_output_channels = 74
             start = 102
             batch_size = 1
@@ -437,9 +437,9 @@ def main():
         # Load preprocessed data and model ONCE
         init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(args.inittime)
         date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
-        date_string = f"{init_year}{init_month}{init_day}_{init_hh}"
-        hrrr_preprocessed_file = f"{args.base_dir}/{date_str}/hrrr_{date_string}.npz"
-        gfs_preprocessed_file = f"{args.base_dir}/{date_str}/gfs_{date_string}.npz"
+        filedate_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+        hrrr_preprocessed_file = f"{args.base_dir}/{date_str}/hrrr_{filedate_str}.npz"
+        gfs_preprocessed_file = f"{args.base_dir}/{date_str}/gfs_{filedate_str}.npz"
         data_loader_hrrr = PreprocessedDataLoader(hrrr_preprocessed_file)
         data_loader_gfs = PreprocessedDataLoader(gfs_preprocessed_file)
         model = ForecastModel(args.model_path)

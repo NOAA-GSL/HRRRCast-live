@@ -191,13 +191,13 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
         # Setup paths
         init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
-        date_string = f"{init_year}{init_month}{init_day}_{init_hh}"
-        hrrr_pres_file = f"{base_dir}/{date_str}/hrrr_{date_string}_pressure.grib2"
-        hrrr_sfc_file = f"{base_dir}/{date_str}/hrrr_{date_string}_surface.grib2"
+        filedate_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+        hrrr_pres_file = f"{base_dir}/{date_str}/hrrr_{filedate_str}_pressure.grib2"
+        hrrr_sfc_file = f"{base_dir}/{date_str}/hrrr_{filedate_str}_surface.grib2"
         
         # Create output directory if it doesn't exist
         utils.make_directory(f"{output_dir}/{date_str}")
-        output_file = f"{output_dir}/{date_str}/hrrr_{date_string}.npz"
+        output_file = f"{output_dir}/{date_str}/hrrr_{filedate_str}.npz"
         
         # Validate required files exist
         for file_path in [norm_file, hrrr_pres_file, hrrr_sfc_file]:

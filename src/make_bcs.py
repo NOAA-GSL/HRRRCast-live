@@ -407,11 +407,11 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
         # Setup paths
         init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
-        date_string = f"{init_year}{init_month}{init_day}_{init_hh}"
+        filedate_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         
         # Create output directory if it doesn't exist
         utils.make_directory(f"{output_dir}/{date_str}")
-        output_file = f"{output_dir}/{date_str}/gfs_{date_string}.npz"
+        output_file = f"{output_dir}/{date_str}/gfs_{filedate_str}.npz"
         
         # Validate normalization file exists
         if not os.path.exists(norm_file):
