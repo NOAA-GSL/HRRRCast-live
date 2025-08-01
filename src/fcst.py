@@ -270,7 +270,7 @@ class WeatherForecaster:
         logger.info("Autoregressive rollout completed")
         return hourly_forecasts, history
     
-    def create_xarray_dataset(self, init_datetime: datetime, times: List[np.timedelta64], 
+    def create_xarray_dataset(self, init_datetime: datetime, times: List[int], 
                             lats: np.ndarray, lons: np.ndarray, data: np.ndarray) -> xr.Dataset:
         """Convert numpy array to xarray.Dataset."""
         data_vars = {}
@@ -288,8 +288,8 @@ class WeatherForecaster:
                 dims=("time", "lead_time", "level", "latitude", "longitude"),
                 coords={
                     "time": [init_datetime],
-                    "lead_time": times,
-                    "level": levels,
+                    "lead_time": ("lead_time", times, {"units": "hours"}),
+                    "level": ("level", levels, {"units": "hPa"}),
                     "latitude": (("latitude", "longitude"), lats),
                     "longitude": (("latitude", "longitude"), lons),
                 },
@@ -305,7 +305,7 @@ class WeatherForecaster:
                 dims=("time", "lead_time", "latitude", "longitude"),
                 coords={
                     "time": [init_datetime],
-                    "lead_time": times,
+                    "lead_time": ("lead_time", times, {"units": "hours"}),
                     "latitude": (("latitude", "longitude"), lats),
                     "longitude": (("latitude", "longitude"), lons),
                 },
@@ -339,7 +339,7 @@ class WeatherForecaster:
             outdata = np.array([denorm_outputs[i] for i in range(0, lead_hours + 1)])
 
             # Create timestamps for each forecast hour
-            times = [np.timedelta64(i, 'h') for i in range(0, lead_hours + 1)]
+            times = list(range(0, lead_hours + 1))
 
             # Convert numpy to xarray
             logger.info("Creating xarray dataset...")

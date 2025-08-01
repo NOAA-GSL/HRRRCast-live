@@ -135,7 +135,7 @@ class Netcdf2Grib:
         cycle = forecast_starttime.hour
         logging.info(f'Forecast start time is {forecast_starttime}')
 
-        datevectors = [forecast_starttime + timedelta(seconds=int(t)) for t in times]
+        datevectors = [forecast_starttime + timedelta(hours=int(t)) for t in times]
 
         time_fmt_str = '00:00:00'
         time_unit_str = f"Hours since {forecast_starttime.strftime('%Y-%m-%d %H:00:00')}"
