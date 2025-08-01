@@ -17,10 +17,10 @@ underestimated extremes. PMM preserves the distribution of the ensemble mean whi
 maintaining the spatial structure of individual ensemble members.
 
 Input files should follow the naming convention:
-  YYYYMMDD_HH/hrrrcast_YYYYMMDD_HH_memN.nc
+  YYYYMMDD/HH/hrrrcast_memN.nc
 
 Output files are saved as:
-  YYYYMMDD_HH/hrrrcast_YYYYMMDD_HH_processed.nc
+  YYYYMMDD/HH/hrrrcast_memavg.nc
 
 Usage:
   python ensemble_postprocess.py "2024-05-06T23" --forecast_dir /path/to/data
@@ -37,6 +37,8 @@ import numpy as np
 import xarray as xr
 import glob
 import utils
+
+from nc2grib import Netcdf2Grib
 
 # Configure logging
 logging.basicConfig(
@@ -194,7 +196,7 @@ def find_ensemble_files(date_str: str, forecast_dir: str) -> List[str]:
         raise FileNotFoundError(f"Directory {date_dir} does not exist")
     
     # Pattern for ensemble files
-    pattern = os.path.join(date_dir, f"hrrrcast_{date_str}_mem*.nc")
+    pattern = os.path.join(date_dir, f"hrrrcast_mem*.nc")
     files = glob.glob(pattern)
     
     if not files:
@@ -230,7 +232,7 @@ def compute_ensemble_pmm(datetime_str: str,
     try:
         # Validate inputs
         init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(datetime_str)
-        date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+        date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
         
         logger.info(f"Computing ensemble post-processing for initialization time: {date_str}")
         
@@ -278,12 +280,16 @@ def compute_ensemble_pmm(datetime_str: str,
         processed_ds.attrs['processed_timestamp'] = str(datetime.now())
         processed_ds.attrs['source_files'] = [os.path.basename(f) for f in ensemble_files]
         
-        # Save processed result
-        output_filename = f"hrrrcast_{date_str}_mem_mean.nc"
+        # Save processed result for plotting
+        output_filename = f"hrrrcast_memavg.nc"
         output_path = os.path.join(output_date_dir, output_filename)
         
         logger.info(f"Saving processed ensemble data to: {output_path}")
         processed_ds.to_netcdf(output_path)
+
+        #conver to grib2 files:
+        converter = Netcdf2Grib()
+        converter.save_grib2(init_datetime, processed_ds, 'avg', output_date_dir)
         
         logger.info(f"Ensemble post-processing completed successfully")
         

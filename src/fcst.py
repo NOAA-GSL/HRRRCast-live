@@ -23,6 +23,8 @@ import tensorflow as tf
 import xarray as xr
 from tqdm import tqdm
 
+from nc2grib import Netcdf2Grib
+
 # Import custom modules (assuming they exist)
 try:
     import resnet
@@ -268,7 +270,7 @@ class WeatherForecaster:
         logger.info("Autoregressive rollout completed")
         return hourly_forecasts, history
     
-    def create_xarray_dataset(self, init_datetime: datetime, times: List[np.timedelta64], 
+    def create_xarray_dataset(self, init_datetime: datetime, times: List[int], 
                             lats: np.ndarray, lons: np.ndarray, data: np.ndarray) -> xr.Dataset:
         """Convert numpy array to xarray.Dataset."""
         data_vars = {}
@@ -286,8 +288,8 @@ class WeatherForecaster:
                 dims=("time", "lead_time", "level", "latitude", "longitude"),
                 coords={
                     "time": [init_datetime],
-                    "lead_time": times,
-                    "level": levels,
+                    "lead_time": ("lead_time", times, {"units": "hours"}),
+                    "level": ("level", levels, {"units": "hPa"}),
                     "latitude": (("latitude", "longitude"), lats),
                     "longitude": (("latitude", "longitude"), lons),
                 },
@@ -303,7 +305,7 @@ class WeatherForecaster:
                 dims=("time", "lead_time", "latitude", "longitude"),
                 coords={
                     "time": [init_datetime],
-                    "lead_time": times,
+                    "lead_time": ("lead_time", times, {"units": "hours"}),
                     "latitude": (("latitude", "longitude"), lats),
                     "longitude": (("latitude", "longitude"), lons),
                 },
@@ -337,7 +339,7 @@ class WeatherForecaster:
             outdata = np.array([denorm_outputs[i] for i in range(0, lead_hours + 1)])
 
             # Create timestamps for each forecast hour
-            times = [np.timedelta64(i, 'h') for i in range(0, lead_hours + 1)]
+            times = list(range(0, lead_hours + 1))
 
             # Convert numpy to xarray
             logger.info("Creating xarray dataset...")
@@ -348,13 +350,20 @@ class WeatherForecaster:
             init_month = self.metadata['init_month']
             init_day = self.metadata['init_day']
             init_hh = self.metadata['init_hh']
-            date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+            date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
             utils.make_directory(f"{output_dir}/{date_str}")
 
-            output_file = f"{output_dir}/{date_str}/hrrrcast_{date_str}_mem{self.member}.nc"
+            # Create a new directory for grib2 files
+            outdir = Path(f"{output_dir}/{date_str}")
+            outdir.mkdir(parents=True, exist_ok=True)
+
+            output_file = f"{output_dir}/{date_str}/hrrrcast_mem{self.member}.nc"
             logger.info(f"Saving forecast to {output_file}")
             outdata_xr.to_netcdf(output_file)
 
+            converter = Netcdf2Grib()
+            converter.save_grib2(init_datetime, outdata_xr, self.member, outdir)
+            
             logger.info("Forecast completed successfully")
             if return_history:
                 return outdata_xr, output_file, history
@@ -363,7 +372,6 @@ class WeatherForecaster:
         except Exception as e:
             logger.error(f"Forecast failed: {e}")
             raise
-
 
 def run_weather_forecast_for_member(forecaster: WeatherForecaster, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str, member: int, print_history: bool = False):
     """Run forecast for a single member, optionally printing forecast step history. Requires precomputed model_input."""
@@ -390,8 +398,7 @@ def parse_arguments():
     )
     
     parser.add_argument("model_path", help="Path to the trained model")
-    parser.add_argument('inittime',
-                       help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
+    parser.add_argument('inittime', help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hours", type=int, help="Lead time in hours")
     parser.add_argument("--members", nargs='+', required=True, help="List of ensemble member IDs (e.g., 0 1 2 or 0,1,2)")
     parser.add_argument("--no_diffusion", default=False, action="store_true", help="Turn off diffusion")
@@ -429,9 +436,10 @@ def main():
 
         # Load preprocessed data and model ONCE
         init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(args.inittime)
-        date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
-        hrrr_preprocessed_file = f"{args.base_dir}/{date_str}/hrrr_{date_str}.npz"
-        gfs_preprocessed_file = f"{args.base_dir}/{date_str}/gfs_{date_str}.npz"
+        date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
+        filedate_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+        hrrr_preprocessed_file = f"{args.base_dir}/{date_str}/hrrr_{filedate_str}.npz"
+        gfs_preprocessed_file = f"{args.base_dir}/{date_str}/gfs_{filedate_str}.npz"
         data_loader_hrrr = PreprocessedDataLoader(hrrr_preprocessed_file)
         data_loader_gfs = PreprocessedDataLoader(gfs_preprocessed_file)
         model = ForecastModel(args.model_path)

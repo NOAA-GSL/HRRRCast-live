@@ -7,7 +7,7 @@ and saves the preprocessed data for use by the forecasting model. This stage
 is CPU-intensive and handles all the GRIB file parsing, interpolation, and normalization.
 
 Usage:
-    python preprocess_grib_gfs.py <norm_file> <year> <month> <day> <hour> <lead_hours> [--base_dir DIR] [--output_dir DIR] [--hrrr_grid_file FILE]
+    python preprocess_grib_gfs.py <norm_file> <inititme> <lead_hours> [--base_dir DIR] [--output_dir DIR] [--hrrr_grid_file FILE]
 """
 
 import argparse
@@ -242,7 +242,7 @@ class GRIBPreprocessor:
     def get_valid_time_filename(self, init_datetime: datetime, lead_hour: int, base_dir: str) -> str:
         """Generate filename based on valid time (init_time + lead_hour)."""
         valid_datetime = init_datetime + timedelta(hours=lead_hour)
-        init_date_str = init_datetime.strftime("%Y%m%d_%H")
+        init_date_str = init_datetime.strftime("%Y%m%d/%H")
         valid_date_str = valid_datetime.strftime("%Y%m%d_%H")
         return f"{base_dir}/{init_date_str}/gfs_{valid_date_str}.grib2"
     
@@ -406,11 +406,12 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
         
         # Setup paths
         init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(datetime_str)
-        date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+        date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
+        filedate_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         
         # Create output directory if it doesn't exist
         utils.make_directory(f"{output_dir}/{date_str}")
-        output_file = f"{output_dir}/{date_str}/gfs_{date_str}.npz"
+        output_file = f"{output_dir}/{date_str}/gfs_{filedate_str}.npz"
         
         # Validate normalization file exists
         if not os.path.exists(norm_file):

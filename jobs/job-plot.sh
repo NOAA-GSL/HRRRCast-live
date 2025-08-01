@@ -8,17 +8,15 @@
 #SBATCH --time=00:30:00
 #SBATCH --exclusive
 
-# conda
-source etc/env.sh
-
 #set vars
 init_time="@[INIT_TIME]"
 lead_hour=@[LEAD_HOUR]
 member=@[MEMBER]
-year=`echo $init_time |cut -c1-4`
-month=`echo $init_time |cut -c6-7`
-day=`echo $init_time |cut -c9-10`
-hour=`echo $init_time |cut -c12-13`
+PACKAGEROOT=@[PACKAGEROOT]
+DATAROOT=@[DATAROOT]
 
-echo "In plot, init_time=${init_time}, year/month/day/hour/=${year} ${month} ${day} ${hour}, lead_hour=${lead_hour}, member=${member}"
-python3 src/plot.py ${init_time} ${lead_hour} --members ${member}
+# conda
+source ${PACKAGEROOT}/etc/env.sh
+
+echo "In plot, init_time=${init_time}, lead_hour=${lead_hour}, member=${member}"
+python3 ${PACKAGEROOT}/src/plot.py ${init_time} ${lead_hour} --members ${member} --forecast_dir ${DATAROOT} --output_dir ${DATAROOT}

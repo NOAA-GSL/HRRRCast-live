@@ -6,7 +6,7 @@ This script plots each variable from the forecast output and saves them as separ
 It handles both pressure level and surface variables from the HRRR forecast data.
 
 Usage:
-    python plot_forecast.py <init_year> <init_month> <init_day> <init_hh> <lead_hour> [--forecast_dir DIR] [--output_dir DIR]
+    python plot_forecast.py <init_time> <lead_hour> <member> [--forecast_dir DIR] [--output_dir DIR]
 """
 
 import argparse
@@ -347,7 +347,7 @@ def plot_lead_hour(h, ds_path, init_datetime, init_year, init_month, init_day, i
     try:
         valid_datetime = init_datetime + timedelta(hours=h)
         timestamp_str = f"{init_year}-{init_month}-{init_day} {init_hh}:00 UTC"
-        output_subdir = f"{output_dir}/{date_str}/{date_str}_mem{member}_lead{h:02d}h"
+        output_subdir = f"{output_dir}/{date_str}/mem{member}_lead{h:02d}h"
         utils.make_directory(output_subdir)
         plotter.plot_pressure_level_variables(ds, h, output_subdir, timestamp_str)
         plotter.plot_surface_variables(ds, h, output_subdir, timestamp_str)
@@ -363,11 +363,12 @@ def plot_forecast_data(datetime_str: str,
     try:
         # Validate inputs
         init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(datetime_str)
-        date_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+        date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
         lead_hour_int = int(lead_hour)
         
         # Setup paths
-        forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_{date_str}_mem{member}.nc"
+        forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_mem{member}.nc"
+        logger.info(f"Forecast file: {forecast_file}")
         
         # Validate forecast file exists
         if not os.path.exists(forecast_file):
