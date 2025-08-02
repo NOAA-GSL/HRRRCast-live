@@ -9,12 +9,13 @@
 #SBATCH --time=00:10:00
 
 # set vars
-init_time="@[INIT_TIME]"
+INIT_TIME="@[INIT_TIME]"
 PACKAGEROOT="@[PACKAGEROOT]"
 DATAROOT="@[DATAROOT]"
 
 # conda
 source ${PACKAGEROOT}/etc/env.sh
 
-echo "In get_ics, init_time=${init_time} "
-python3 ${PACKAGEROOT}/src/get_ics.py ${init_time} --base_dir ${DATAROOT}
+# job
+echo "In get_ics, init_time=${INIT_TIME} "
+python3 ${PACKAGEROOT}/src/get_ics.py ${INIT_TIME} --base_dir ${DATAROOT}

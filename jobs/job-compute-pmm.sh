@@ -8,18 +8,19 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --time=00:10:00
 
+# load wgrib2 modules
 module use /contrib/spack-stack/spack-stack-1.9.1/envs/ue-oneapi-2024.2.1/install/modulefiles/Core/
 module load stack-oneapi
 module load wgrib2
 
-#set vars
-init_time="@[INIT_TIME]"
-lead_hour=@[LEAD_HOUR]
-member=@[MEMBER]
+# set vars
+INIT_TIME="@[INIT_TIME]"
 PACKAGEROOT=@[PACKAGEROOT]
 DATAROOT=@[DATAROOT]
 
+# conda
 source ${PACKAGEROOT}/etc/env.sh
 
-echo "In compute_pmm, init_time=${init_time}"
-python ${PACKAGEROOT}/src/compute_pmm.py ${init_time} --forecast_dir ${DATAROOT} --output_dir ${DATAROOT}
+# job
+echo "In compute_pmm, init_time=${INIT_TIME}"
+python ${PACKAGEROOT}/src/compute_pmm.py ${INIT_TIME} --forecast_dir ${DATAROOT} --output_dir ${DATAROOT}

@@ -333,11 +333,6 @@ class ForecastPlotter:
 
 
 def plot_lead_hour(h, ds_path, init_datetime, init_year, init_month, init_day, init_hh, output_dir, date_str, member, config_dict):
-    import xarray as xr
-    import os
-    from pathlib import Path
-    import logging
-    from datetime import timedelta
     # Reconstruct config and plotter
     config = ForecastPlotterConfig()
     for k, v in config_dict.items():
