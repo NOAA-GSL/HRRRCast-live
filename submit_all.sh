@@ -10,7 +10,8 @@ N_GPUS=${5:-1}
 ACCNR=${ACCNR:-gsd-hpcs}
 PACKAGEROOT=${6:-`pwd`}
 DATAROOT=${7:-`pwd`}
-ENVMODE=${8:-``}
+RUNPLOT=${8:-"YES"}
+ENVMODE=${9:-``}
 
 submit_with_check() {
     local jobid
@@ -45,7 +46,7 @@ get_ranges() {
 }
 
 source ./atparse.bash
-if [ ! -d "$DIRECTORY" ]; then
+if [ ! -d "$DATAROOT/logs" ]; then
     mkdir -p $DATAROOT/logs
 fi
 cd $DATAROOT
@@ -75,9 +76,11 @@ if [ $USE_DIFFUSION -eq 0 ]; then
     jobid5=$(submit_with_check sbatch --dependency=afterok:$jobid3:$jobid4 --parsable $DATAROOT/logs/job-fcst.sh)
     echo "Submitted job: $jobid5"
     
-    atparse < $PACKAGEROOT/jobs/job-plot.sh > $DATAROOT/logs/job-plot.sh
-    jobid6=$(submit_with_check sbatch --dependency=afterok:$jobid5 --parsable $DATAROOT/logs/job-plot.sh)
-    echo "Submitted job: $jobid6"
+    if [ "$RUNPLOT" == "YES" ]; then
+      atparse < $PACKAGEROOT/jobs/job-plot.sh > $DATAROOT/logs/job-plot.sh
+      jobid6=$(submit_with_check sbatch --dependency=afterok:$jobid5 --parsable $DATAROOT/logs/job-plot.sh)
+      echo "Submitted job: $jobid6"
+    fi
 else
     # run two ensemble members
     jobids=()
@@ -87,9 +90,11 @@ else
         jobids+=($jobid5)
         echo "Submitted job: $jobid5"
 
-        atparse < $PACKAGEROOT/jobs/job-plot.sh > $DATAROOT/logs/job-plot-${MEMBER}.sh
-        jobid6=$(submit_with_check sbatch --dependency=afterok:$jobid5 --parsable $DATAROOT/logs/job-plot-${MEMBER}.sh)
-        echo "Submitted job: $jobid6"
+        if [ "$RUNPLOT" == "YES" ]; then
+            atparse < $PACKAGEROOT/jobs/job-plot.sh > $DATAROOT/logs/job-plot-${MEMBER}.sh
+            jobid6=$(submit_with_check sbatch --dependency=afterok:$jobid5 --parsable $DATAROOT/logs/job-plot-${MEMBER}.sh)
+            echo "Submitted job: $jobid6"
+	fi
     done
     
     # ensemble PMM
@@ -100,8 +105,10 @@ else
         jobid7=$(submit_with_check sbatch --dependency=afterok:$(IFS=:; echo "${jobids[*]}") --parsable $DATAROOT/logs/job-compute-pmm.sh)
         echo "Submitted job: $jobid7"
     
-        atparse < $PACKAGEROOT/jobs/job-plot.sh > $DATAROOT/logs/job-plot-mean.sh
-        jobid8=$(submit_with_check sbatch --dependency=afterok:$jobid7 --parsable $DATAROOT/logs/job-plot-mean.sh)
-        echo "Submitted job: $jobid8"
+        if [ "$RUNPLOT" == "YES" ]; then
+            atparse < $PACKAGEROOT/jobs/job-plot.sh > $DATAROOT/logs/job-plot-mean.sh
+            jobid8=$(submit_with_check sbatch --dependency=afterok:$jobid7 --parsable $DATAROOT/logs/job-plot-mean.sh)
+            echo "Submitted job: $jobid8"
+	fi
     fi
 fi
