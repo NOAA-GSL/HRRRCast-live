@@ -9,13 +9,13 @@
 #SBATCH --time=00:10:00
 
 # set vars
-init_time="@[INIT_TIME]"
+INIT_TIME="@[INIT_TIME]"
 PACKAGEROOT=@[PACKAGEROOT]
 DATAROOT=@[DATAROOT]
 
 # conda
 source ${PACKAGEROOT}/etc/env.sh
 
-# make ics
-echo "In make_ics, init_time=${init_time}"
-python3 ${PACKAGEROOT}/src/make_ics.py ${PACKAGEROOT}/net-diffusion/normalize.nc ${init_time} --base_dir ${DATAROOT} --output_dir ${DATAROOT}
+# job
+echo "In make_ics, init_time=${INIT_TIME}"
+python3 ${PACKAGEROOT}/src/make_ics.py ${PACKAGEROOT}/net-diffusion/normalize.nc ${INIT_TIME} --base_dir ${DATAROOT} --output_dir ${DATAROOT}

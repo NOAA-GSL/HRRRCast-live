@@ -9,13 +9,14 @@
 #SBATCH --time=00:10:00
 
 # set vars
-init_time="@[INIT_TIME]"
-lead_hour=@[LEAD_HOUR]
+INIT_TIME="@[INIT_TIME]"
+LEAD_HOUR=@[LEAD_HOUR]
 PACKAGEROOT=@[PACKAGEROOT]
 DATAROOT=@[DATAROOT]
  
 # conda
 source ${PACKAGEROOT}/etc/env.sh
 
-echo "In get_bcs, init_time=${init_time}, lead_hour=${lead_hour}"
-python3 ${PACKAGEROOT}/src/get_bcs.py ${init_time} ${lead_hour} --base_dir ${DATAROOT}
+# job
+echo "In get_bcs, init_time=${INIT_TIME}, lead_hour=${LEAD_HOUR}"
+python3 ${PACKAGEROOT}/src/get_bcs.py ${INIT_TIME} ${LEAD_HOUR} --base_dir ${DATAROOT}
