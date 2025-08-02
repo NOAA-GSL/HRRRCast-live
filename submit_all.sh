@@ -46,7 +46,7 @@ get_ranges() {
 }
 
 source ./atparse.bash
-if [ ! -d "$DIRECTORY" ]; then
+if [ ! -d "$DATAROOT/logs" ]; then
     mkdir -p $DATAROOT/logs
 fi
 cd $DATAROOT
