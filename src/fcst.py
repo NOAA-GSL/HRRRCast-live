@@ -151,15 +151,22 @@ class WeatherForecaster:
         self.metadata = data_loader_hrrr.metadata
         self.member = member
         self.use_diffusion = use_diffusion
-    
-    @staticmethod
-    def denormalize(output: np.ndarray, norm_file: str) -> np.ndarray:
-        """Convert model output back to physical units using stored mean/std."""
+
+        # Load normalization file and extract mean/std
+        norm_file = self.metadata['norm_file']
         try:
             norms = xr.open_dataset(norm_file)['UGRD']
-            mean = norms[0, :74].values[None, None, None, :]
-            std = norms[1, :74].values[None, None, None, :]
-            return np.squeeze(output * std + mean)
+            self.mean = norms[0, :74]
+            self.std = norms[1, :74]
+        except Exception as e:
+            logger.error(f"Error loading normalization file: {e}")
+            raise
+    
+
+    def denormalize(self, output: np.ndarray) -> np.ndarray:
+        """Convert model output back to physical units using stored mean/std."""
+        try:
+            return np.squeeze(output * self.std.values[None, None, None, :] + self.mean.values[None, None, None, :])
         except Exception as e:
             logger.error(f"Error in denormalization: {e}")
             raise
@@ -258,7 +265,8 @@ class WeatherForecaster:
 
             # set to 0 negative REFC values
             refc = y[..., -1]
-            refc = tf.where(refc < 0, tf.zeros_like(refc), refc)
+            min_normalized_refc = -self.mean[-1] / self.std[-1]
+            refc = tf.maximum(refc, min_normalized_refc)
             y = tf.concat([y[...,:-1], tf.expand_dims(refc, axis=-1)], axis=-1)
 
             hourly_forecasts[hour] = y
@@ -330,10 +338,9 @@ class WeatherForecaster:
 
             # Denormalize all outputs
             logger.info("Denormalizing outputs...")
-            norm_file = self.metadata['norm_file']
             denorm_outputs = {}
             for hour, forecast in hourly_forecasts.items():
-                denorm_outputs[hour] = self.denormalize(forecast[None, ...], norm_file)
+                denorm_outputs[hour] = self.denormalize(forecast[None, ...])
 
             # Stack all timesteps into a single numpy array
             outdata = np.array([denorm_outputs[i] for i in range(0, lead_hours + 1)])
