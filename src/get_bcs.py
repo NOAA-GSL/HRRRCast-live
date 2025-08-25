@@ -134,9 +134,8 @@ def get_gfs_urls(year: str, month: str, day: str, hour: str, lead_hours: int) ->
             start_forecast_hour = hour_int - init_cycle
     
     # Generate URLs for all forecast hours from start to start + lead_hours, skipping 0th hour
-    for fh in range(start_forecast_hour, start_forecast_hour + lead_hours + 1):
-        if fh == 0:
-            continue  # skip 0th hour
+    for fh in range(1, lead_hours + 1):
+        fh += start_forecast_hour
         forecast_str = f"{fh:03d}"
         url = f"{Config.GFS_BASE_URL}/gfs.{init_date_str}/{cycle_str}/atmos/gfs.t{cycle_str}z.pgrb2.0p25.f{forecast_str}"
         
@@ -160,6 +159,10 @@ def download_gfs_files(year: str, month: str, day: str, hour: str, lead_hours: i
         logger.info(f"Downloading GFS boundary conditions: {year}-{month}-{day} {hour}:00 UTC + {lead_hours} hours")
     
     urls = get_gfs_urls(year, month, day, hour, lead_hours)
+    logging.info(f"Total files to download: {len(urls)}")
+    for url in urls:
+        logger.info(f"{url[0]} -> {url[1]}")
+        
     results = []
     
     # Use ThreadPoolExecutor for multiple files
