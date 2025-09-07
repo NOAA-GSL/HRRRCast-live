@@ -19,7 +19,6 @@ module load wgrib2
 INIT_TIME="@[INIT_TIME]"
 LEAD_HOUR=@[LEAD_HOUR]
 MEMBER=@[MEMBER]
-USE_DIFFUSION=@[USE_DIFFUSION]
 PACKAGEROOT=@[PACKAGEROOT]
 DATAROOT=@[DATAROOT]
 ENVMODE=@[ENVMODE]
@@ -32,11 +31,6 @@ else
 fi
 
 # job
-echo "In fcst, INIT_TIME=${INIT_TIME}, LEAD_HOUR=${LEAD_HOUR}, MEMBER=${MEMBER}, USE_DIFFUSION=${USE_DIFFUSION}, base_dir=${DATAROOT}"
-if [ $USE_DIFFUSION -eq 0 ]; then
-    python ${PACKAGEROOT}/src/fcst.py $PACKAGEROOT/net-deterministic/model.keras ${INIT_TIME} ${LEAD_HOUR} \
-        --members ${MEMBER} --no_diffusion --base_dir ${DATAROOT} --output_dir ${DATAROOT}
-else
-    python ${PACKAGEROOT}/src/fcst.py $PACKAGEROOT/net-diffusion/model.keras ${INIT_TIME} ${LEAD_HOUR} \
-        --members ${MEMBER} --base_dir ${DATAROOT} --output_dir ${DATAROOT}
-fi
+echo "In fcst, INIT_TIME=${INIT_TIME}, LEAD_HOUR=${LEAD_HOUR}, MEMBER=${MEMBER}, base_dir=${DATAROOT}"
+python ${PACKAGEROOT}/src/fcst.py $PACKAGEROOT/net-diffusion/model.keras ${INIT_TIME} ${LEAD_HOUR} \
+    --members ${MEMBER} --base_dir ${DATAROOT} --output_dir ${DATAROOT}

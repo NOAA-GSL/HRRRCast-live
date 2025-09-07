@@ -16,11 +16,9 @@ from iris.coords import DimCoord
 import iris_grib
 import eccodes
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+from utils import setup_logging
+
+logger = setup_logging('INFO')
 
 
 class Netcdf2Grib:
@@ -34,6 +32,34 @@ class Netcdf2Grib:
             "SPFH": [None, "specific_humidity", "kg kg**-1"],
             "T2M": [2, "air_temperature", "K"],
             "REFC": [0, "equivalent_reflectivity_factor", "dBZ"],
+            # Expanded surface variables
+            "PRES": [0, "surface_air_pressure", "Pa"],
+            "MSLMA": [0, "air_pressure_at_mean_sea_level", "Pa"],
+            "UGRD10M": [10, "x_wind", "m s**-1"],
+            "VGRD10M": [10, "y_wind", "m s**-1"],
+            "UGRD80M": [80, "x_wind", "m s**-1"],
+            "VGRD80M": [80, "y_wind", "m s**-1"],
+            "D2M": [2, "dew_point_temperature", "K"],
+            "R2M": [2, "relative_humidity", "%"],
+            "TCDC": [0, "cloud_area_fraction", "1"],
+            "VIS": [0, "visibility_in_air", "m"],
+            "APCP": [0, "lwe_thickness_of_precipitation_amount", "kg m**-2"],
+            "HGTCC": [0, "geopotential_height_at_cloud_top", "m"],  # approximation
+            "CAPE": [0, "atmosphere_convective_available_potential_energy", "J kg**-1"],
+            "CIN": [0, "atmosphere_convective_inhibition", "J kg**-1"],
+        }
+
+        # GRIB2 parameter overrides: var_name -> (discipline, parameterCategory, parameterNumber, typeOfFirstFixedSurface)
+        # NOTE: Codes chosen from WMO GRIB2 tables; some (HGTCC) are approximations and may need refinement.
+        self.GRIB_PARAM_OVERRIDE = {
+            "REFC":  (0, 16, 196, 10),   # already handled, retained for completeness
+            "MSLMA": (0, 3, 1, 102),     # pressure reduced to MSL
+            "TCDC":  (0, 6, 1, 10),      # total cloud cover, entire atmosphere
+            "VIS":   (0, 19, 0, 1),      # visibility, surface
+            "APCP":  (0, 1, 8, 1),       # total precipitation, surface (accum)
+            "CAPE":  (0, 7, 6, 1),       # convective available potential energy, surface based
+            "CIN":   (0, 7, 7, 1),       # convective inhibition, surface based
+            "HGTCC": (0, 6, 13, 1),      # cloud ceiling height (approx: using phys atmos category)
         }
 
     def tweaked_messages(self, cube):
@@ -52,11 +78,23 @@ class Netcdf2Grib:
                 grib_message, "longitudeOfFirstGridPointInDegrees", 237.280472
             )
 
-            if cube.standard_name == "equivalent_reflectivity_factor":
+            # Retrieve original variable name if stored
+            orig_name = cube.attributes.get("orig_name", None)
+            std_name = cube.standard_name if hasattr(cube, "standard_name") else None
+
+            if std_name == "equivalent_reflectivity_factor" or orig_name == "REFC":
                 eccodes.codes_set(grib_message, "discipline", 0)
                 eccodes.codes_set(grib_message, "parameterCategory", 16)
                 eccodes.codes_set(grib_message, "parameterNumber", 196)
                 eccodes.codes_set(grib_message, "typeOfFirstFixedSurface", 10)
+            else:
+                key = orig_name if orig_name in self.GRIB_PARAM_OVERRIDE else None
+                if key is not None:
+                    disc, cat, num, surface = self.GRIB_PARAM_OVERRIDE[key]
+                    eccodes.codes_set(grib_message, "discipline", disc)
+                    eccodes.codes_set(grib_message, "parameterCategory", cat)
+                    eccodes.codes_set(grib_message, "parameterNumber", num)
+                    eccodes.codes_set(grib_message, "typeOfFirstFixedSurface", surface)
 
         yield grib_message
 
@@ -137,7 +175,7 @@ class Netcdf2Grib:
 
         times = cubes[0].coord("time").points
         cycle = forecast_starttime.hour
-        logging.info(f"Forecast start time is {forecast_starttime}")
+        logger.info(f"Forecast start time is {forecast_starttime}")
 
         datevectors = [forecast_starttime + timedelta(hours=int(t)) for t in times]
 
@@ -155,7 +193,7 @@ class Netcdf2Grib:
         )
 
         for idate, date in enumerate(datevectors):
-            logging.info(f"Processing for time {date.strftime('%Y-%m-%d %H:00:00')}")
+            logger.info(f"Processing for time {date.strftime('%Y-%m-%d %H:00:00')}")
             hrs = int((date - forecast_starttime).total_seconds() // 3600)
 
             if member == "avg":
@@ -166,7 +204,7 @@ class Netcdf2Grib:
                 outfile = os.path.join(
                     outdir, f"hrrrcast.m{member:02d}.t{cycle:02d}z.pgrb2.f{hrs:02d}"
                 )
-            logging.info(f"grib2 file name: {outfile}")
+            logger.info(f"grib2 file name: {outfile}")
 
             for cube in sorted(cubes, key=lambda cube: cube.name()):
                 var_name = cube.name()
@@ -222,6 +260,7 @@ class Netcdf2Grib:
                                 hrs, standard_name="forecast_period", units="hours"
                             )
                         )
+                        cube_slice_level.attributes["orig_name"] = var_name
                         cube_slice_level.standard_name = self.ATTR_MAPS[var_name][1]
                         cube_slice_level.units = self.ATTR_MAPS[var_name][2]
                         iris_grib.save_messages(
@@ -235,16 +274,21 @@ class Netcdf2Grib:
                             hrs, standard_name="forecast_period", units="hours"
                         )
                     )
-                    cube_slice.standard_name = self.ATTR_MAPS[var_name][1]
-                    cube_slice.units = self.ATTR_MAPS[var_name][2]
-                    # Add height coord and save messages for all variables
-                    cube_slice.add_aux_coord(
-                        iris.coords.DimCoord(
-                            self.ATTR_MAPS[var_name][0],
-                            standard_name="height",
-                            units="m",
-                        )
-                    )
+                    if var_name in self.ATTR_MAPS:
+                        cube_slice.attributes["orig_name"] = var_name
+                        cube_slice.standard_name = self.ATTR_MAPS[var_name][1]
+                        cube_slice.units = self.ATTR_MAPS[var_name][2]
+                        height_val = self.ATTR_MAPS[var_name][0]
+                        if height_val is not None and height_val > 0:
+                            cube_slice.add_aux_coord(
+                                iris.coords.DimCoord(
+                                    height_val,
+                                    standard_name="height",
+                                    units="m",
+                                )
+                            )
+                    else:
+                        logger.warning(f"Variable {var_name} missing in ATTR_MAPS; using existing metadata")
                     iris_grib.save_messages(
                         self.tweaked_messages(cube_slice), outfile, append=True
                     )
@@ -254,7 +298,7 @@ class Netcdf2Grib:
 
             # Construct the wgrib2 command
             wgrib2_command = ["wgrib2", "-s", outfile]
-            logging.info(f"Running wgrib2 command: {' '.join(wgrib2_command)} to generate index file {output_idx_file}")
+            logger.info(f"Running wgrib2 command: {' '.join(wgrib2_command)} to generate index file {output_idx_file}")
 
             try:
                 # Open the output file for writing
@@ -262,16 +306,16 @@ class Netcdf2Grib:
                     # Execute the wgrib2 command and redirect stdout to the output file
                     subprocess.run(wgrib2_command, stdout=f_out, check=True)
 
-                logging.info(f"Index file created successfully: {output_idx_file}")
+                logger.info(f"Index file created successfully: {output_idx_file}")
 
             except subprocess.CalledProcessError as e:
-                logging.error(f"Error running wgrib2 command: {e}")
+                logger.error(f"Error running wgrib2 command: {e}")
 
         # Remove intermediate netCDF file
         if os.path.isfile(filename):
-            logging.info(f"Attempting to delete intermediate nc file {filename}")
+            logger.info(f"Attempting to delete intermediate nc file {filename}")
             try:
                 os.remove(filename)
-                logging.info(f"Successfully deleted intermediate nc file {filename}")
+                logger.info(f"Successfully deleted intermediate nc file {filename}")
             except Exception as e:
-                logging.error(f"Failed to delete intermediate nc file {filename}: {e}")
+                logger.error(f"Failed to delete intermediate nc file {filename}: {e}")

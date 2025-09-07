@@ -27,13 +27,15 @@ import xarray as xr
 import xesmf as xe
 
 import utils
+from utils import setup_logging
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+from transform import (
+    log_transform_array,
+    neg_log_transform_array,
+    DEFAULT_LOG_EPS,
 )
-logger = logging.getLogger(__name__)
+
+logger = None
 
 
 class WeatherPreprocessConfig:
@@ -42,7 +44,7 @@ class WeatherPreprocessConfig:
     def __init__(self, hrrr_grid_file: Optional[str] = None):
         # 3D and 2D variables for GFS
         self.pl_vars = ["GFS-HGT", "GFS-SPFH", "GFS-TMP", "GFS-UGRD", "GFS-VGRD", "GFS-VVEL"]
-        self.sfc_vars = ["GFS-MSLET", "GFS-PRES", "GFS-PRMSL", "GFS-REFC"]
+        self.sfc_vars = ["GFS-PRES", "GFS-PRMSL", "GFS-REFC", "GFS-T2M", "GFS-UGRD10M", "GFS-VGRD10M", "GFS-UGRD80M", "GFS-VGRD80M", "GFS-D2M", "GFS-R2M", "GFS-TCDC", "GFS-VIS", "GFS-APCP", "GFS-HGTCC", "GFS-CAPE", "GFS-CIN"]
         
         # Pressure levels (hPa)
         self.levels = [250, 500, 850, 1000]
@@ -65,6 +67,18 @@ class WeatherPreprocessConfig:
         # HRRR grid coordinates (will be loaded from file or defined)
         self.hrrr_lats = None
         self.hrrr_lons = None
+
+          # log-transform variables list
+        self.LOG_TRANSFORM_VARS = [
+            "GFS-SPFH",
+            "GFS-VIS",
+            "GFS-APCP",
+            "GFS-HGTCC",
+            "GFS-CAPE",
+        ]
+        self.NEG_LOG_TRANSFORM_VARS = [
+            "GFS-CIN",
+        ]    
 
 
 class GridInterpolator:
@@ -140,88 +154,185 @@ def process_single_lead_hour(args):
     
     logger.info(f"Processing lead time {lead_time}h from file: {os.path.basename(gfs_file)}")
     
-    # Load normalization data
-    norms = xr.open_dataset(norm_file)['UGRD'].values
-    
-    # Process pressure level variables
-    varnames = ['gh', 'q', 't', 'u', 'v', 'w']
+    # Load normalization dataset (per-variable stats)
+    ds_norm = xr.open_dataset(norm_file)
+
+    # Open GRIB file
     grbs = pg.open(gfs_file)
-    
-    # Get GFS grid coordinates
+
+    # Get GFS grid coordinates using first geopotential height level
     first_grb = grbs.select(shortName='gh', level=config.levels[0])[0]
     gfs_lats, gfs_lons = first_grb.latlons()
-    
-    normalized_vals, raw_vals = [], []
-    
-    for v_idx, var in enumerate(varnames):
-        selected = grbs.select(shortName=var, level=config.levels)
-        
-        if len(selected) != len(config.levels):
-            logger.warning(f"Expected {len(config.levels)} levels for {var} at lead {lead_time}h, got {len(selected)}")
-        
-        for l_idx, grb in enumerate(selected):
-            # Get original GFS data
-            gfs_vals = grb.values
-            
-            # Interpolate to HRRR grid
-            hrrr_vals = preprocessor.interpolator.interpolate_to_hrrr_grid(gfs_vals, gfs_lats, gfs_lons)
-            
-            # Downsample the HRRR grid
-            base_idx = 74
-            idx = base_idx + v_idx * len(config.levels) + l_idx
-            
-            if idx < len(norms[0]):
-                mean, std = norms[0, idx], norms[1, idx]
-                raw_vals.append(hrrr_vals)
-                normalized_vals.append(preprocessor.normalize(hrrr_vals, mean, std))
-            else:
-                logger.error(f"Normalization index {idx} out of bounds")
-                raise IndexError(f"Normalization index {idx} out of bounds")
-    
-    grbs.close()
-    pres_norm = np.array(normalized_vals)
-    pres_raw = np.array(raw_vals)
-    
-    # Process surface variables
-    base_idx = 74 + len(config.pl_vars) * len(config.levels)
-    mslet_mean, mslet_std = norms[0, base_idx], norms[1, base_idx]
-    pres_mean, pres_std = norms[0, base_idx + 1], norms[1, base_idx + 1]
-    prmsl_mean, prmsl_std = norms[0, base_idx + 2], norms[1, base_idx + 2]
-    refc_mean, refc_std = norms[0, base_idx + 3], norms[1, base_idx + 3]
-    
-    grbs = pg.open(gfs_file)
-    
-    # Extract GFS variables and interpolate to HRRR grid
-    mslet_gfs = grbs.select(shortName="mslet")[0].values
-    mslet_hrrr = preprocessor.interpolator.interpolate_to_hrrr_grid(mslet_gfs, gfs_lats, gfs_lons)
-    mslet_vals = mslet_hrrr
-    
-    pres_gfs = grbs.select(shortName="sp")[0].values
-    pres_hrrr = preprocessor.interpolator.interpolate_to_hrrr_grid(pres_gfs, gfs_lats, gfs_lons)
-    pres_vals = pres_hrrr
-    
-    prmsl_gfs = grbs.select(shortName="prmsl")[0].values
-    prmsl_hrrr = preprocessor.interpolator.interpolate_to_hrrr_grid(prmsl_gfs, gfs_lats, gfs_lons)
-    prmsl_vals = prmsl_hrrr
-    
-    refc_gfs = grbs.select(shortName="refc")[0].values
-    refc_hrrr = preprocessor.interpolator.interpolate_to_hrrr_grid(refc_gfs, gfs_lats, gfs_lons)
-    refc_vals = refc_hrrr
-    refc_vals = np.maximum(refc_vals, 0)  # Remove invalid reflectivity values
-    
-    # Normalize extracted variables
-    sfc_norm = [
-        preprocessor.normalize(mslet_vals, mslet_mean, mslet_std),
-        preprocessor.normalize(pres_vals, pres_mean, pres_std),
-        preprocessor.normalize(prmsl_vals, prmsl_mean, prmsl_std),
-        preprocessor.normalize(refc_vals, refc_mean, refc_std),
+
+    # Pressure-level variable mappings: GRIB shortName -> (norm var, config name)
+    pl_mappings = [
+        {'shortName': 'gh', 'cfg': 'GFS-HGT'},
+        {'shortName': 'q',  'cfg': 'GFS-SPFH'},
+        {'shortName': 't',  'cfg': 'GFS-TMP'},
+        {'shortName': 'u',  'cfg': 'GFS-UGRD'},
+        {'shortName': 'v',  'cfg': 'GFS-VGRD'},
+        {'shortName': 'w',  'cfg': 'GFS-VVEL'},
     ]
-    
-    sfc_raw = [mslet_vals, pres_vals, prmsl_vals, refc_vals]
-    
+
+    normalized_pl, raw_pl = [], []
+    for mapping in pl_mappings:
+        short = mapping['shortName']
+        cfg_name = mapping['cfg']
+
+        try:
+            selected = grbs.select(shortName=short, level=config.levels)
+        except Exception as e:
+            logger.warning(f"Unable to select pressure variable {short}: {e}")
+            continue
+
+        if len(selected) != len(config.levels):
+            logger.warning(f"Expected {len(config.levels)} levels for {short} got {len(selected)} (lead {lead_time}h)")
+
+        # Fetch stats array: shape (2, nLevels) if available
+        stats = ds_norm[cfg_name].values if cfg_name in ds_norm.variables else None
+        if stats is None:
+            logger.warning(f"No normalization stats for {cfg_name}; will compute per-level mean/std")
+
+        for l_idx, grb_var in enumerate(selected):
+            try:
+                vals = grb_var.values
+            except Exception as e:
+                logger.warning(f"Failed reading values for {short} level {l_idx}: {e}")
+                continue
+
+            # Interpolate to HRRR grid and downsample implicitly via HRRR grid choice
+            hrrr_vals = preprocessor.interpolator.interpolate_to_hrrr_grid(vals, gfs_lats, gfs_lons)
+            raw_pl.append(hrrr_vals)
+
+            # Apply log transforms where configured
+            if cfg_name in config.LOG_TRANSFORM_VARS:
+                proc_vals = log_transform_array(hrrr_vals, eps=DEFAULT_LOG_EPS)
+            elif cfg_name in config.NEG_LOG_TRANSFORM_VARS:
+                proc_vals = neg_log_transform_array(hrrr_vals, eps=DEFAULT_LOG_EPS)
+            else:
+                proc_vals = hrrr_vals
+
+            if stats is not None and l_idx < stats.shape[1]:
+                mean = float(stats[0, l_idx])
+                std = float(stats[1, l_idx])
+            else:
+                mean = float(np.nanmean(proc_vals))
+                std = float(np.nanstd(proc_vals))
+            norm_vals = preprocessor.normalize(proc_vals, mean, std)
+            logger.info(f"Variable {mapping['cfg']}-{l_idx}: mean {mean} std {std} min {np.min(proc_vals)} max {np.max(proc_vals)}: mean {np.mean(norm_vals)}, std {np.std(norm_vals)} min {np.min(norm_vals)}, max {np.max(norm_vals)}")
+            normalized_pl.append(norm_vals)
+
     grbs.close()
-    
-    return lead_time, pres_norm, pres_raw, np.array(sfc_norm), np.array(sfc_raw)
+    pres_norm = np.array(normalized_pl)
+    pres_raw = np.array(raw_pl)
+
+    # Surface variable mappings including height-specific variants
+    sfc_mappings = [
+        {'shortName': 'sp',     'cfg': 'GFS-PRES'},
+        {'shortName': 'prmsl',  'cfg': 'GFS-PRMSL'},
+        {'shortName': 'refc',   'cfg': 'GFS-REFC'},
+        {'shortName': '2t',     'cfg': 'GFS-T2M'},
+        {'shortName': '10u',    'cfg': 'GFS-UGRD10M'},
+        {'shortName': '10v',    'cfg': 'GFS-VGRD10M'},
+        {'shortName': 'u',      'cfg': 'GFS-UGRD80M', 'typeOfLevel': 'heightAboveGround', 'level': 80},
+        {'shortName': 'v',      'cfg': 'GFS-VGRD80M', 'typeOfLevel': 'heightAboveGround', 'level': 80},
+        {'shortName': '2d',     'cfg': 'GFS-D2M'},
+        {'shortName': '2r',     'cfg': 'GFS-R2M'},
+        {'shortName': 'tcc',    'cfg': 'GFS-TCDC', "typeOfLevel": "atmosphere"},
+        {'shortName': 'vis',    'cfg': 'GFS-VIS'},
+        {'shortName': 'tp',     'cfg': 'GFS-APCP'},
+        {'shortName': 'gh',     'cfg': 'GFS-HGTCC',  'typeOfLevel': 'cloudCeiling'},
+        {'shortName': 'cape',   'cfg': 'GFS-CAPE'},
+        {'shortName': 'cin',    'cfg': 'GFS-CIN'},
+    ]
+
+    grbs = pg.open(gfs_file)
+    normalized_sfc, raw_sfc = [], []
+    for mapping in sfc_mappings:
+        kwargs = {'shortName': mapping['shortName']}
+        if 'typeOfLevel' in mapping:
+            kwargs['typeOfLevel'] = mapping['typeOfLevel']
+        if 'level' in mapping:
+            kwargs['level'] = mapping['level']
+        try:
+            msgs = grbs.select(**kwargs)
+            if not msgs:
+                logger.warning(f"Surface var {mapping['cfg']} ({kwargs}) not found")
+                continue
+            vals = msgs[0].values
+        except Exception as e:
+            logger.warning(f"Failed selecting surface var {mapping['cfg']}: {e}")
+            continue
+
+        # Interpolate
+        hrrr_vals = preprocessor.interpolator.interpolate_to_hrrr_grid(vals, gfs_lats, gfs_lons)
+
+        # APCP replacement: use nearest synoptic hour strictly greater than valid time if available
+        if mapping['cfg'] == 'GFS-APCP':
+            try:
+                valid_datetime = init_datetime + timedelta(hours=lead_time)
+                syn_hours = [0, 6, 12, 18]
+                next_syn_hour = next((h for h in syn_hours if h > valid_datetime.hour), None)
+                if next_syn_hour is None:
+                    future_syn_dt = (valid_datetime + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                else:
+                    future_syn_dt = valid_datetime.replace(hour=next_syn_hour, minute=0, second=0, microsecond=0)
+                # Build expected local path (all GFS files stored under init directory)
+                # Use preprocessor helper to construct path for future synoptic valid time
+                future_lead = int((future_syn_dt - init_datetime).total_seconds() // 3600)
+                future_path = preprocessor.get_valid_time_filename(init_datetime, future_lead, base_dir)
+                future_fname = os.path.basename(future_path)
+                if os.path.exists(future_path):
+                    try:
+                        grbs_future = pg.open(future_path)
+                        future_msgs = grbs_future.select(shortName='tp')
+                        if future_msgs:
+                            future_vals = future_msgs[0].values
+                            future_interp = preprocessor.interpolator.interpolate_to_hrrr_grid(future_vals, gfs_lats, gfs_lons)
+                            hrrr_vals = future_interp
+                            logger.info(f"Replaced GFS-APCP at lead {lead_time}h using future synoptic APCP from {future_fname} (> valid {valid_datetime:%Y-%m-%d %H}Z)")
+                        grbs_future.close()
+                    except Exception as fe:
+                        logger.warning(f"Failed using future synoptic APCP {future_path}: {fe}")
+                else:
+                    logger.info(f"Future synoptic APCP file not found ({future_fname}); keeping current lead file values")
+            except Exception as e_apcp:
+                logger.warning(f"APCP future synoptic replacement error (lead {lead_time}h): {e_apcp}")
+
+        # Clean / enforce constraints
+        if mapping['cfg'] == 'GFS-REFC':
+            hrrr_vals = np.maximum(hrrr_vals, 0)
+
+        # Transform if needed
+        if mapping['cfg'] in config.LOG_TRANSFORM_VARS:
+            proc_vals = log_transform_array(hrrr_vals, eps=DEFAULT_LOG_EPS)
+        elif mapping['cfg'] in config.NEG_LOG_TRANSFORM_VARS:
+            proc_vals = neg_log_transform_array(hrrr_vals, eps=DEFAULT_LOG_EPS)
+        else:
+            proc_vals = hrrr_vals
+
+        # Stats
+        if mapping['cfg'] in ds_norm.variables:
+            stats = ds_norm[mapping['cfg']].values
+            if stats.shape[0] >= 2:
+                var_mean = float(np.nanmean(stats[0]))
+                var_std = float(np.nanmean(stats[1]))
+            else:
+                var_mean = float(np.nanmean(proc_vals))
+                var_std = float(np.nanstd(proc_vals))
+        else:
+            logger.warning(f"No normalization stats for surface var {mapping['norm']}; computing from data")
+            var_mean = float(np.nanmean(proc_vals))
+            var_std = float(np.nanstd(proc_vals))
+
+        norm_vals = preprocessor.normalize(proc_vals, var_mean, var_std)
+        logger.info(f"Variable {mapping['cfg']}: mean {var_mean} std {var_std} min {np.min(proc_vals)} max {np.max(proc_vals)}: mean {np.mean(norm_vals)}, std {np.std(norm_vals)} min {np.min(norm_vals)}, max {np.max(norm_vals)}")
+        normalized_sfc.append(norm_vals)
+        raw_sfc.append(hrrr_vals)
+
+    grbs.close()
+
+    return lead_time, np.array(pres_norm), np.array(pres_raw), np.array(normalized_sfc), np.array(raw_sfc)
 
 
 class GRIBPreprocessor:
@@ -539,13 +650,11 @@ def parse_arguments():
 
 def main():
     """Main execution function."""
+    global logger
+    args = parse_arguments()
+    logger = setup_logging(args.log_level)
+
     try:
-        args = parse_arguments()
-        
-        # Set logging level
-        logging.getLogger().setLevel(getattr(logging, args.log_level))
-        
-        # Run preprocessing
         output_file = preprocess_grib_data(
             norm_file=args.norm_file,
             datetime_str=args.inittime,
@@ -554,9 +663,7 @@ def main():
             output_dir=args.output_dir,
             hrrr_grid_file=args.hrrr_grid_file
         )
-        
         logger.info(f"Preprocessing complete. Output saved to: {output_file}")
-        
     except Exception as e:
         logger.error(f"Application failed: {e}")
         sys.exit(1)

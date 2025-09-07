@@ -40,14 +40,15 @@ from diffusion_params import (
     ddpm,
     ddim,
 )
-import utils
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+from transform import (
+    inverse_log_transform_array,
+    inverse_neg_log_transform_array,
+    DEFAULT_LOG_EPS,
 )
-logger = logging.getLogger(__name__)
+import utils
+from utils import setup_logging
+
+logger = None
 
 
 class PreprocessedDataLoader:
@@ -144,37 +145,142 @@ class ForecastModel:
 
 class WeatherForecaster:
     """Handles the forecasting pipeline."""
-    
-    def __init__(self, data_loader_hrrr: PreprocessedDataLoader, data_loader_gfs: PreprocessedDataLoader, member: int, use_diffusion: bool):
+
+    def __init__(
+        self,
+        data_loader_hrrr: PreprocessedDataLoader,
+        data_loader_gfs: PreprocessedDataLoader,
+        member: int,
+        use_diffusion: bool,
+        predicted_channels: Optional[int] = None,
+        gfs_channels: Optional[int] = None,
+        static_channels: Optional[int] = None,
+    ):
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
         self.metadata = data_loader_hrrr.metadata
         self.member = member
         self.use_diffusion = use_diffusion
 
-        # Load normalization file and extract mean/std
-        norm_file = self.metadata['norm_file']
+        # Derive dynamic channel counts if not provided
+        pl_vars = self.metadata["pl_vars"]
+        sfc_vars = self.metadata["sfc_vars"]
+        levels = self.metadata["levels"]
+        default_predicted = len(pl_vars) * len(levels) + len(sfc_vars)
+        total_hrrr = data_loader_hrrr.get_model_input().shape[-1]
+
+        if predicted_channels is None:
+            predicted_channels = default_predicted
+        if gfs_channels is None:
+            gfs_channels = data_loader_gfs.get_model_input().shape[-1]
+        if static_channels is None:
+            static_channels = max(total_hrrr - predicted_channels, 0)
+
+        self.predicted_channels = predicted_channels
+        self.gfs_channels = gfs_channels
+        self.static_channels = static_channels
+
+        # Load normalization file and construct per-channel mean/std vectors consistent with preprocessing
+        norm_file = self.metadata["norm_file"]
         try:
-            norms = xr.open_dataset(norm_file)['UGRD']
-            self.mean = norms[0, :74]
-            self.std = norms[1, :74]
+            ds_norm = xr.open_dataset(norm_file)
+            self._init_channel_stats(ds_norm)
+            ds_norm.close()
+            logger.info(
+                f"Normalization file loaded and channel stats constructed: {norm_file}"
+            )
         except Exception as e:
-            logger.error(f"Error loading normalization file: {e}")
+            logger.error(f"Error loading/processing normalization file: {e}")
             raise
     
 
+    def _init_channel_stats(self, ds_norm: xr.Dataset):
+        """Build flattened mean/std vectors matching channel ordering in preprocessing.
+
+        Ordering used in make_ics preprocessing:
+          1. Pressure-level vars in the order (UGRD, VGRD, VVEL, TMP, HGT, SPFH) for each level.
+          2. Surface vars in the order stored in metadata['sfc_vars'] (no constants).
+        Constants (e.g., LAND, OROG) were appended in preprocessing but are not predicted
+        by the diffusion / deterministic heads (first 74 channels). We still include them
+        at the tail of the vectors if present so slicing remains safe.
+        """
+        pl_vars = self.metadata['pl_vars']  # ["UGRD", ...]
+        sfc_vars = self.metadata['sfc_vars']
+        levels = self.metadata['levels']
+
+        means = []
+        stds = []
+
+        # Pressure-level variables
+        # Preprocessing loops over raw GRIB shortNames: u,v,w,t,gh,q corresponding to pl_vars order below
+        pl_order = ["UGRD", "VGRD", "VVEL", "TMP", "HGT", "SPFH"]
+        for var in pl_order:
+            if var not in ds_norm.variables:
+                # Fallback: fill with zeros/ones to avoid crash
+                logger.warning(f"Normalization stats missing for pressure var {var}; using mean=0,std=1")
+                means.extend([0.0] * len(levels))
+                stds.extend([1.0] * len(levels))
+                continue
+            stats = ds_norm[var].values  # shape (2, level)
+            # Safeguard shape
+            if stats.shape[0] < 2:
+                logger.warning(f"Stats for {var} malformed; using zeros/ones")
+                means.extend([0.0] * len(levels))
+                stds.extend([1.0] * len(levels))
+                continue
+            # If level dimension differs, broadcast or truncate
+            nlev_stats = stats.shape[1] if stats.ndim > 1 else 1
+            for i, lvl in enumerate(levels):
+                if i < nlev_stats:
+                    means.append(float(stats[0, i]))
+                    stds.append(float(stats[1, i]))
+                else:
+                    means.append(0.0)
+                    stds.append(1.0)
+
+        # Surface variables (single value per variable)
+        for var in sfc_vars:
+            if var not in ds_norm.variables:
+                logger.warning(f"Normalization stats missing for surface var {var}; using mean=0,std=1")
+                means.append(0.0)
+                stds.append(1.0)
+                continue
+            stats = ds_norm[var].values  # expect (2, ...) first dim=stat
+            if stats.shape[0] < 2:
+                logger.warning(f"Stats for {var} malformed; using mean=0,std=1")
+                means.append(0.0)
+                stds.append(1.0)
+                continue
+            # Reduce any remaining dims to scalar with nanmean
+            means.append(float(np.nanmean(stats[0])))
+            stds.append(float(np.nanmean(stats[1])) if np.nanmean(stats[1]) != 0 else 1.0)
+
+        self.channel_means = np.array(means, dtype=np.float32)
+        self.channel_stds = np.array(stds, dtype=np.float32)
+        vmin, vmax = self.get_variable_bounds()
+        self.channel_mins = (vmin - self.channel_means) / self.channel_stds
+        self.channel_maxs = (vmax - self.channel_means) / self.channel_stds
+
     def denormalize(self, output: np.ndarray) -> np.ndarray:
-        """Convert model output back to physical units using stored mean/std."""
+        """Convert model output back to physical units using stored per-channel stats.
+
+        output: shape (1, H, W, C_out) or (H,W,C_out). We slice stats to C_out.
+        """
         try:
-            return np.squeeze(output * self.std.values[None, None, None, :] + self.mean.values[None, None, None, :])
+            if output.ndim == 3:
+                output = output[None, ...]
+            C_out = output.shape[-1]
+            means = self.channel_means[:C_out][None, None, None, :]
+            stds = self.channel_stds[:C_out][None, None, None, :]
+            return np.squeeze(output * stds + means)
         except Exception as e:
             logger.error(f"Error in denormalization: {e}")
             raise
     
     def predict(self, model: ForecastModel, X: tf.Tensor):
         if self.use_diffusion:
-            num_output_channels = 74
-            start = 102
+            num_output_channels = self.predicted_channels
+            start = self.predicted_channels + self.gfs_channels
             batch_size = 1
 
             # start from complete gaussian noise
@@ -228,6 +334,56 @@ class WeatherForecaster:
             return model.predict(X)
 
 
+    def get_variable_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return (mins, maxs) numpy arrays each shaped (output_channels,).
+        """
+        raw_bounds = {
+            "UGRD":    (-120, 120),
+            "VGRD":    (-120, 120),
+            "VVEL":    (-30, 30),
+            "TMP":     (180, 340),
+            "HGT":     (-600, 20000),
+            "SPFH":    (0, 0.05),
+            "PRES":    (50000, 110000),
+            "MSLMA":   (50000, 110000),
+            "REFC":    (0, 80),
+            "T2M":     (180, 340),
+            "UGRD10M": (-100, 100),
+            "VGRD10M": (-100, 100),
+            "UGRD80M": (-100, 100),
+            "VGRD80M": (-100, 100),
+            "D2M":     (180, 340),
+            "R2M":     (0, 100),
+            "TCDC":    (0, 100),
+            "VIS":     (0, 100000),
+            "APCP":    (0, 500),
+            "HGTCC":   (0, 20000),
+            "CAPE":    (0, 7000),
+            "CIN":     (-2000, 0),
+        }
+        eps = 1e-3
+        mins = []
+        maxs = []
+        log_vars = {"SPFH", "VIS", "APCP", "HGTCC", "CAPE"}
+        neg_log_vars = {"CIN"}
+        num_levels = len(self.metadata['levels'])
+        # Merge 3D and 2D targets into a single loop
+        for i, var in enumerate(raw_bounds):
+            vmin, vmax = raw_bounds[var]
+            if var in log_vars:
+                vmin = np.log(vmin + eps) - np.log(eps)
+                vmax = np.log(vmax + eps) - np.log(eps)
+            elif var in neg_log_vars:
+                vmin = np.sign(vmin) * (np.log(abs(vmin) + eps) - np.log(eps))
+                vmax = np.sign(vmax) * (np.log(abs(vmax) + eps) - np.log(eps))
+            # Repeat for each pressure level if 3D, else once
+            n_levels = num_levels if i < 6 else 1
+            for _ in range(n_levels):
+                mins.append(vmin)
+                maxs.append(vmax)
+        return np.array(mins, dtype=np.float32), np.array(maxs, dtype=np.float32)
+
     def autoregressive_rollout(self, initial_input: np.ndarray, forcing_input: np.ndarray, model: ForecastModel, 
                              target_hour: int) -> Tuple[Dict[int, np.ndarray], Dict[int, Dict]]:
         """Perform greedy autoregressive rollout."""
@@ -237,21 +393,22 @@ class WeatherForecaster:
         X = tf.convert_to_tensor(initial_input, dtype=tf.float32)
         
         # Stores forecasts and history
-        hourly_forecasts = {0: tf.identity(X[0:1, :, :, :74])}
+        hourly_forecasts = {0: tf.identity(X[0:1, :, :, :self.predicted_channels])}
         history = {0: {'step': 0, 'from': None}}
-        
+
+        start_pred_noise = self.predicted_channels + self.gfs_channels
+
         # Process all hourly steps
         for hour in tqdm(range(1, target_hour + 1), desc="Forecasting"):
             from_hour = ((hour - 1) // 6) * 6
             step = hour - from_hour
-            
-            # setup ICs and BCs
-            # NOTE: BCS (forcing_input) no longer includes 0th hour, so hour=1 -> index 0, hour=2 -> index 1, etc.
+
+            # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
             X = tf.concat(
                 [
                     hourly_forecasts[from_hour],
                     forcing_input[hour-1:hour, :, :, :],
-                    X[:, :, :, 102:-1],
+                    X[:, :, :, start_pred_noise:-1],
                     tf.fill(
                         tf.concat([tf.shape(X)[:-1], [1]], axis=0),
                         step / 6.0,
@@ -259,22 +416,14 @@ class WeatherForecaster:
                 ],
                 axis=-1,
             )
-            
-            # predict
-            y = self.predict(model, X)
 
-            # set to 0 negative REFC values
-            refc = y[..., -1]
-            min_normalized_refc = -self.mean[-1] / self.std[-1]
-            refc = tf.maximum(refc, min_normalized_refc)
-            y = tf.concat([y[...,:-1], tf.expand_dims(refc, axis=-1)], axis=-1)
+            # Predict next-hour fields (predicted channels only)
+            y = self.predict(model, X)
+            y = tf.clip_by_value(y, self.channel_mins[:y.shape[-1]], self.channel_maxs[:y.shape[-1]])
 
             hourly_forecasts[hour] = y
-            history[hour] = {
-                'step': step,
-                'from': from_hour,
-            }
-        
+            history[hour] = {"step": step, "from": from_hour}
+
         logger.info("Autoregressive rollout completed")
         return hourly_forecasts, history
     
@@ -352,6 +501,28 @@ class WeatherForecaster:
             logger.info("Creating xarray dataset...")
             outdata_xr = self.create_xarray_dataset(init_datetime, times, lats, lons, outdata)
 
+            # Apply inverse log / signed-log transforms to recover physical units
+            try:
+                log_vars = {"SPFH", "VIS", "APCP", "HGTCC", "CAPE"}
+                neg_log_vars = {"CIN"}
+                applied = []
+                for var in log_vars:
+                    if var in outdata_xr.variables:
+                        data_arr = outdata_xr[var].values  # shape (time, lead_time, [level], y, x)
+                        outdata_xr[var].values[:] = inverse_log_transform_array(data_arr, eps=DEFAULT_LOG_EPS)
+                        applied.append(var)
+                for var in neg_log_vars:
+                    if var in outdata_xr.variables:
+                        data_arr = outdata_xr[var].values
+                        outdata_xr[var].values[:] = inverse_neg_log_transform_array(data_arr, eps=DEFAULT_LOG_EPS)
+                        applied.append(var)
+                if applied:
+                    logger.info(f"Applied inverse log transforms to variables: {', '.join(applied)}")
+                else:
+                    logger.info("No inverse log transforms applied (variables not found in dataset)")
+            except Exception as e:
+                logger.error(f"Failed applying inverse log transforms: {e}")
+
             # Save output
             init_year = self.metadata['init_year']
             init_month = self.metadata['init_month']
@@ -419,12 +590,11 @@ def parse_arguments():
 
 def main():
     """Main execution function."""
-    try:
-        args = parse_arguments()
-        
-        # Set logging level
-        logging.getLogger().setLevel(getattr(logging, args.log_level))
+    global logger
+    args = parse_arguments()
+    logger = setup_logging(args.log_level)
 
+    try:
         # Parse members argument (support space/comma separated and ranges like 0-2)
         def expand_member_arg(m):
             result = []
@@ -454,26 +624,38 @@ def main():
         # Precompute model_input ONCE
         model_input_hrrr = data_loader_hrrr.get_model_input()
         model_input_gfs = data_loader_gfs.get_model_input()
-        lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
+        model_input_hrrr = np.nan_to_num(model_input_hrrr, nan=0.0)
+        model_input_gfs = np.nan_to_num(model_input_gfs, nan=0.0)
+        pl_vars = data_loader_hrrr.metadata["pl_vars"]
+        sfc_vars = data_loader_hrrr.metadata["sfc_vars"]
+        levels = data_loader_hrrr.metadata["levels"]
+        predicted_channels = len(pl_vars) * len(levels) + len(sfc_vars)
+        gfs_channels = model_input_gfs.shape[-1]
+        static_channels = max(model_input_hrrr.shape[-1] - predicted_channels, 0)
+
+        lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1), dtype=model_input_hrrr.dtype)
         if not args.no_diffusion:
-            rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 74))
-            step_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1))
+            rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], predicted_channels), dtype=model_input_hrrr.dtype)
+            step_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1), dtype=model_input_hrrr.dtype)
             model_input = np.concatenate([
-                model_input_hrrr[:, :, :, :74],
+                model_input_hrrr[:, :, :, :predicted_channels],
                 model_input_gfs[0:1, :, :, :],
                 rand_channel,
-                model_input_hrrr[:, :, :, 74:],
+                model_input_hrrr[:, :, :, predicted_channels:],
                 step_channel, lead_channel], axis=-1)
         else:
             model_input = np.concatenate([
-                model_input_hrrr[:, :, :, :74],
+                model_input_hrrr[:, :, :, :predicted_channels],
                 model_input_gfs[0:1, :, :, :],
-                model_input_hrrr[:, :, :, 74:],
+                model_input_hrrr[:, :, :, predicted_channels:],
                 lead_channel], axis=-1)
         
         output_files = []
         for i, member in enumerate(members):
-            forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member, not args.no_diffusion)
+            forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member, not args.no_diffusion,
+                                           predicted_channels=predicted_channels,
+                                           gfs_channels=gfs_channels,
+                                           static_channels=static_channels)
             forecast_dataset, output_file = run_weather_forecast_for_member(
                 forecaster, model, args.lead_hours, model_input, args.output_dir, member, print_history=(i==len(members)-1)
             )

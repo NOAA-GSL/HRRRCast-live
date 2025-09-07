@@ -8,14 +8,13 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from dateutil import parser
 from pathlib import Path
 from typing import List, Tuple
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 import utils
+from utils import setup_logging, create_output_directory, download_file_with_retry
 
 # -------------------------------
 # Configuration
@@ -28,8 +27,8 @@ class Config:
     
     # File types
     HRRR_FILE_TYPES = {
-        'pressure': 'wrfprsf00.grib2',
-        'surface': 'wrfsfcf00.grib2'
+        'pressure': 'wrfprsf00.grib2',   # analysis pressure
+        'surface': 'wrfsfcf00.grib2'     # analysis surface
     }
     
     # Retry settings
@@ -37,69 +36,6 @@ class Config:
     RETRY_DELAY = 2  # seconds
     TIMEOUT = 300    # seconds
 
-# -------------------------------
-# Logging Setup
-# -------------------------------
-def setup_logging(log_level: str = 'INFO') -> logging.Logger:
-    """Set up logging configuration."""
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper()),
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    return logging.getLogger(__name__)
-
-# -------------------------------
-# Utility Functions
-# -------------------------------
-def create_output_directory(base_dir: str, date_str: str) -> Path:
-    """Create output directory if it doesn't exist."""
-    output_dir = Path(base_dir) / date_str
-    utils.make_directory(output_dir)
-    return output_dir
-
-def download_file_with_retry(url: str, output_path: str, max_retries: int = Config.MAX_RETRIES) -> bool:
-    """Download a file with retry logic and progress tracking."""
-    logger = logging.getLogger(__name__)
-    
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"Downloading {url} (attempt {attempt + 1}/{max_retries})")
-            
-            response = requests.get(url, stream=True, timeout=Config.TIMEOUT)
-            response.raise_for_status()
-            
-            # Get file size for progress tracking
-            total_size = int(response.headers.get('content-length', 0))
-            
-            with open(output_path, 'wb') as f:
-                downloaded = 0
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        # Show progress for large files
-                        if total_size > 0 and downloaded % (total_size // 10) == 0:
-                            progress = (downloaded / total_size) * 100
-                            logger.info(f"Progress: {progress:.1f}%")
-            
-            logger.info(f"Successfully downloaded: {os.path.basename(output_path)}")
-            return True
-            
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Download attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                logger.info(f"Retrying in {Config.RETRY_DELAY} seconds...")
-                time.sleep(Config.RETRY_DELAY)
-            else:
-                logger.error(f"Failed to download {url} after {max_retries} attempts")
-                return False
-        except Exception as e:
-            logger.error(f"Unexpected error downloading {url}: {e}")
-            return False
-    
-    return False
 
 # -------------------------------
 # HRRR Download Functions
@@ -159,7 +95,7 @@ def download_hrrr_data(datetime_str: str, base_dir: str = "{DATAROOT}/") -> dict
     output_dir = create_output_directory(base_dir, date_str)
     logger.info(f"Output directory: {output_dir}")
     
-    results = {'hrrr': []}
+    results = {'hrrr': [], 'prev_hour_surface_f01': False}
     
     # Download HRRR data
     try:
@@ -168,6 +104,25 @@ def download_hrrr_data(datetime_str: str, base_dir: str = "{DATAROOT}/") -> dict
     except Exception as e:
         logger.error(f"Error downloading HRRR data: {e}")
         results['hrrr'] = [False]
+
+    # Also download previous hour cycle's 1h surface forecast (wrfsfcf01.grib2)
+    try:
+        prev_cycle_dt = init_datetime - timedelta(hours=1)
+        _, prev_year, prev_month, prev_day, prev_hour = utils.validate_datetime(prev_cycle_dt.strftime('%Y-%m-%dT%H'))
+        # Keep file naming with original cycle timestamp but store in current output_dir
+        prev_cycle_date = f"{prev_year}{prev_month}{prev_day}"
+        prev_url = f"{Config.HRRR_BASE_URL}/hrrr.{prev_cycle_date}/conus/hrrr.t{prev_hour}z.wrfsfcf01.grib2"
+        prev_filename = f"hrrr_{prev_cycle_date}_{prev_hour}_surface_f01.grib2"
+        prev_path = output_dir / prev_filename
+        if not prev_path.exists():
+            logger.info(f"Downloading previous hour surface 1h forecast (APCP source) into current directory from {prev_url}")
+            results['prev_hour_surface_f01'] = download_file_with_retry(prev_url, str(prev_path))
+        else:
+            logger.info(f"Previous hour surface 1h forecast already present in current directory: {prev_path}")
+            results['prev_hour_surface_f01'] = True
+    except Exception as e:
+        logger.error(f"Failed downloading previous hour surface f01 file: {e}")
+        results['prev_hour_surface_f01'] = False
     
     return results
 
@@ -202,11 +157,11 @@ Examples:
         )
         
         # Summary
-        total_successful = sum(results['hrrr'])
-        total_attempted = len(results['hrrr'])
-        
+        total_successful = sum(results['hrrr']) + (1 if results.get('prev_hour_surface_f01') else 0)
+        total_attempted = len(results['hrrr']) + 1
+
         logger.info(f"Download summary: {total_successful}/{total_attempted} files successful")
-        
+
         if total_successful == 0:
             logger.error("No files were downloaded successfully")
             sys.exit(1)
