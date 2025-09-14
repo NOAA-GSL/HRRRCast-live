@@ -427,6 +427,24 @@ class WeatherForecaster:
         logger.info("Autoregressive rollout completed")
         return hourly_forecasts, history
     
+    @staticmethod
+    def compute_r2m(ds: xr.Dataset) -> xr.Dataset:
+        """
+        Compute relative humidity at 2m (R2M) using T2M and D2M.
+        Assumes T2M and D2M are in Kelvin.
+        """
+        # Convert to Celsius
+        T_c = ds["T2M"] - 273.15
+        Td_c = ds["D2M"] - 273.15
+        # Magnus formula for saturation vapor pressure (hPa)
+        es = 6.112 * np.exp((17.67 * T_c) / (T_c + 243.5))
+        e = 6.112 * np.exp((17.67 * Td_c) / (Td_c + 243.5))
+        # Relative humidity (%)
+        RH = 100.0 * (e / es)
+        # Clip to [0, 100]
+        ds["R2M"] = RH.clip(min=0.0, max=100.0)
+        return ds
+
     def create_xarray_dataset(self, init_datetime: datetime, times: List[int], 
                             lats: np.ndarray, lons: np.ndarray, data: np.ndarray) -> xr.Dataset:
         """Convert numpy array to xarray.Dataset."""
@@ -470,7 +488,12 @@ class WeatherForecaster:
             )
             var_index += 1
         
-        return xr.Dataset(data_vars)
+        ds = xr.Dataset(data_vars)
+
+        # compute relative humidity at 2m
+        ds = self.compute_r2m(ds)
+
+        return ds
     
     def run_forecast(self, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str = "./", return_history: bool = False):
         """Run the complete forecasting pipeline. Requires precomputed model_input."""

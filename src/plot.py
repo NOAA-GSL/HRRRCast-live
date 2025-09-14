@@ -110,7 +110,13 @@ class ForecastPlotter:
             logger.error(f"Error loading forecast data: {e}")
             raise
     
-    def get_refc_cmap(self) -> tuple:
+    @staticmethod
+    def _sample_cmap(name, n):
+        base = plt.get_cmap(name)
+        return [mcolors.to_hex(base(i/(n-1))) for i in range(n)]
+
+    @staticmethod
+    def get_refc_cmap() -> tuple:
         """Return colormap + norm for composite reflectivity (REFC)."""
         reflectivity_levels = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70]
         reflectivity_colors = [
@@ -122,7 +128,8 @@ class ForecastPlotter:
         norm = mcolors.BoundaryNorm(reflectivity_levels, cmap.N)
         return cmap, norm, vmin, vmax
 
-    def get_apcp_cmap(self) -> tuple:
+    @staticmethod
+    def get_apcp_cmap() -> tuple:
         """Return colormap + norm for accumulated precipitation (APCP)."""
         apcp_levels = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 25, 35, 45, 60, 80, 100]
         apcp_colors = [
@@ -133,6 +140,43 @@ class ForecastPlotter:
         cmap = mcolors.ListedColormap(apcp_colors)
         norm = mcolors.BoundaryNorm(apcp_levels, cmap.N)
         return cmap, norm, vmin, vmax
+
+    @staticmethod
+    def get_cape_cmap() -> tuple:
+        """Colormap for CAPE (0-7000 J/kg) using 'inferno'."""
+        levels = [0, 100, 250, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 5000, 6000, 7000]
+        colors = ForecastPlotter._sample_cmap("inferno", len(levels)-1)
+        cmap = mcolors.ListedColormap(colors)
+        norm = mcolors.BoundaryNorm(levels, cmap.N)
+        return cmap, norm, min(levels), max(levels)
+    
+    @staticmethod
+    def get_cin_cmap() -> tuple:
+        """Colormap for CIN (-2000 to 0 J/kg) using 'PuBuGn_r'."""
+        levels = [-2000, -1500, -1000, -750, -500, -300, -200, -150, -100, -75, -50, -25, -10, -1, 0]
+        colors = ForecastPlotter._sample_cmap("PuBuGn_r", len(levels)-1)
+        cmap = mcolors.ListedColormap(colors)
+        norm = mcolors.BoundaryNorm(levels, cmap.N)
+        return cmap, norm, min(levels), max(levels)
+    
+    @staticmethod
+    def get_vis_cmap() -> tuple:
+        """Colormap for VIS (0-100000 m) using 'YlOrBr_r' and log-ish spaced levels."""
+        levels = [10, 50, 100, 200, 400, 800, 1500, 3000, 6000, 12000, 24000, 48000, 100000]
+        colors = ForecastPlotter._sample_cmap("YlOrBr_r", len(levels)-1)
+        cmap = mcolors.ListedColormap(colors)
+        norm = mcolors.BoundaryNorm(levels, cmap.N)
+        return cmap, norm, min(levels), max(levels)
+    
+    @staticmethod
+    def get_hgtcc_cmap() -> tuple:
+        """Colormap for HGTCC (0-20000 m) using 'viridis'."""
+        levels = [0, 500, 1000, 1500, 2000, 2500, 3000, 4000, 5000, 6000, 8000, 10000, 12000, 15000, 20000]
+        colors = ForecastPlotter._sample_cmap("viridis", len(levels)-1)
+        cmap = mcolors.ListedColormap(colors)
+        norm = mcolors.BoundaryNorm(levels, cmap.N)
+        return cmap, norm, min(levels), max(levels)
+
     
     def create_plot(self, data: np.ndarray, lats: np.ndarray, lons: np.ndarray, 
                    var_name: str, level: Optional[int] = None, 
@@ -150,6 +194,14 @@ class ForecastPlotter:
             cmap, norm, vmin, vmax = self.get_refc_cmap()
         elif var_name == 'APCP':
             cmap, norm, vmin, vmax = self.get_apcp_cmap()
+        elif var_name == 'CAPE':
+            cmap, norm, vmin, vmax = self.get_cape_cmap()
+        elif var_name == 'CIN':
+            cmap, norm, vmin, vmax = self.get_cin_cmap()
+        elif var_name == 'VIS':
+            cmap, norm, vmin, vmax = self.get_vis_cmap()
+        elif var_name == 'HGTCC':
+            cmap, norm, vmin, vmax = self.get_hgtcc_cmap()
         else:
             cmap = var_config.get('cmap', self.config.cmap_default)
             norm = None
