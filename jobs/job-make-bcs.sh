@@ -19,4 +19,4 @@ source ${PACKAGEROOT}/etc/env.sh
 
 # job
 echo "In make_bcs, init_time=${INIT_TIME}, lead_hour=${LEAD_HOUR}"
-python3 ${PACKAGEROOT}/src/make_bcs.py ${PACKAGEROOT}/net-diffusion/normalize.nc ${INIT_TIME} ${LEAD_HOUR} --base_dir ${DATAROOT} --output_dir ${DATAROOT} --hrrr_grid_file "${date_str}/hrrr_${date_str}_surface.grib2"
+python3 ${PACKAGEROOT}/src/make_bcs.py ${PACKAGEROOT}/net-diffusion/normalize-stats.nc ${INIT_TIME} ${LEAD_HOUR} --base_dir ${DATAROOT} --output_dir ${DATAROOT} --hrrr_grid_file "${date_str}/hrrr_${date_str}_surface.grib2"

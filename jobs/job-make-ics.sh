@@ -18,4 +18,4 @@ source ${PACKAGEROOT}/etc/env.sh
 
 # job
 echo "In make_ics, init_time=${INIT_TIME}"
-python3 ${PACKAGEROOT}/src/make_ics.py ${PACKAGEROOT}/net-diffusion/normalize.nc ${INIT_TIME} --base_dir ${DATAROOT} --output_dir ${DATAROOT}
+python3 ${PACKAGEROOT}/src/make_ics.py ${PACKAGEROOT}/net-diffusion/normalize-stats.nc ${INIT_TIME} --base_dir ${DATAROOT} --output_dir ${DATAROOT}

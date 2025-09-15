@@ -12,10 +12,10 @@ from datetime import datetime, timedelta
 from dateutil import parser
 from pathlib import Path
 from typing import List, Tuple
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 import utils
+from utils import setup_logging, create_output_directory, download_file_with_retry
+import math
 
 # -------------------------------
 # Configuration
@@ -31,69 +31,6 @@ class Config:
     RETRY_DELAY = 2  # seconds
     TIMEOUT = 300    # seconds
 
-# -------------------------------
-# Logging Setup
-# -------------------------------
-def setup_logging(log_level: str = 'INFO') -> logging.Logger:
-    """Set up logging configuration."""
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper()),
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    return logging.getLogger(__name__)
-
-# -------------------------------
-# Utility Functions
-# -------------------------------
-def create_output_directory(base_dir: str, date_str: str) -> Path:
-    """Create output directory if it doesn't exist."""
-    output_dir = Path(base_dir) / date_str
-    utils.make_directory(output_dir)
-    return output_dir
-
-def download_file_with_retry(url: str, output_path: str, max_retries: int = Config.MAX_RETRIES) -> bool:
-    """Download a file with retry logic and progress tracking."""
-    logger = logging.getLogger(__name__)
-    
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"Downloading {url} (attempt {attempt + 1}/{max_retries})")
-            
-            response = requests.get(url, stream=True, timeout=Config.TIMEOUT)
-            response.raise_for_status()
-            
-            # Get file size for progress tracking
-            total_size = int(response.headers.get('content-length', 0))
-            
-            with open(output_path, 'wb') as f:
-                downloaded = 0
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        # Show progress for large files
-                        if total_size > 0 and downloaded % (total_size // 10) == 0:
-                            progress = (downloaded / total_size) * 100
-                            logger.info(f"Progress: {progress:.1f}%")
-            
-            logger.info(f"Successfully downloaded: {os.path.basename(output_path)}")
-            return True
-            
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Download attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                logger.info(f"Retrying in {Config.RETRY_DELAY} seconds...")
-                time.sleep(Config.RETRY_DELAY)
-            else:
-                logger.error(f"Failed to download {url} after {max_retries} attempts")
-                return False
-        except Exception as e:
-            logger.error(f"Unexpected error downloading {url}: {e}")
-            return False
-    
-    return False
 
 # -------------------------------
 # GFS Download Functions
@@ -134,8 +71,8 @@ def get_gfs_urls(year: str, month: str, day: str, hour: str, lead_hours: int) ->
             start_forecast_hour = hour_int - init_cycle
     
     # Generate URLs for all forecast hours from start to start + lead_hours, skipping 0th hour
-    for fh in range(1, lead_hours + 1):
-        fh += start_forecast_hour
+    for fh_ in range(1, lead_hours + 1):
+        fh = fh_ + start_forecast_hour
         forecast_str = f"{fh:03d}"
         url = f"{Config.GFS_BASE_URL}/gfs.{init_date_str}/{cycle_str}/atmos/gfs.t{cycle_str}z.pgrb2.0p25.f{forecast_str}"
         
@@ -146,6 +83,22 @@ def get_gfs_urls(year: str, month: str, day: str, hour: str, lead_hours: int) ->
         
         filename = f"gfs_{valid_str}.grib2"
         urls.append((url, filename))
+
+        if fh_ == lead_hours:
+            # if valid_dt is not a synoptic hour, also get the next synoptic hour file
+            if valid_dt.hour not in cycle_hours:
+                next_syn_hour = min([c for c in cycle_hours if c > valid_dt.hour], default=0)
+                if next_syn_hour == 0:
+                    next_syn_dt = valid_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                else:
+                    next_syn_dt = valid_dt.replace(hour=next_syn_hour, minute=0, second=0, microsecond=0)
+                
+                next_fh = int((next_syn_dt - init_dt).total_seconds() // 3600)
+                next_forecast_str = f"{next_fh:03d}"
+                next_url = f"{Config.GFS_BASE_URL}/gfs.{init_date_str}/{cycle_str}/atmos/gfs.t{cycle_str}z.pgrb2.0p25.f{next_forecast_str}"
+                next_valid_str = next_syn_dt.strftime("%Y%m%d_%H")
+                next_filename = f"gfs_{next_valid_str}.grib2"
+                urls.append((next_url, next_filename))
     
     return urls
 
