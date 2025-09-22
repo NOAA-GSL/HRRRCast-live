@@ -445,6 +445,16 @@ class WeatherForecaster:
             y = self.predict(model, X)
             y = tf.clip_by_value(y, self.channel_mins[:y.shape[-1]], self.channel_maxs[:y.shape[-1]])
 
+            # Apply REFC noise suppression: set reflectivity < 5 dBZ to 0 (operate in normalized space)
+            refc_channel = 122
+            refc = y[..., refc_channel]
+            refc = tf.where(refc < 0.05, 0.0, refc)
+            y = tf.concat([
+                y[..., :refc_channel],
+                tf.expand_dims(refc, axis=-1),
+                y[..., refc_channel + 1:]
+            ], axis=-1)
+
             hourly_forecasts[hour] = y
             history[hour] = {"step": step, "from": from_hour}
 
