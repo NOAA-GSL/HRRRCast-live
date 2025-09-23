@@ -112,7 +112,31 @@ class ForecastModel:
     def __init__(self, model_path: str):
         self.model_path = model_path
         self.model = None
+        self._setup_tf_environment()
         self._load_model()
+
+    def _setup_tf_environment(self) -> None:
+        """ 
+        Set up the TensorFlow environment for optimal performance.
+        """
+        # use only 1 gpu
+        num_gpus = 1
+        # Improved CPU/GPU device handling
+        gpus = tf.config.list_physical_devices("GPU")
+        if gpus:
+            logger.info(f"Num GPUs available: {len(gpus)}")
+            tf.config.set_visible_devices(gpus[:num_gpus], "GPU")
+            visible_gpus = tf.config.get_visible_devices("GPU")
+            logger.info(f"Using GPUs: {[gpu.name for gpu in visible_gpus]}")
+            for gpu in tf.config.get_visible_devices("GPU"):
+                tf.config.experimental.set_memory_growth(gpu, True)
+            logger.info("GPU memory growth set for all visible GPUs.")
+        else:
+            tf.config.set_visible_devices([], "GPU")
+            logger.warning("No GPUs used, running on CPU only.")
+
+        # set JIT compilation of graphs
+        tf.config.optimizer.set_jit(True)
     
     def _load_model(self):
         """Load the TensorFlow model."""
