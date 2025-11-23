@@ -558,6 +558,25 @@ class WeatherForecaster:
             logger.info("Creating xarray dataset...")
             outdata_xr = self.create_xarray_dataset(init_datetime, times, lats, lons, outdata)
 
+            # Inject raw constant LAND / OROG if present (repeat across lead_time so GRIB conversion sees time axis)
+            for cname in ["LAND", "OROG"]:
+                raw_key = f"{cname}_raw"
+                if raw_key in self.data_loader_hrrr.data.files and cname not in outdata_xr:
+                    cvals = self.data_loader_hrrr.data[raw_key]
+                    const_4d = np.tile(cvals[None, None, :, :], (1, len(times), 1, 1))
+                    outdata_xr[cname] = xr.DataArray(
+                        const_4d,
+                        dims=("time", "lead_time", "latitude", "longitude"),
+                        coords={
+                            "time": [init_datetime],
+                            "lead_time": ("lead_time", times, {"units": "hours"}),
+                            "latitude": (("latitude", "longitude"), lats),
+                            "longitude": (("latitude", "longitude"), lons),
+                        },
+                        name=cname,
+                    )
+                    logger.info(f"Added constant field {cname} to forecast output")
+
             # Apply inverse log / signed-log transforms to recover physical units
             try:
                 log_vars = {"SPFH", "VIS", "APCP", "HGTCC", "CAPE"}

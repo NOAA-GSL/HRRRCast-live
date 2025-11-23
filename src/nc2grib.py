@@ -32,6 +32,8 @@ class Netcdf2Grib:
             "SPFH": [None, "specific_humidity", "kg kg**-1"],
             "T2M": [2, "air_temperature", "K"],
             "REFC": [0, "equivalent_reflectivity_factor", "dBZ"],
+            "LAND": [0, "land_binary_mask", "1"],
+            "OROG": [0, "surface_altitude", "m"],
             # Expanded surface variables
             "PRES": [0, "surface_air_pressure", "Pa"],
             "MSLMA": [0, "air_pressure_at_mean_sea_level", "Pa"],
@@ -60,6 +62,7 @@ class Netcdf2Grib:
             "CAPE":  (0, 7, 6, 1),       # convective available potential energy, surface based
             "CIN":   (0, 7, 7, 1),       # convective inhibition, surface based
             "HGTCC": (0, 6, 13, 1),      # cloud ceiling height (approx: using phys atmos category)
+            "OROG":  (0, 3, 5, 1),       # orography, surface
         }
 
     def tweaked_messages(self, cube):

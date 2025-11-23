@@ -187,7 +187,7 @@ class GRIBPreprocessor:
             logger.error(f"Error processing pressure levels: {e}")
             raise
     
-    def process_surface_variables(self, sfc_file: str, norm_file: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def process_surface_variables(self, sfc_file: str, norm_file: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
         """Load and normalize surface and constant variables using per-variable stats.
 
         Returns:
@@ -209,7 +209,8 @@ class GRIBPreprocessor:
             lons = lons[::self.config.downsample_factor, ::self.config.downsample_factor]
 
             norm_arrays = []  # normalized data for all surface + constants
-            raw_arrays = []   # raw data for only dynamic surface vars (exclude constants if desired)
+            raw_arrays = []   # raw data for only dynamic surface vars
+            const_raw: Dict[str, np.ndarray] = {}  # store original (unnormalized) LAND/OROG
 
             def fetch_grib_field(var_name: str):
                 """Retrieve a GRIB field based on mapping; return None if not found."""
@@ -291,23 +292,25 @@ class GRIBPreprocessor:
                 logger.info(f"Variable {var}: mean {var_mean}, std {var_std}, min {np.min(vals_proc)}, max {np.max(vals_proc)} : mean {np.mean(norm_vals)}, std {np.std(norm_vals)} min {np.min(norm_vals)}, max {np.max(norm_vals)}")
                 norm_arrays.append(norm_vals)
 
-                # Keep raw (pre-normalization) for non-constant variables
-                if var not in self.config.consts:
+                if var in self.config.consts:
+                    # Store original unnormalized constant values for later denormalized output
+                    const_raw[var] = vals
+                else:
                     raw_arrays.append(vals)
 
             grbs.close()
             if not norm_arrays:
                 raise RuntimeError("No surface variables were successfully processed")
 
-            return np.array(norm_arrays), np.array(raw_arrays), lats, lons
+            return np.array(norm_arrays), np.array(raw_arrays), lats, lons, const_raw
 
         except Exception as e:
             logger.error(f"Error processing surface variables: {e}")
             raise
     
     def save_preprocessed_data(self, output_file: str, pres_norm: np.ndarray, pres_raw: np.ndarray,
-                              sfc_norm: np.ndarray, sfc_raw: np.ndarray, lats: np.ndarray, 
-                              lons: np.ndarray, metadata: Dict) -> None:
+                              sfc_norm: np.ndarray, sfc_raw: np.ndarray, const_raw: Dict[str, np.ndarray],
+                              lats: np.ndarray, lons: np.ndarray, metadata: Dict) -> None:
         """Save preprocessed data to compressed numpy format."""
         try:
             logger.info(f"Saving preprocessed data to {output_file}")
@@ -317,19 +320,20 @@ class GRIBPreprocessor:
             model_input = np.transpose(model_input, (1, 2, 0))[None, ...]
             
             # Save all data in compressed format
-            np.savez_compressed(
-                output_file,
-                # Model input (ready for inference)
+            save_kwargs = dict(
                 model_input=model_input,
-                # Raw data for potential analysis
                 pres_raw=pres_raw,
                 sfc_raw=sfc_raw,
-                # Coordinate information
                 lats=lats,
                 lons=lons,
-                # Metadata
-                **metadata
+                **metadata,
             )
+            # Add raw constants if present
+            for cname in ["LAND", "OROG"]:
+                if cname in const_raw:
+                    save_kwargs[f"{cname}_raw"] = const_raw[cname]
+
+            np.savez_compressed(output_file, **save_kwargs)
             
             logger.info(f"Preprocessed data saved successfully")
             logger.info(f"Model input shape: {model_input.shape}")
@@ -371,7 +375,7 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
         pres_norm, pres_raw = preprocessor.process_pressure_levels(hrrr_pres_file, norm_file)
         
         logger.info("Processing surface data...")
-        sfc_norm, sfc_raw, lats, lons = preprocessor.process_surface_variables(hrrr_sfc_file, norm_file)
+        sfc_norm, sfc_raw, lats, lons, const_raw = preprocessor.process_surface_variables(hrrr_sfc_file, norm_file)
         
         # Validate grid dimensions
         expected_shape = (config.grid_height, config.grid_width)
@@ -396,7 +400,7 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
         
         # Save preprocessed data
         preprocessor.save_preprocessed_data(
-            output_file, pres_norm, pres_raw, sfc_norm, sfc_raw, lats, lons, metadata
+            output_file, pres_norm, pres_raw, sfc_norm, sfc_raw, const_raw, lats, lons, metadata
         )
         
         logger.info("GRIB preprocessing completed successfully")
