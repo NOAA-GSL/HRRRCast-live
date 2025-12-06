@@ -173,6 +173,7 @@ class GRIBPreprocessor:
                         continue
                     mean, std = float(stats[0, l_idx]), float(stats[1, l_idx])
                     norm_vals = self.normalize(vals_proc, mean, std)
+                    norm_vals[np.isnan(norm_vals)] = 0
                     logger.info(f"Variable {var}: mean {mean} std {std} min {np.min(vals_proc)} max {np.max(vals_proc)}: mean {np.mean(norm_vals)}, std {np.std(norm_vals)} min {np.min(norm_vals)}, max {np.max(norm_vals)}")
                     normalized_vals.append(norm_vals)
 
@@ -289,6 +290,7 @@ class GRIBPreprocessor:
                     var_std = float(np.nanstd(vals_proc))
 
                 norm_vals = self.normalize(vals_proc, var_mean, var_std)
+                norm_vals[np.isnan(norm_vals)] = 0
                 logger.info(f"Variable {var}: mean {var_mean}, std {var_std}, min {np.min(vals_proc)}, max {np.max(vals_proc)} : mean {np.mean(norm_vals)}, std {np.std(norm_vals)} min {np.min(norm_vals)}, max {np.max(norm_vals)}")
                 norm_arrays.append(norm_vals)
 

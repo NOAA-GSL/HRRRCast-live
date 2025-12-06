@@ -6,8 +6,8 @@ This script processes ensemble forecast data from HRRR (High-Resolution Rapid Re
 model runs and computes post-processed ensemble products. It applies different statistical
 methods based on the variable type:
 
-- REFC (Reflectivity): Uses Probability-Matched Mean (PMM) to preserve the natural 
-  distribution and spatial structure of precipitation-related fields
+- REFC (Reflectivity) and APCP (Precipitation Accumulation): Uses Probability-Matched Mean (PMM) 
+  to preserve the natural distribution and spatial structure of precipitation-related fields
 - All other variables: Uses standard ensemble mean which is appropriate for variables
   like temperature, wind, pressure, etc.
 
@@ -258,9 +258,9 @@ def compute_ensemble_pmm(datetime_str: str,
                 processed_datasets[var_name] = var_data
                 continue
             
-            # Apply PMM only to REFC (reflectivity), use standard mean for others
-            if var_name == 'REFC':
-                logger.info(f"Computing PMM for reflectivity variable: {var_name}")
+            # Apply PMM to REFC (reflectivity) and APCP (precip accum), use ensemble mean for others
+            if var_name in ['REFC', 'APCP']:
+                logger.info(f"Computing PMM for variable: {var_name}")
                 processed_var = process_variable_pmm(var_data, method=method)
                 processed_var.attrs['processing_method'] = 'probability_matched_mean'
             else:
