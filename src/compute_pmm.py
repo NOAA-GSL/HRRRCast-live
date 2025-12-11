@@ -84,9 +84,6 @@ def compute_PMM(fields: xr.DataArray, method=2) -> xr.DataArray:
     else:
         logger.debug("")  # Just newline if no time coord
     
-    # Load data
-    fields = fields.compute()
-    
     # Compute the simple ensemble mean along the member dimension
     field_mean = fields.mean(dim="member")
     

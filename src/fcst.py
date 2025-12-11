@@ -136,7 +136,7 @@ class ForecastModel:
             logger.warning("No GPUs used, running on CPU only.")
 
         # set JIT compilation of graphs
-        tf.config.optimizer.set_jit(True)
+        tf.config.optimizer.set_jit(False)
     
     def _load_model(self):
         """Load the TensorFlow model."""
