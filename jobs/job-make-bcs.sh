@@ -5,7 +5,7 @@
 #SBATCH --account=@[ACCNR]
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=@[LEAD_HOUR]
-#SBATCH --time=00:30:00
+#SBATCH --time=@[MAKE_BCS_WALLTIME]
 #SBATCH --exclusive
 
 # set vars
