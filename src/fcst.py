@@ -191,7 +191,9 @@ class WeatherForecaster:
         sfc_vars = self.metadata["sfc_vars"]
         levels = self.metadata["levels"]
         default_predicted = len(pl_vars) * len(levels) + len(sfc_vars)
-        total_hrrr = data_loader_hrrr.get_model_input().shape[-1]
+        input_shape = data_loader_hrrr.get_model_input().shape
+        total_hrrr = input_shape[-1]
+        nlat, nlon = input_shape[1], input_shape[2] 
 
         if predicted_channels is None:
             predicted_channels = default_predicted
@@ -216,6 +218,18 @@ class WeatherForecaster:
         except Exception as e:
             logger.error(f"Error loading/processing normalization file: {e}")
             raise
+
+        # set member noise
+        if self.use_diffusion:
+            self.member_noise = tf.random.stateless_normal(
+                shape=(nlat, nlon, self.predicted_channels),
+                dtype=tf.float32,
+                seed=[self.member, 0]
+            )
+            self.member_noise = tf.tile(
+                tf.expand_dims(self.member_noise, axis=0), [1, 1, 1, 1]
+            )
+
     
 
     def _init_channel_stats(self, ds_norm: xr.Dataset):
@@ -305,35 +319,26 @@ class WeatherForecaster:
         if self.use_diffusion:
             num_output_channels = self.predicted_channels
             start = self.predicted_channels + self.gfs_channels
-            batch_size = 1
 
             # start from complete gaussian noise
-            tf.random.set_seed(self.member)
-            Xn = tf.random.normal(
-                shape=tf.shape(X[0, :, :, start : start + num_output_channels])
-            )
-            Xn = tf.tile(tf.expand_dims(Xn, axis=0), [batch_size, 1, 1, 1])
-            X = tf.concat(
-                [
-                    X[:, :, :, :start],
-                    Xn,
-                    X[:, :, :, start + num_output_channels :],
-                ],
-                axis=-1,
-            )
+            Xn = self.member_noise
 
             # iterate over diffusion steps
             for t_ in tqdm(range(NUM_INFERENCE_STEPS - 1)):
                 ti = NUM_INFERENCE_STEPS - 1 - t_
                 t = INFERENCE_STEPS[ti]
+
                 # set the correct time embedding
+                step_encoding = tf.fill(
+                    tf.concat([tf.shape(X)[:-1], [1]], axis=0),
+                    t / NUM_DIFFUSION_STEPS,
+                )
                 X = tf.concat(
                     [
-                        X[:, :, :, :-2],
-                        tf.fill(
-                            tf.concat([tf.shape(X)[:-1], [1]], axis=0),
-                            t / NUM_DIFFUSION_STEPS,
-                        ),
+                        X[:, :, :, :start],
+                        Xn,
+                        X[:, :, :, start + num_output_channels :-2],
+                        step_encoding,
                         X[:, :, :, -1:],
                     ],
                     axis=-1,
@@ -342,16 +347,7 @@ class WeatherForecaster:
                 # predict total noise
                 x_0 = model.predict(X)
                 epsilon_t = compute_epsilon(Xn, x_0, t)
-
                 Xn = ddim(Xn, epsilon_t, ti, seed=self.member)
-                X = tf.concat(
-                    [
-                        X[:, :, :, :start],
-                        Xn,
-                        X[:, :, :, start + num_output_channels :],
-                    ],
-                    axis=-1,
-                )
 
             return Xn
         else:
