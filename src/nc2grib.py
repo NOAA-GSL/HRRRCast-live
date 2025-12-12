@@ -209,92 +209,86 @@ class Netcdf2Grib:
                 )
             logger.info(f"grib2 file name: {outfile}")
 
-            for cube in sorted(cubes, key=lambda cube: cube.name()):
-                var_name = cube.name()
+            # Streaming generator: yield all messages for this hour without accumulating in memory
+            def messages_for_hour():
+                cubes_sorted = sorted(cubes, key=lambda c: c.name())
+                for cube in cubes_sorted:
+                    var_name = cube.name()
 
-                # Adjust cube for different variables
-                time_coord_dim = cube.coord_dims("time")
-                cube.remove_coord("time")
-                cube.add_dim_coord(new_time_coord, time_coord_dim)
+                    time_coord_dim = cube.coord_dims("time")
+                    cube.remove_coord("time")
+                    cube.add_dim_coord(new_time_coord, time_coord_dim)
 
-                if idate == 0:
-                    for idim, co in enumerate([y_dimco, x_dimco]):
-                        if len(cube.data.shape) == 4:
-                            cube.add_dim_coord(co, idim + 2)
-                        elif len(cube.data.shape) == 3:
-                            cube.add_dim_coord(co, idim + 1)
+                    if idate == 0:
+                        for idim, co in enumerate([y_dimco, x_dimco]):
+                            if len(cube.data.shape) == 4:
+                                cube.add_dim_coord(co, idim + 2)
+                            elif len(cube.data.shape) == 3:
+                                cube.add_dim_coord(co, idim + 1)
 
-                hour_slice = iris.Constraint(
-                    time=iris.time.PartialDateTime(
-                        month=date.month, day=date.day, hour=date.hour
-                    )
-                )
-                cube_slice = cube.extract(hour_slice)
-
-                cube_slice.coord(
-                    "projection_y_coordinate"
-                ).coord_system = iris.coord_systems.LambertConformal(
-                    central_lat=38.5,
-                    central_lon=262.5,
-                    false_easting=0.0,
-                    false_northing=0.0,
-                    secant_latitudes=(38.5, 38.5),
-                    ellipsoid=iris.coord_systems.GeogCS(6371229.0),
-                )
-                cube_slice.coord(
-                    "projection_x_coordinate"
-                ).coord_system = iris.coord_systems.LambertConformal(
-                    central_lat=38.5,
-                    central_lon=262.5,
-                    false_easting=0.0,
-                    false_northing=0.0,
-                    secant_latitudes=(38.5, 38.5),
-                    ellipsoid=iris.coord_systems.GeogCS(6371229.0),
-                )
-
-                if len(cube_slice.data.shape) == 3:
-                    levels = cube_slice.coord("pressure").points
-                    for level in levels:
-                        cube_slice_level = cube_slice.extract(
-                            iris.Constraint(pressure=level)
+                    hour_slice = iris.Constraint(
+                        time=iris.time.PartialDateTime(
+                            month=date.month, day=date.day, hour=date.hour
                         )
-                        cube_slice_level.add_aux_coord(
+                    )
+                    cube_slice = cube.extract(hour_slice)
+
+                    cube_slice.coord("projection_y_coordinate").coord_system = iris.coord_systems.LambertConformal(
+                        central_lat=38.5,
+                        central_lon=262.5,
+                        false_easting=0.0,
+                        false_northing=0.0,
+                        secant_latitudes=(38.5, 38.5),
+                        ellipsoid=iris.coord_systems.GeogCS(6371229.0),
+                    )
+                    cube_slice.coord("projection_x_coordinate").coord_system = iris.coord_systems.LambertConformal(
+                        central_lat=38.5,
+                        central_lon=262.5,
+                        false_easting=0.0,
+                        false_northing=0.0,
+                        secant_latitudes=(38.5, 38.5),
+                        ellipsoid=iris.coord_systems.GeogCS(6371229.0),
+                    )
+
+                    if len(cube_slice.data.shape) == 3:
+                        levels = cube_slice.coord("pressure").points
+                        for level in levels:
+                            cube_slice_level = cube_slice.extract(
+                                iris.Constraint(pressure=level)
+                            )
+                            cube_slice_level.add_aux_coord(
+                                iris.coords.DimCoord(
+                                    hrs, standard_name="forecast_period", units="hours"
+                                )
+                            )
+                            cube_slice_level.attributes["orig_name"] = var_name
+                            cube_slice_level.standard_name = self.ATTR_MAPS[var_name][1]
+                            cube_slice_level.units = self.ATTR_MAPS[var_name][2]
+                            yield from self.tweaked_messages(cube_slice_level)
+                    else:
+                        cube_slice.add_aux_coord(
                             iris.coords.DimCoord(
                                 hrs, standard_name="forecast_period", units="hours"
                             )
                         )
-                        cube_slice_level.attributes["orig_name"] = var_name
-                        cube_slice_level.standard_name = self.ATTR_MAPS[var_name][1]
-                        cube_slice_level.units = self.ATTR_MAPS[var_name][2]
-                        iris_grib.save_messages(
-                            self.tweaked_messages(cube_slice_level),
-                            outfile,
-                            append=True,
-                        )
-                else:
-                    cube_slice.add_aux_coord(
-                        iris.coords.DimCoord(
-                            hrs, standard_name="forecast_period", units="hours"
-                        )
-                    )
-                    if var_name in self.ATTR_MAPS:
-                        cube_slice.attributes["orig_name"] = var_name
-                        cube_slice.standard_name = self.ATTR_MAPS[var_name][1]
-                        cube_slice.units = self.ATTR_MAPS[var_name][2]
-                        height_val = self.ATTR_MAPS[var_name][0]
-                        if height_val is not None and height_val > 0:
-                            cube_slice.add_aux_coord(
-                                iris.coords.DimCoord(
-                                    height_val,
-                                    standard_name="height",
-                                    units="m",
+                        if var_name in self.ATTR_MAPS:
+                            cube_slice.attributes["orig_name"] = var_name
+                            cube_slice.standard_name = self.ATTR_MAPS[var_name][1]
+                            cube_slice.units = self.ATTR_MAPS[var_name][2]
+                            height_val = self.ATTR_MAPS[var_name][0]
+                            if height_val is not None and height_val > 0:
+                                cube_slice.add_aux_coord(
+                                    iris.coords.DimCoord(
+                                        height_val, standard_name="height", units="m"
+                                    )
                                 )
+                        else:
+                            logger.warning(
+                                f"Variable {var_name} missing in ATTR_MAPS; using existing metadata"
                             )
-                    else:
-                        logger.warning(f"Variable {var_name} missing in ATTR_MAPS; using existing metadata")
-                    iris_grib.save_messages(
-                        self.tweaked_messages(cube_slice), outfile, append=True
-                    )
+                        yield from self.tweaked_messages(cube_slice)
+
+            iris_grib.save_messages(messages_for_hour(), outfile, append=(idate != 0))
 
             # Use wgrib2 to generate index files
             output_idx_file = f"{outfile}.idx"
