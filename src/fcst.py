@@ -314,6 +314,140 @@ class WeatherForecaster:
         except Exception as e:
             logger.error(f"Error in denormalization: {e}")
             raise
+
+    def _apply_inverse_transforms(self, ds: xr.Dataset) -> xr.Dataset:
+        """Apply inverse transforms to variables stored in log/signed-log space.
+
+        Returns the same dataset instance with values modified in place for the affected
+        variables. Safe to call when variables are absent.
+        """
+        try:
+            log_vars = {"SPFH", "VIS", "APCP", "HGTCC", "CAPE"}
+            neg_log_vars = {"CIN"}
+            applied = []
+            for var in log_vars:
+                if var in ds.variables:
+                    data_arr = ds[var].values
+                    ds[var].values[:] = inverse_log_transform_array(data_arr, eps=DEFAULT_LOG_EPS)
+                    applied.append(var)
+            for var in neg_log_vars:
+                if var in ds.variables:
+                    data_arr = ds[var].values
+                    ds[var].values[:] = inverse_neg_log_transform_array(data_arr, eps=DEFAULT_LOG_EPS)
+                    applied.append(var)
+            if applied:
+                logger.info(f"Applied inverse transforms to: {', '.join(applied)}")
+        except Exception as e:
+            logger.error(f"Failed applying inverse transforms: {e}")
+        return ds
+
+    def build_single_hour_dataset(
+        self,
+        init_datetime: datetime,
+        hour: int,
+        lats: np.ndarray,
+        lons: np.ndarray,
+        forecast_norm: np.ndarray,
+    ) -> xr.Dataset:
+        """Build an xarray.Dataset for a single lead hour from a normalized forecast slice.
+
+        Args:
+            init_datetime: initialization datetime
+            hour: lead time in hours (int)
+            lats, lons: 2D latitude/longitude arrays (Ny, Nx)
+            forecast_norm: normalized model output for this hour, shape (1, Ny, Nx, C)
+
+        Returns:
+            xr.Dataset with dims (time=1, lead_time=1, [level], latitude, longitude)
+        """
+        # Denormalize to physical units
+        denorm = self.denormalize(forecast_norm)
+        # Ensure shape (time=1, Ny, Nx, C)
+        if denorm.ndim == 3:
+            denorm = denorm[None, ...]
+        times = [hour]
+        ds_hour = self.create_xarray_dataset(init_datetime, times, lats, lons, denorm)
+
+        # Inject constants if present in preprocessed NPZ (repeat across lead_time length 1)
+        for cname in ["LAND", "OROG"]:
+            raw_key = f"{cname}_raw"
+            if hasattr(self.data_loader_hrrr, "data") and raw_key in self.data_loader_hrrr.data.files and cname not in ds_hour:
+                cvals = self.data_loader_hrrr.data[raw_key]
+                const_4d = np.tile(cvals[None, None, :, :], (1, len(times), 1, 1))
+                ds_hour[cname] = xr.DataArray(
+                    const_4d,
+                    dims=("time", "lead_time", "latitude", "longitude"),
+                    coords={
+                        "time": [init_datetime],
+                        "lead_time": ("lead_time", times, {"units": "hours"}),
+                        "latitude": (("latitude", "longitude"), lats),
+                        "longitude": (("latitude", "longitude"), lons),
+                    },
+                    name=cname,
+                )
+                logger.debug(f"Injected constant field {cname} for hour {hour}")
+
+        # Apply inverse transforms to recover physical units
+        ds_hour = self._apply_inverse_transforms(ds_hour)
+        return ds_hour
+
+    def write_single_hour_netcdf(
+        self,
+        init_datetime: datetime,
+        hour: int,
+        ds_hour: xr.Dataset,
+        output_dir: str,
+        member: Union[int, str],
+    ) -> str:
+        """Write a NetCDF file for a single lead time.
+
+        Returns the output file path.
+        """
+        init_year = self.metadata['init_year']
+        init_month = self.metadata['init_month']
+        init_day = self.metadata['init_day']
+        init_hh = self.metadata['init_hh']
+        date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
+        utils.make_directory(f"{output_dir}/{date_str}")
+        outdir = Path(f"{output_dir}/{date_str}")
+        outdir.mkdir(parents=True, exist_ok=True)
+        mem_str = f"avg" if str(member) == "avg" else f"mem{int(member)}"
+        nc_path = outdir / f"hrrrcast_{mem_str}_f{hour:02d}.nc"
+        logger.info(f"Saving single-hour NetCDF to {nc_path}")
+        ds_hour.to_netcdf(nc_path)
+        return str(nc_path)
+
+    def write_single_hour_grib2(
+        self,
+        init_datetime: datetime,
+        hour: int,
+        ds_hour: xr.Dataset,
+        output_dir: str,
+        member: Union[int, str],
+    ) -> None:
+        """Write a GRIB2 file for a single lead time using Netcdf2Grib.
+
+        Netcdf2Grib iterates over available time points; with a single-hour dataset,
+        it will produce only the requested f{hour:02d} product.
+        """
+        init_year = self.metadata['init_year']
+        init_month = self.metadata['init_month']
+        init_day = self.metadata['init_day']
+        init_hh = self.metadata['init_hh']
+        date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
+        utils.make_directory(f"{output_dir}/{date_str}")
+        outdir = Path(f"{output_dir}/{date_str}")
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        converter = Netcdf2Grib()
+        # Ensure ds_hour has exactly one lead_time equal to 'hour'
+        if 'lead_time' in ds_hour.coords:
+            try:
+                # If needed, overwrite lead_time coord to match the requested hour
+                ds_hour = ds_hour.assign_coords(lead_time=("lead_time", [hour]))
+            except Exception:
+                pass
+        converter.save_grib2(init_datetime, ds_hour, member, outdir)
     
     def predict(self, model: ForecastModel, X: tf.Tensor):
         if self.use_diffusion:
@@ -405,18 +539,30 @@ class WeatherForecaster:
         return np.array(mins, dtype=np.float32), np.array(maxs, dtype=np.float32)
 
     def autoregressive_rollout(self, initial_input: np.ndarray, forcing_input: np.ndarray, model: ForecastModel, 
-                             target_hour: int) -> Tuple[Dict[int, np.ndarray], Dict[int, Dict]]:
+                             target_hour: int,
+                             output_dir: Optional[str] = None,
+                             init_datetime: Optional[datetime] = None,
+                             write_per_hour: bool = False) -> Dict[int, Dict]:
         """Perform greedy autoregressive rollout."""
         logger.info(f"Starting autoregressive rollout for {target_hour} hours")
         
         # Initial input (updated during rollout)
         X = tf.convert_to_tensor(initial_input, dtype=tf.float32)
         
-        # Stores forecasts and history
-        hourly_forecasts = {0: tf.identity(X[0:1, :, :, :self.predicted_channels])}
+        # Track only the state at the most recent 6-hour boundary (from_hour)
+        state_from_hour = tf.identity(X[0:1, :, :, :self.predicted_channels])
+        last_from_hour = 0
         history = {0: {'step': 0, 'from': None}}
 
         start_pred_noise = self.predicted_channels + self.gfs_channels
+
+        # Lazily fetch coordinates if writing outputs per hour
+        lats = lons = None
+        if write_per_hour:
+            try:
+                lats, lons = self.data_loader_hrrr.get_coordinates()
+            except Exception:
+                pass
 
         # Process all hourly steps
         for hour in tqdm(range(1, target_hour + 1), desc="Forecasting"):
@@ -426,7 +572,7 @@ class WeatherForecaster:
             # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
             X = tf.concat(
                 [
-                    hourly_forecasts[from_hour],
+                    state_from_hour,
                     forcing_input[hour-1:hour, :, :, :],
                     X[:, :, :, start_pred_noise:-1],
                     tf.fill(
@@ -451,11 +597,25 @@ class WeatherForecaster:
                 y[..., refc_channel + 1:]
             ], axis=-1)
 
-            hourly_forecasts[hour] = y
+            # Write out per-hour products if requested
+            if write_per_hour and output_dir is not None and init_datetime is not None and lats is not None and lons is not None:
+                try:
+                    ds_hour = self.build_single_hour_dataset(init_datetime, hour, lats, lons, y.numpy())
+                    # Persist NetCDF and GRIB2 for this hour
+                    _ = self.write_single_hour_netcdf(init_datetime, hour, ds_hour, output_dir, self.member)
+                    self.write_single_hour_grib2(init_datetime, hour, ds_hour, output_dir, self.member)
+                except Exception as e:
+                    logger.error(f"Failed writing hour {hour} outputs: {e}")
+
             history[hour] = {"step": step, "from": from_hour}
 
+            # When we reach a 6-hour boundary, update the reference state
+            if hour % 6 == 0:
+                state_from_hour = y
+                last_from_hour = hour
+
         logger.info("Autoregressive rollout completed")
-        return hourly_forecasts, history
+        return history
     
     @staticmethod
     def compute_r2m(ds: xr.Dataset) -> xr.Dataset:
@@ -526,7 +686,12 @@ class WeatherForecaster:
         return ds
     
     def run_forecast(self, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str = "./", return_history: bool = False):
-        """Run the complete forecasting pipeline. Requires precomputed model_input."""
+        """Run the forecasting pipeline with per-hour streaming outputs. Requires precomputed model_input.
+
+        This function now avoids building a single multi-hour xarray Dataset and avoids bulk NetCDF/GRIB2 writes.
+        Instead, per-hour NetCDF/GRIB2 files are written during the autoregressive rollout. To preserve the
+        call signature, this returns (None, None[, history]) where history is included if return_history=True.
+        """
         try:
             lats, lons = self.data_loader_hrrr.get_coordinates()
             init_datetime = self.data_loader_hrrr.get_init_datetime()
@@ -535,90 +700,21 @@ class WeatherForecaster:
             logger.info(f"Model input shape: {model_input.shape}")
             logger.info(self.metadata)
 
-            # Run autoregressive forecast
-            hourly_forecasts, history = self.autoregressive_rollout(model_input, self.data_loader_gfs.get_model_input(), model, lead_hours)
-
-            # Denormalize all outputs
-            logger.info("Denormalizing outputs...")
-            denorm_outputs = {}
-            for hour, forecast in hourly_forecasts.items():
-                denorm_outputs[hour] = self.denormalize(forecast[None, ...])
-
-            # Stack all timesteps into a single numpy array
-            outdata = np.array([denorm_outputs[i] for i in range(0, lead_hours + 1)])
-
-            # Create timestamps for each forecast hour
-            times = list(range(0, lead_hours + 1))
-
-            # Convert numpy to xarray
-            logger.info("Creating xarray dataset...")
-            outdata_xr = self.create_xarray_dataset(init_datetime, times, lats, lons, outdata)
-
-            # Inject raw constant LAND / OROG if present (repeat across lead_time so GRIB conversion sees time axis)
-            for cname in ["LAND", "OROG"]:
-                raw_key = f"{cname}_raw"
-                if raw_key in self.data_loader_hrrr.data.files and cname not in outdata_xr:
-                    cvals = self.data_loader_hrrr.data[raw_key]
-                    const_4d = np.tile(cvals[None, None, :, :], (1, len(times), 1, 1))
-                    outdata_xr[cname] = xr.DataArray(
-                        const_4d,
-                        dims=("time", "lead_time", "latitude", "longitude"),
-                        coords={
-                            "time": [init_datetime],
-                            "lead_time": ("lead_time", times, {"units": "hours"}),
-                            "latitude": (("latitude", "longitude"), lats),
-                            "longitude": (("latitude", "longitude"), lons),
-                        },
-                        name=cname,
-                    )
-                    logger.info(f"Added constant field {cname} to forecast output")
-
-            # Apply inverse log / signed-log transforms to recover physical units
-            try:
-                log_vars = {"SPFH", "VIS", "APCP", "HGTCC", "CAPE"}
-                neg_log_vars = {"CIN"}
-                applied = []
-                for var in log_vars:
-                    if var in outdata_xr.variables:
-                        data_arr = outdata_xr[var].values  # shape (time, lead_time, [level], y, x)
-                        outdata_xr[var].values[:] = inverse_log_transform_array(data_arr, eps=DEFAULT_LOG_EPS)
-                        applied.append(var)
-                for var in neg_log_vars:
-                    if var in outdata_xr.variables:
-                        data_arr = outdata_xr[var].values
-                        outdata_xr[var].values[:] = inverse_neg_log_transform_array(data_arr, eps=DEFAULT_LOG_EPS)
-                        applied.append(var)
-                if applied:
-                    logger.info(f"Applied inverse log transforms to variables: {', '.join(applied)}")
-                else:
-                    logger.info("No inverse log transforms applied (variables not found in dataset)")
-            except Exception as e:
-                logger.error(f"Failed applying inverse log transforms: {e}")
-
-            # Save output
-            init_year = self.metadata['init_year']
-            init_month = self.metadata['init_month']
-            init_day = self.metadata['init_day']
-            init_hh = self.metadata['init_hh']
-            date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
-            utils.make_directory(f"{output_dir}/{date_str}")
-
-            # Create a new directory for grib2 files
-            outdir = Path(f"{output_dir}/{date_str}")
-            outdir.mkdir(parents=True, exist_ok=True)
-
-            output_file = f"{output_dir}/{date_str}/hrrrcast_mem{self.member}.nc"
-            logger.info(f"Saving forecast to {output_file}")
-            outdata_xr.to_netcdf(output_file)
-
-            converter = Netcdf2Grib()
-            converter.save_grib2(init_datetime, outdata_xr, self.member, outdir)
-            
-            logger.info("Forecast completed successfully")
+            # Run autoregressive forecast and write per-hour outputs to disk
+            history = self.autoregressive_rollout(
+                model_input,
+                self.data_loader_gfs.get_model_input(),
+                model,
+                lead_hours,
+                output_dir=output_dir,
+                init_datetime=init_datetime,
+                write_per_hour=True,
+            )
+            logger.info("Forecast completed successfully (per-hour outputs written during rollout)")
             if return_history:
-                return outdata_xr, output_file, history
+                return history
             else:
-                return outdata_xr, output_file
+                return None
         except Exception as e:
             logger.error(f"Forecast failed: {e}")
             raise
@@ -626,7 +722,7 @@ class WeatherForecaster:
 def run_weather_forecast_for_member(forecaster: WeatherForecaster, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str, member: int, print_history: bool = False):
     """Run forecast for a single member, optionally printing forecast step history. Requires precomputed model_input."""
     try:
-        forecast_dataset, output_file, history = forecaster.run_forecast(model, lead_hours, model_input, output_dir, return_history=True)
+        history = forecaster.run_forecast(model, lead_hours, model_input, output_dir, return_history=True)
         if print_history:
             logger.info("Forecast schedule:")
             for hour in range(1, min(lead_hours + 1, 25)):
@@ -634,7 +730,6 @@ def run_weather_forecast_for_member(forecaster: WeatherForecaster, model: Foreca
                 logger.info(f"Hour {hour:2d}: from hour {info['from']:2d} using step {info['step']}h")
             if lead_hours > 24:
                 logger.info(f"... (showing first 24 hours of {lead_hours} total)")
-        return forecast_dataset, output_file
     except Exception as e:
         logger.error(f"Forecast failed for member {member}: {e}")
         raise
@@ -722,18 +817,16 @@ def main():
                 model_input_hrrr[:, :, :, predicted_channels:],
                 lead_channel], axis=-1)
         
-        output_files = []
         for i, member in enumerate(members):
             forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member, not args.no_diffusion,
                                            predicted_channels=predicted_channels,
                                            gfs_channels=gfs_channels,
                                            static_channels=static_channels)
-            forecast_dataset, output_file = run_weather_forecast_for_member(
+            run_weather_forecast_for_member(
                 forecaster, model, args.lead_hours, model_input, args.output_dir, member, print_history=(i==len(members)-1)
             )
-            logger.info(f"Forecast complete for member {member}. Output saved to: {output_file}")
-            output_files.append(output_file)
-        logger.info(f"All forecasts complete. Output files: {output_files}")
+            logger.info(f"Forecast complete for member {member}.")
+        logger.info(f"All forecasts complete.")
         
     except Exception as e:
         logger.error(f"Application failed: {e}")

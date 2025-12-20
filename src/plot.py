@@ -6,7 +6,11 @@ This script plots each variable from the forecast output and saves them as separ
 It handles both pressure level and surface variables from the HRRR forecast data.
 
 Usage:
-    python plot_forecast.py <init_time> <lead_hour> <member> [--forecast_dir DIR] [--output_dir DIR]
+        python plot_forecast.py <init_time> <lead_hour> <member> [--forecast_dir DIR] [--output_dir DIR]
+    
+        Expects per-hour NetCDF files:
+            - Member average (PMM/mean): hrrrcast_memavg_fXX.nc
+            - Individual members:        hrrrcast_memN_fXX.nc
 """
 
 import argparse
@@ -271,7 +275,8 @@ class ForecastPlotter:
                 try:
                     # Extract data for this variable and level
                     # Use lead_time dimension and select first time step (time=0)
-                    data = ds[var_name].isel(time=0, lead_time=lead_hour, level=level_idx).values
+                    # Per-hour file has a single lead_time slot; index 0
+                    data = ds[var_name].isel(time=0, lead_time=0, level=level_idx).values
                     logger.info(f"{var_name} stats - mean: {np.nanmean(data):.2f}, std: {np.nanstd(data):.2f}, min: {np.nanmin(data):.2f}, max: {np.nanmax(data):.2f}")
                     
                     # Create plot
@@ -311,7 +316,8 @@ class ForecastPlotter:
             try:
                 # Extract data for this variable
                 # Use lead_time dimension and select first time step (time=0)
-                data = ds[var_name].isel(time=0, lead_time=lead_hour).values
+                # Per-hour file has a single lead_time slot; index 0
+                data = ds[var_name].isel(time=0, lead_time=0).values
                 # log mean, std, min, max of data
                 logger.info(f"{var_name} stats - mean: {np.nanmean(data):.2f}, std: {np.nanstd(data):.2f}, min: {np.nanmin(data):.2f}, max: {np.nanmax(data):.2f}")
                 
@@ -372,9 +378,9 @@ class ForecastPlotter:
                 if level is not None:
                     # Find level index
                     level_idx = self.config.levels.index(level) if level in self.config.levels else 0
-                    data = ds[var_name].isel(time=0, lead_time=lead_hour, level=level_idx).values
+                    data = ds[var_name].isel(time=0, lead_time=0, level=level_idx).values
                 else:
-                    data = ds[var_name].isel(time=0, lead_time=lead_hour).values
+                    data = ds[var_name].isel(time=0, lead_time=0).values
                 
                 # Get colormap
                 var_config = self.config.var_configs.get(var_display, {})
@@ -447,32 +453,27 @@ def plot_forecast_data(datetime_str: str,
         date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
         lead_hour_int = int(lead_hour)
         
-        # Setup paths
-        forecast_file = f"{forecast_dir}/{date_str}/hrrrcast_mem{member}.nc"
-        logger.info(f"Forecast file: {forecast_file}")
-        
-        # Validate forecast file exists
-        if not os.path.exists(forecast_file):
-            raise FileNotFoundError(f"Forecast file not found: {forecast_file}")
-        
+        # Normalize 'pmm' alias to 'avg'
+        member_norm = 'avg' if str(member).lower() in ('avg', 'pmm') else member
+
         # Initialize plotter config (for passing to subprocesses)
         config = ForecastPlotterConfig()
         config_dict = config.__dict__
         
-        # Load forecast data ONCE to check max lead
-        ds = xr.open_dataset(forecast_file, decode_timedelta=True)
-        max_lead = len(ds.lead_time) - 1
-        ds.close()
-        if lead_hour_int > max_lead:
-            raise ValueError(f"Lead hour {lead_hour_int} not available in forecast data (max: {max_lead})")
-        
         n_workers = lead_hour_int
         logger.info(f"Parallel plotting using {n_workers} workers (one per lead hour)")
         # Parallel plotting over lead hours
-        args_list = [
-            (h, forecast_file, init_datetime, init_year, init_month, init_day, init_hh, output_dir, date_str, member, config_dict)
-            for h in range(1, lead_hour_int + 1)
-        ]
+        args_list = []
+        for h in range(1, lead_hour_int + 1):
+            # Build per-hour file path
+            if str(member_norm).lower() == 'avg':
+                ds_path = f"{forecast_dir}/{date_str}/hrrrcast_memavg_f{h:02d}.nc"
+            else:
+                ds_path = f"{forecast_dir}/{date_str}/hrrrcast_mem{member_norm}_f{h:02d}.nc"
+            if not os.path.exists(ds_path):
+                logger.warning(f"Skipping hour f{h:02d}: file not found {ds_path}")
+                continue
+            args_list.append((h, ds_path, init_datetime, init_year, init_month, init_day, init_hh, output_dir, date_str, member_norm, config_dict))
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
             futures = [executor.submit(plot_lead_hour, *args) for args in args_list]
             for future in as_completed(futures):

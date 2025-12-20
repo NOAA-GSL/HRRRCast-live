@@ -16,11 +16,11 @@ averaging of precipitation-related variables creates unrealistically smooth fiel
 underestimated extremes. PMM preserves the distribution of the ensemble mean while
 maintaining the spatial structure of individual ensemble members.
 
-Input files should follow the naming convention:
-  YYYYMMDD/HH/hrrrcast_memN.nc
+Input files should follow the naming convention (per-member, per-hour):
+    YYYYMMDD/HH/hrrrcast_memN_fXX.nc
 
-Output files are saved as:
-  YYYYMMDD/HH/hrrrcast_memavg.nc
+Output files are saved per hour:
+    YYYYMMDD/HH/hrrrcast_memavg_fXX.nc
 
 Usage:
   python ensemble_postprocess.py "2024-05-06T23" --forecast_dir /path/to/data
@@ -36,6 +36,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import xarray as xr
 import glob
+import re
 import utils
 
 from nc2grib import Netcdf2Grib
@@ -185,115 +186,130 @@ def process_variable_mean(var_data: xr.DataArray) -> xr.DataArray:
     processed_var = var_data.mean(dim='member')
     return processed_var
 
-def find_ensemble_files(date_str: str, forecast_dir: str) -> List[str]:
-    """Find all ensemble member files for a given date."""
-    # Look for files in the date directory
+def find_hourly_member_files(date_str: str, forecast_dir: str) -> Dict[int, List[str]]:
+    """Discover per-member, per-hour files and group by forecast hour.
+
+    Returns a mapping: hour -> list of files for all members at that hour.
+    """
     date_dir = os.path.join(forecast_dir, date_str)
     if not os.path.exists(date_dir):
         raise FileNotFoundError(f"Directory {date_dir} does not exist")
-    
-    # Pattern for ensemble files
-    pattern = os.path.join(date_dir, f"hrrrcast_mem*.nc")
-    files = glob.glob(pattern)
-    
-    if not files:
-        raise FileNotFoundError(f"No ensemble files found matching pattern: {pattern}")
-    
-    # Sort files to ensure consistent ordering
-    files.sort()
-    logger.info(f"Found {len(files)} ensemble files")
-    return files
 
-def load_ensemble_data(files: List[str]) -> xr.Dataset:
-    """Load ensemble data from multiple files and concatenate along member dimension."""
+    pattern = os.path.join(date_dir, "hrrrcast_mem*_f*.nc")
+    files = glob.glob(pattern)
+    if not files:
+        raise FileNotFoundError(f"No hourly member files found matching pattern: {pattern}")
+
+    hour_map: Dict[int, List[str]] = {}
+    rx = re.compile(r"hrrrcast_mem(\d+)_f(\d{2})\.nc$")
+    for f in files:
+        m = rx.search(os.path.basename(f))
+        if not m:
+            logger.warning(f"Skipping unexpected filename: {f}")
+            continue
+        member = int(m.group(1))
+        hour = int(m.group(2))
+        hour_map.setdefault(hour, []).append(f)
+
+    # Sort file lists per hour by member for consistency
+    for h in hour_map:
+        hour_map[h].sort(key=lambda p: int(rx.search(os.path.basename(p)).group(1)))
+
+    logger.info(f"Discovered hours: {sorted(hour_map.keys())}; total files: {len(files)}")
+    return hour_map
+
+def load_hour_ensemble_data(files: List[str]) -> xr.Dataset:
+    """Load per-hour ensemble files and concatenate along member dimension."""
     datasets = []
-    
-    for i, file in enumerate(files):
-        logger.info(f"Loading file {i+1}/{len(files)}: {os.path.basename(file)}")
+    for idx, file in enumerate(files):
+        logger.info(f"Loading file {idx+1}/{len(files)}: {os.path.basename(file)}")
         ds = xr.open_dataset(file)
-        # Add member coordinate
-        ds = ds.expand_dims(member=[i])
+        # Use member index derived from filename order; assume sorted by member
+        ds = ds.expand_dims(member=[idx])
         datasets.append(ds)
-    
-    # Concatenate along member dimension
     ensemble_ds = xr.concat(datasets, dim='member')
-    logger.info(f"Loaded ensemble dataset with shape: {dict(ensemble_ds.dims)}")
-    
+    logger.info(f"Loaded per-hour ensemble dataset with dims: {dict(ensemble_ds.dims)}")
     return ensemble_ds
 
 def compute_ensemble_pmm(datetime_str: str,
                         forecast_dir: str = "./", 
                         output_dir: str = "./",
                         method: int = 2):
-    """Main ensemble post-processing function."""
+    """Main ensemble post-processing function, iterating per-hour files and writing per-hour outputs."""
     try:
         # Validate inputs
         init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(datetime_str)
         date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
-        
+
         logger.info(f"Computing ensemble post-processing for initialization time: {date_str}")
-        
-        # Find ensemble files
-        ensemble_files = find_ensemble_files(date_str, forecast_dir)
-        
-        # Load ensemble data
-        ensemble_ds = load_ensemble_data(ensemble_files)
-        
+
+        # Discover hourly member files
+        hour_map = find_hourly_member_files(date_str, forecast_dir)
+
         # Create output directory if it doesn't exist
         output_date_dir = os.path.join(output_dir, date_str)
         utils.make_directory(output_date_dir)
-        
-        # Process each variable with appropriate method
-        processed_datasets = {}
-        
-        for var_name in ensemble_ds.data_vars:
-            var_data = ensemble_ds[var_name]
-            
-            # Check if variable has the required dimensions
-            if 'member' not in var_data.dims:
-                logger.warning(f"Variable {var_name} does not have 'member' dimension, copying as-is")
-                processed_datasets[var_name] = var_data
-                continue
-            
-            # Apply PMM to REFC (reflectivity) and APCP (precip accum), use ensemble mean for others
-            if var_name in ['REFC', 'APCP']:
-                logger.info(f"Computing PMM for variable: {var_name}")
-                processed_var = process_variable_pmm(var_data, method=method)
-                processed_var.attrs['processing_method'] = 'probability_matched_mean'
-            else:
-                logger.info(f"Computing ensemble mean for variable: {var_name}")
-                processed_var = process_variable_mean(var_data)
-                processed_var.attrs['processing_method'] = 'ensemble_mean'
-            
-            processed_datasets[var_name] = processed_var
-        
-        # Create output dataset
-        processed_ds = xr.Dataset(processed_datasets)
-        
-        # Copy attributes from original dataset
-        processed_ds.attrs = ensemble_ds.attrs.copy()
-        processed_ds.attrs['postprocessing_method'] = 'PMM for REFC, ensemble mean for others'
-        processed_ds.attrs['pmm_method'] = method
-        processed_ds.attrs['processed_timestamp'] = str(datetime.now())
-        processed_ds.attrs['source_files'] = [os.path.basename(f) for f in ensemble_files]
-        
-        # Save processed result for plotting
-        output_filename = f"hrrrcast_memavg.nc"
-        output_path = os.path.join(output_date_dir, output_filename)
-        
-        logger.info(f"Saving processed ensemble data to: {output_path}")
-        processed_ds.to_netcdf(output_path)
 
-        #conver to grib2 files:
         converter = Netcdf2Grib()
-        converter.save_grib2(init_datetime, processed_ds, 'avg', output_date_dir)
-        
-        logger.info(f"Ensemble post-processing completed successfully")
-        
-        # Close datasets to free memory
-        ensemble_ds.close()
-        processed_ds.close()
-        
+
+        for lead_hour in sorted(hour_map.keys()):
+            files = hour_map[lead_hour]
+            logger.info(f"Processing forecast hour f{lead_hour:02d} with {len(files)} member files")
+
+            # Load per-hour ensemble
+            ensemble_ds = load_hour_ensemble_data(files)
+
+            processed_datasets: Dict[str, xr.DataArray] = {}
+
+            for var_name in ensemble_ds.data_vars:
+                var_data = ensemble_ds[var_name]
+                if 'member' not in var_data.dims:
+                    logger.warning(f"Variable {var_name} missing 'member' dim at f{lead_hour:02d}, copying as-is")
+                    da = var_data
+                else:
+                    if var_name in ['REFC', 'APCP']:
+                        logger.info(f"PMM for {var_name} at f{lead_hour:02d}")
+                        da = process_variable_pmm(var_data, method=method)
+                        da.attrs['processing_method'] = 'probability_matched_mean'
+                    else:
+                        logger.info(f"Mean for {var_name} at f{lead_hour:02d}")
+                        da = process_variable_mean(var_data)
+                        da.attrs['processing_method'] = 'ensemble_mean'
+
+                # Ensure time and lead_time coords/dims exist for downstream writer
+                # If dims already exist, just set their coordinate values; else expand dims
+                if 'time' in da.dims and 'lead_time' in da.dims:
+                    da = da.assign_coords(time=[np.datetime64(init_datetime)],
+                                          lead_time=[int(lead_hour)])
+                else:
+                    da = da.expand_dims({
+                        'time': [np.datetime64(init_datetime)],
+                        'lead_time': [int(lead_hour)]
+                    })
+                processed_datasets[var_name] = da
+
+            processed_ds = xr.Dataset(processed_datasets)
+            # Copy attributes and annotate
+            processed_ds.attrs = ensemble_ds.attrs.copy()
+            processed_ds.attrs['postprocessing_method'] = 'PMM for REFC/APCP, mean for others'
+            processed_ds.attrs['pmm_method'] = method
+            processed_ds.attrs['processed_timestamp'] = str(datetime.now())
+            processed_ds.attrs['source_files'] = [os.path.basename(f) for f in files]
+
+            # Save per-hour NetCDF
+            out_nc = os.path.join(output_date_dir, f"hrrrcast_memavg_f{lead_hour:02d}.nc")
+            logger.info(f"Saving per-hour processed ensemble to: {out_nc}")
+            processed_ds.to_netcdf(out_nc)
+
+            # Save per-hour GRIB2 for avg
+            converter.save_grib2(init_datetime, processed_ds, 'avg', output_date_dir)
+
+            # Close datasets to free memory
+            ensemble_ds.close()
+            processed_ds.close()
+
+        logger.info("Ensemble per-hour post-processing completed successfully")
+
     except Exception as e:
         logger.error(f"Ensemble post-processing failed: {e}")
         raise
