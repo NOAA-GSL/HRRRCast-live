@@ -15,7 +15,7 @@ ACCNR=${ACCNR:-gsd-hpcs}
 # set wall clock time limits
 hr=$(echo "$INIT_TIME" | grep -oP '\d{2}$')
 if [[ "$hr" =~ ^(00|06|12|18)$ ]]; then
-    FCST_WALLTIME="02:00:00"
+    FCST_WALLTIME="01:30:00"
 else
     FCST_WALLTIME="00:40:00"
 fi

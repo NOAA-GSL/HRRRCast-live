@@ -543,7 +543,11 @@ class WeatherForecaster:
                              output_dir: Optional[str] = None,
                              init_datetime: Optional[datetime] = None,
                              write_per_hour: bool = False) -> Dict[int, Dict]:
-        """Perform greedy autoregressive rollout."""
+        """Perform greedy autoregressive rollout.
+
+        When write_per_hour=True, persist single-hour NetCDF and GRIB2 files for each lead hour,
+        including f00 representing the initial state.
+        """
         logger.info(f"Starting autoregressive rollout for {target_hour} hours")
         
         # Initial input (updated during rollout)
@@ -563,6 +567,22 @@ class WeatherForecaster:
                 lats, lons = self.data_loader_hrrr.get_coordinates()
             except Exception:
                 pass
+
+        # Local helper to write outputs for any hour using shared context
+        def write_hour_outputs(hour: int, data: np.ndarray) -> None:
+            """Build dataset and write NetCDF/GRIB2 for a given hour if output context is available."""
+            if not (write_per_hour and output_dir is not None and init_datetime is not None and lats is not None and lons is not None):
+                return
+            try:
+                ds_hour = self.build_single_hour_dataset(init_datetime, hour, lats, lons, data)
+                _ = self.write_single_hour_netcdf(init_datetime, hour, ds_hour, output_dir, self.member)
+                self.write_single_hour_grib2(init_datetime, hour, ds_hour, output_dir, self.member)
+            except Exception as e:
+                logger.error(f"Failed writing hour {hour} outputs: {e}")
+
+        # Write out hour 0 (f00) products representing the initial state
+        write_hour_outputs(0, state_from_hour.numpy())
+        history[0] = {"step": 0, "from": 0}
 
         # Process all hourly steps
         for hour in tqdm(range(1, target_hour + 1), desc="Forecasting"):
@@ -598,14 +618,7 @@ class WeatherForecaster:
             ], axis=-1)
 
             # Write out per-hour products if requested
-            if write_per_hour and output_dir is not None and init_datetime is not None and lats is not None and lons is not None:
-                try:
-                    ds_hour = self.build_single_hour_dataset(init_datetime, hour, lats, lons, y.numpy())
-                    # Persist NetCDF and GRIB2 for this hour
-                    _ = self.write_single_hour_netcdf(init_datetime, hour, ds_hour, output_dir, self.member)
-                    self.write_single_hour_grib2(init_datetime, hour, ds_hour, output_dir, self.member)
-                except Exception as e:
-                    logger.error(f"Failed writing hour {hour} outputs: {e}")
+            write_hour_outputs(hour, y.numpy())
 
             history[hour] = {"step": step, "from": from_hour}
 
