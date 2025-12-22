@@ -18,10 +18,11 @@ module load wgrib2
 # set vars
 INIT_TIME="@[INIT_TIME]"
 LEAD_HOUR=@[LEAD_HOUR]
-MEMBER=@[MEMBER]
 PACKAGEROOT=@[PACKAGEROOT]
 DATAROOT=@[DATAROOT]
 ENVMODE=@[ENVMODE]
+N_ENSEMBLES=@[N_ENSEMBLES]
+N_GPUS=@[N_GPUS]
 
 # conda
 if [ "$ENVMODE" == "OPN" ]; then
@@ -30,7 +31,28 @@ else
     source ${PACKAGEROOT}/etc/env.sh
 fi
 
-# job
-echo "In fcst, INIT_TIME=${INIT_TIME}, LEAD_HOUR=${LEAD_HOUR}, MEMBER=${MEMBER}, base_dir=${DATAROOT}"
+# job array task -> compute member range for this task
+TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
+
+# Compute start-end range for this task using block distribution
+chunk=$(( N_ENSEMBLES / N_GPUS ))
+rem=$(( N_ENSEMBLES % N_GPUS ))
+extra=0
+if (( TASK_ID < rem )); then extra=1; fi
+if (( TASK_ID < rem )); then
+    start=$(( TASK_ID * chunk + TASK_ID ))
+else
+    start=$(( TASK_ID * chunk + rem ))
+fi
+end=$(( start + chunk + extra - 1 ))
+
+if (( start > end )); then
+    echo "No members assigned to array task ${TASK_ID} (N_ENSEMBLES=${N_ENSEMBLES}, N_GPUS=${N_GPUS}). Exiting."
+    exit 0
+fi
+MEMBER_RANGE="${start}-${end}"
+
+echo "In fcst, INIT_TIME=${INIT_TIME}, LEAD_HOUR=${LEAD_HOUR}, TASK_ID=${TASK_ID}, MEMBER_RANGE=${MEMBER_RANGE}, base_dir=${DATAROOT}"
+
 python ${PACKAGEROOT}/src/fcst.py $PACKAGEROOT/net-diffusion/model.keras ${INIT_TIME} ${LEAD_HOUR} \
-    --members ${MEMBER} --base_dir ${DATAROOT} --output_dir ${DATAROOT}
+    --members ${MEMBER_RANGE} --base_dir ${DATAROOT} --output_dir ${DATAROOT}
