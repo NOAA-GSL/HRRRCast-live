@@ -174,7 +174,7 @@ class WeatherForecaster:
         self,
         data_loader_hrrr: PreprocessedDataLoader,
         data_loader_gfs: PreprocessedDataLoader,
-        member: int,
+        members: List[int],
         use_diffusion: bool,
         predicted_channels: Optional[int] = None,
         gfs_channels: Optional[int] = None,
@@ -183,7 +183,7 @@ class WeatherForecaster:
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
         self.metadata = data_loader_hrrr.metadata
-        self.member = member
+        self.members = members
         self.use_diffusion = use_diffusion
 
         # Derive dynamic channel counts if not provided
@@ -219,17 +219,17 @@ class WeatherForecaster:
             logger.error(f"Error loading/processing normalization file: {e}")
             raise
 
-        # set member noise
+        # set member noise for all members
         if self.use_diffusion:
-            self.member_noise = tf.random.stateless_normal(
-                shape=(nlat, nlon, self.predicted_channels),
-                dtype=tf.float32,
-                seed=[self.member, 0]
-            )
-            self.member_noise = tf.tile(
-                tf.expand_dims(self.member_noise, axis=0), [1, 1, 1, 1]
-            )
-
+            self.member_noise = {}
+            for member in self.members:
+                noise = tf.random.stateless_normal(
+                    shape=(nlat, nlon, self.predicted_channels),
+                    dtype=tf.float32,
+                    seed=[member, 0]
+                )
+                noise = tf.expand_dims(noise, axis=0)
+                self.member_noise[member] = noise
     
 
     def _init_channel_stats(self, ds_norm: xr.Dataset):
@@ -449,13 +449,13 @@ class WeatherForecaster:
                 pass
         converter.save_grib2(init_datetime, ds_hour, member, outdir)
     
-    def predict(self, model: ForecastModel, X: tf.Tensor):
+    def predict(self, model: ForecastModel, X: tf.Tensor, member: int) -> tf.Tensor:
         if self.use_diffusion:
             num_output_channels = self.predicted_channels
             start = self.predicted_channels + self.gfs_channels
 
             # start from complete gaussian noise
-            Xn = self.member_noise
+            Xn = self.member_noise[member]
 
             # iterate over diffusion steps
             for t_ in tqdm(range(NUM_INFERENCE_STEPS - 1)):
@@ -481,7 +481,7 @@ class WeatherForecaster:
                 # predict total noise
                 x_0 = model.predict(X)
                 epsilon_t = compute_epsilon(Xn, x_0, t)
-                Xn = ddim(Xn, epsilon_t, ti, seed=self.member)
+                Xn = ddim(Xn, epsilon_t, ti, seed=member)
 
             return Xn
         else:
@@ -553,9 +553,11 @@ class WeatherForecaster:
         # Initial input (updated during rollout)
         X = tf.convert_to_tensor(initial_input, dtype=tf.float32)
         
-        # Track only the state at the most recent 6-hour boundary (from_hour)
-        state_from_hour = tf.identity(X[0:1, :, :, :self.predicted_channels])
-        last_from_hour = 0
+        # Track state_from_hour per member
+        num_members = len(self.members)
+        state_from_hour = {
+            member: tf.identity(X[0:1, :, :, :self.predicted_channels]) for member in self.members
+        }
         history = {0: {'step': 0, 'from': None}}
 
         start_pred_noise = self.predicted_channels + self.gfs_channels
@@ -569,30 +571,32 @@ class WeatherForecaster:
                 pass
 
         # Local helper to write outputs for any hour using shared context
-        def write_hour_outputs(hour: int, data: np.ndarray) -> None:
+        def write_hour_outputs(hour: int, data: np.ndarray, member: int) -> None:
             """Build dataset and write NetCDF/GRIB2 for a given hour if output context is available."""
             if not (write_per_hour and output_dir is not None and init_datetime is not None and lats is not None and lons is not None):
                 return
             try:
                 ds_hour = self.build_single_hour_dataset(init_datetime, hour, lats, lons, data)
-                _ = self.write_single_hour_netcdf(init_datetime, hour, ds_hour, output_dir, self.member)
-                self.write_single_hour_grib2(init_datetime, hour, ds_hour, output_dir, self.member)
+                _ = self.write_single_hour_netcdf(init_datetime, hour, ds_hour, output_dir, member)
+                self.write_single_hour_grib2(init_datetime, hour, ds_hour, output_dir, member)
             except Exception as e:
-                logger.error(f"Failed writing hour {hour} outputs: {e}")
+                logger.error(f"Failed writing hour {hour} outputs for member {member}: {e}")
 
-        # Write out hour 0 (f00) products representing the initial state
-        write_hour_outputs(0, state_from_hour.numpy())
+        # Write out hour 0 (f00) products representing the initial state for each member
+        for member in self.members:
+            write_hour_outputs(0, state_from_hour[member].numpy(), member)
         history[0] = {"step": 0, "from": 0}
 
         # Process all hourly steps
         for hour in tqdm(range(1, target_hour + 1), desc="Forecasting"):
             from_hour = ((hour - 1) // 6) * 6
             step = hour - from_hour
+            history[hour] = {"step": step, "from": from_hour}
 
             # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
-            X = tf.concat(
+            X_base = tf.concat(
                 [
-                    state_from_hour,
+                    X[:, :, :, :self.predicted_channels],
                     forcing_input[hour-1:hour, :, :, :],
                     X[:, :, :, start_pred_noise:-1],
                     tf.fill(
@@ -603,29 +607,38 @@ class WeatherForecaster:
                 axis=-1,
             )
 
-            # Predict next-hour fields (predicted channels only)
-            y = self.predict(model, X)
-            y = tf.clip_by_value(y, self.channel_mins[:y.shape[-1]], self.channel_maxs[:y.shape[-1]])
+            for member in self.members:
 
-            # Apply REFC noise suppression: set reflectivity < 5 dBZ to 0 (operate in normalized space)
-            refc_channel = 122
-            refc = y[..., refc_channel]
-            refc = tf.where(refc < 0.05, 0.0, refc)
-            y = tf.concat([
-                y[..., :refc_channel],
-                tf.expand_dims(refc, axis=-1),
-                y[..., refc_channel + 1:]
-            ], axis=-1)
+                # update with new state_from_hour for this member
+                X_member = tf.concat(
+                    [
+                        state_from_hour[member],
+                        X_base[:, :, :, self.predicted_channels:],
+                    ],
+                    axis=-1,
+                )
 
-            # Write out per-hour products if requested
-            write_hour_outputs(hour, y.numpy())
+                # Predict next-hour fields (predicted channels only)
+                y = self.predict(model, X_member, member)
+                y = tf.clip_by_value(y, self.channel_mins[:y.shape[-1]], self.channel_maxs[:y.shape[-1]])
 
-            history[hour] = {"step": step, "from": from_hour}
+                # Apply REFC noise suppression: set reflectivity < 5 dBZ to 0 (operate in normalized space)
+                refc_channel = 122
+                refc = y[..., refc_channel]
+                refc = tf.where(refc < 0.05, 0.0, refc)
+                y = tf.concat([
+                    y[..., :refc_channel],
+                    tf.expand_dims(refc, axis=-1),
+                    y[..., refc_channel + 1:]
+                ], axis=-1)
 
-            # When we reach a 6-hour boundary, update the reference state
-            if hour % 6 == 0:
-                state_from_hour = y
-                last_from_hour = hour
+                # Write out per-hour products if requested
+                write_hour_outputs(hour, y.numpy(), member)
+
+                # When we reach a 6-hour boundary, update the reference 
+                # state for this member
+                if hour % 6 == 0:
+                    state_from_hour[member] = y
 
         logger.info("Autoregressive rollout completed")
         return history
@@ -732,7 +745,7 @@ class WeatherForecaster:
             logger.error(f"Forecast failed: {e}")
             raise
 
-def run_weather_forecast_for_member(forecaster: WeatherForecaster, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str, member: int, print_history: bool = False):
+def run_weather_forecast(forecaster: WeatherForecaster, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str, print_history: bool = False):
     """Run forecast for a single member, optionally printing forecast step history. Requires precomputed model_input."""
     try:
         history = forecaster.run_forecast(model, lead_hours, model_input, output_dir, return_history=True)
@@ -744,7 +757,7 @@ def run_weather_forecast_for_member(forecaster: WeatherForecaster, model: Foreca
             if lead_hours > 24:
                 logger.info(f"... (showing first 24 hours of {lead_hours} total)")
     except Exception as e:
-        logger.error(f"Forecast failed for member {member}: {e}")
+        logger.error(f"Forecast failed : {e}")
         raise
 
 
@@ -830,15 +843,13 @@ def main():
                 model_input_hrrr[:, :, :, predicted_channels:],
                 lead_channel], axis=-1)
         
-        for i, member in enumerate(members):
-            forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, member, not args.no_diffusion,
-                                           predicted_channels=predicted_channels,
-                                           gfs_channels=gfs_channels,
-                                           static_channels=static_channels)
-            run_weather_forecast_for_member(
-                forecaster, model, args.lead_hours, model_input, args.output_dir, member, print_history=(i==len(members)-1)
-            )
-            logger.info(f"Forecast complete for member {member}.")
+        forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, members, not args.no_diffusion,
+                                        predicted_channels=predicted_channels,
+                                        gfs_channels=gfs_channels,
+                                        static_channels=static_channels)
+        run_weather_forecast(
+            forecaster, model, args.lead_hours, model_input, args.output_dir, print_history=True
+        )
         logger.info(f"All forecasts complete.")
         
     except Exception as e:
