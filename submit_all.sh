@@ -16,11 +16,12 @@ ACCNR=${ACCNR:-gsd-hpcs}
 hr=$(echo "$INIT_TIME" | grep -oP '\d{2}$')
 if [[ "$hr" =~ ^(00|06|12|18)$ ]]; then
     FCST_WALLTIME="01:30:00"
+    PMM_WALLTIME="01:40:00"
 else
     FCST_WALLTIME="00:40:00"
+    PMM_WALLTIME="00:50:00"
 fi
 
-PMM_WALLTIME="00:30:00"
 GET_ICS_WALLTIME="00:10:00"
 GET_BCS_WALLTIME="00:30:00"
 MAKE_ICS_WALLTIME="00:10:00"
@@ -76,7 +77,7 @@ fi
 # ensemble PMM
 if [ $N_ENSEMBLES -ge 2 ]; then
     atparse < $PACKAGEROOT/jobs/job-compute-pmm.sh > $DATAROOT/logs/job-compute-pmm.sh
-    jobid7=$(submit_with_check sbatch --dependency=afterok:$jobid5 --parsable $DATAROOT/logs/job-compute-pmm.sh)
+    jobid7=$(submit_with_check sbatch --dependency=after:$jobid5 --parsable $DATAROOT/logs/job-compute-pmm.sh)
     echo "Submitted job: $jobid7"
 
     if [ "$RUNPLOT" == "YES" ]; then

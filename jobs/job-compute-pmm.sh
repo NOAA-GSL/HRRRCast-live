@@ -18,10 +18,12 @@ module load wgrib2
 INIT_TIME="@[INIT_TIME]"
 PACKAGEROOT=@[PACKAGEROOT]
 DATAROOT=@[DATAROOT]
+LEAD_HOUR=@[LEAD_HOUR]
+N_ENSEMBLES=@[N_ENSEMBLES]
 
 # conda
 source ${PACKAGEROOT}/etc/env.sh
 
 # job
-echo "In compute_pmm, init_time=${INIT_TIME}"
-python ${PACKAGEROOT}/src/compute_pmm.py ${INIT_TIME} --forecast_dir ${DATAROOT} --output_dir ${DATAROOT}
+echo "In compute_pmm, init_time=${INIT_TIME}, lead_hour=${LEAD_HOUR}, n_ensembles=${N_ENSEMBLES}"
+python ${PACKAGEROOT}/src/compute_pmm.py ${INIT_TIME} ${LEAD_HOUR} --forecast_dir ${DATAROOT} --output_dir ${DATAROOT} --n_ensembles ${N_ENSEMBLES}
