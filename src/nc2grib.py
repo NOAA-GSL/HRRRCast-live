@@ -248,10 +248,19 @@ class Netcdf2Grib:
         msg.typeOfStatisticalProcessing = 0
         msg.numberOfTimeRanges = 0
 
-        # 8. Second surface (unused)
+        # 7. Second surface (unused)
         msg.typeOfSecondFixedSurface = 255
         msg.scaleFactorOfSecondFixedSurface = 0
         msg.scaledValueOfSecondFixedSurface = 0
+
+        # 8. Adjust decimal scale factor for specific humidity (SPFH) to improve precision
+        if var_name == "SPFH":
+            if surface_value >= 5000 and surface_value <= 10000:
+                msg.decScaleFactor = 12
+            elif surface_value >= 15000 and surface_value <= 40000:
+                msg.decScaleFactor = 10
+            else:
+                msg.decScaleFactor = 8
 
         return msg
 
@@ -327,10 +336,8 @@ class Netcdf2Grib:
                     vals = np.squeeze(da.sel(level=level).values)
                     # Slice out time/lead if present
                     if vals.ndim == 4:
-                        _, _, ny, nx = vals.shape
                         vals2d = vals[0, 0, :, :]
                     elif vals.ndim == 3:
-                        _, ny, nx = vals.shape
                         vals2d = vals[0, :, :]
                     else:
                         vals2d = vals
@@ -341,12 +348,10 @@ class Netcdf2Grib:
                 msg = self._build_message(var_name, forecast_starttime, lead, surface_type=surface_type, surface_value=surface_value)
                 vals = np.squeeze(da.values)
                 if vals.ndim == 3:
-                    # (time, lead, y, x)
                     vals2d = vals[0, 0, :, :]
                 elif vals.ndim == 2:
                     vals2d = vals
                 else:
-                    # Attempt to reduce
                     vals2d = np.squeeze(vals)
                 msg.data = np.asarray(vals2d)
                 msg.pack()
