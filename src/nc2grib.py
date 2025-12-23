@@ -39,7 +39,7 @@ GRIB_PARAM_MAP = {
     "VVEL": (0, 2, 8, 100),   # vertical velocity (Pa/s)
     "TMP":  (0, 0, 0, 100),   # temperature
     "HGT":  (0, 3, 5, 100),   # geopotential height
-    "SPFH": (0, 1, 1, 100),   # specific humidity
+    "SPFH": (0, 1, 0, 100),   # specific humidity
     # Surface/height fields
     "PRES":    (0, 3, 0, 1),    # pressure (surface)
     "MSLMA":   (0, 3, 1, 102),  # mean sea level pressure
