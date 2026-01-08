@@ -261,6 +261,8 @@ class Netcdf2Grib:
                 msg.decScaleFactor = 10
             else:
                 msg.decScaleFactor = 8
+        else:
+            msg.decScaleFactor = 1
 
         return msg
 
