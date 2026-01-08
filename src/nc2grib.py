@@ -307,55 +307,58 @@ class Netcdf2Grib:
         g2 = grib2io.open(outfile, mode="w")
         logger.info(f"Writing GRIB2: {outfile}")
 
-        # Ensure y,x dims exist (rename from latitude/longitude if needed)
-        ds_loc = ds_hour
-        if "y" not in ds_loc.dims or "x" not in ds_loc.dims:
-            if "latitude" in ds_loc.dims and "longitude" in ds_loc.dims:
-                ds_loc = ds_loc.rename_dims({"latitude": "y", "longitude": "x"})
-            else:
-                logger.warning("Dataset missing y/x dims; attempting to infer from data variable shapes.")
+        try:
+            # Ensure y,x dims exist (rename from latitude/longitude if needed)
+            ds_loc = ds_hour
+            if "y" not in ds_loc.dims or "x" not in ds_loc.dims:
+                if "latitude" in ds_loc.dims and "longitude" in ds_loc.dims:
+                    ds_loc = ds_loc.rename_dims({"latitude": "y", "longitude": "x"})
+                else:
+                    logger.warning("Dataset missing y/x dims; attempting to infer from data variable shapes.")
 
-        # Loop over variables in sorted order for stable output
-        for var_name in sorted(ds_loc.data_vars):
-            da = ds_loc[var_name]
-            if var_name not in GRIB_PARAM_MAP:
-                logger.debug(f"Skipping unknown variable {var_name}")
-                continue
+            # Loop over variables in sorted order for stable output
+            for var_name in sorted(ds_loc.data_vars):
+                da = ds_loc[var_name]
+                if var_name not in GRIB_PARAM_MAP:
+                    logger.debug(f"Skipping unknown variable {var_name}")
+                    continue
 
-            surface_type, surface_value = self._get_surface_type_and_value(var_name, ds_loc, da)
+                surface_type, surface_value = self._get_surface_type_and_value(var_name, ds_loc, da)
 
-            # Pressure-level variables
-            if "level" in da.coords:
-                for level in np.atleast_1d(da["level"].values):
-                    # Ensure pressure level is in Pa (convert from hPa/mb if necessary)
-                    plevel = float(level)
-                    if plevel < 2000:  # assume provided in hPa
-                        plevel *= 100.0
-                    msg = self._build_message(var_name, forecast_starttime, lead, surface_type=100, surface_value=plevel)
-                    # Expect data shape (time=1, lead_time=1, level=1, y, x) or (lead_time=1, level=1, y, x)
-                    vals = np.squeeze(da.sel(level=level).values)
-                    # Slice out time/lead if present
-                    if vals.ndim == 4:
+                # Pressure-level variables
+                if "level" in da.coords:
+                    for level in np.atleast_1d(da["level"].values):
+                        # Ensure pressure level is in Pa (convert from hPa/mb if necessary)
+                        plevel = float(level)
+                        if plevel < 2000:  # assume provided in hPa
+                            plevel *= 100.0
+                        msg = self._build_message(var_name, forecast_starttime, lead, surface_type=100, surface_value=plevel)
+                        # Expect data shape (time=1, lead_time=1, level=1, y, x) or (lead_time=1, level=1, y, x)
+                        vals = np.squeeze(da.sel(level=level).values)
+                        # Slice out time/lead if present
+                        if vals.ndim == 4:
+                            vals2d = vals[0, 0, :, :]
+                        elif vals.ndim == 3:
+                            vals2d = vals[0, :, :]
+                        else:
+                            vals2d = vals
+                        msg.data = np.asarray(vals2d)
+                        msg.pack()
+                        g2.write(msg)
+                else:
+                    msg = self._build_message(var_name, forecast_starttime, lead, surface_type=surface_type, surface_value=surface_value)
+                    vals = np.squeeze(da.values)
+                    if vals.ndim == 3:
                         vals2d = vals[0, 0, :, :]
-                    elif vals.ndim == 3:
-                        vals2d = vals[0, :, :]
-                    else:
+                    elif vals.ndim == 2:
                         vals2d = vals
+                    else:
+                        vals2d = np.squeeze(vals)
                     msg.data = np.asarray(vals2d)
                     msg.pack()
                     g2.write(msg)
-            else:
-                msg = self._build_message(var_name, forecast_starttime, lead, surface_type=surface_type, surface_value=surface_value)
-                vals = np.squeeze(da.values)
-                if vals.ndim == 3:
-                    vals2d = vals[0, 0, :, :]
-                elif vals.ndim == 2:
-                    vals2d = vals
-                else:
-                    vals2d = np.squeeze(vals)
-                msg.data = np.asarray(vals2d)
-                msg.pack()
-                g2.write(msg)
+        except Exception as e:
+            logger.warning("Error writing GRIB messages: %s", e)
 
         g2.close()
 
