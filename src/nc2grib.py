@@ -63,7 +63,7 @@ GRIB_PARAM_MAP = {
 
 
 class Netcdf2Grib:
-    def __init__(self, section3: Optional[np.ndarray] = None, pdtn_default: int = 0, drtn_default: int = 0):
+    def __init__(self, section3: Optional[np.ndarray] = None, pdtn_default: int = 0, drtn_default: int = 3):
         self.section3 = self._resolve_section3(section3)
         self.pdtn_default = pdtn_default
         self.drtn_default = drtn_default
@@ -117,15 +117,10 @@ class Netcdf2Grib:
 
         # Common defaults
         shape_of_earth = 1  # spherical with given radius
-        # Scale factors for latitude/longitude (assume default: not used)
-        lat_scale = 0
-        lon_scale = 0
         # Resolution and component flags: 8 -> winds(grid) per wgrib2 'res 8'
         res_flags = 8
         # Projection centre flag: 0 = north, 1 = south
         proj_center_flag = 0
-        # Scanning mode: 0 typically yields input WE:SN, output WE:SN in wgrib2
-        scan_mode = 0
 
         # Section 3 structure (template 3.30 Lambert Conformal) matching grib_dump order:
         # Fields reflect wgrib2/grib_dump output: res=8, scanningMode=64 (WE:SN), LaD=38500000, Dx/Dy=6000000
@@ -209,18 +204,15 @@ class Netcdf2Grib:
             1                # Type of Data: 1 (Forecast)
         ], dtype=np.int64)
 
-        # 2. Determine PDT
-        pdtn = pdtn if pdtn is not None else self.pdtn_default
-
-        # 3. Construct message
+        # 2. Construct message
         msg = grib2io.Grib2Message(
             section1=section1,
             section3=self.section3,
-            pdtn=pdtn,
+            pdtn=self.pdtn_default if pdtn is None else pdtn,
             drtn=self.drtn_default if drtn is None else drtn,
         )
 
-        # 4. Set parameter keys
+        # 3. Set parameter keys
         if var_name in GRIB_PARAM_MAP:
             disc, cat, num, default_surface = GRIB_PARAM_MAP[var_name]
             msg.discipline = disc
@@ -240,20 +232,21 @@ class Netcdf2Grib:
             msg.scaledValueOfFirstFixedSurface = 0
             msg.scaleFactorOfFirstFixedSurface = 0
 
-        # 5. Time metadata
+        # 4. Time metadata
         msg.unitOfForecastTime = 1  # hours
         msg.leadTime = timedelta(hours=int(lead_hour))
 
-        # 6. Statistical processing
+        # 5. Statistical processing
         msg.typeOfStatisticalProcessing = 0
         msg.numberOfTimeRanges = 0
 
-        # 7. Second surface (unused)
+        # 6. Second surface (unused)
         msg.typeOfSecondFixedSurface = 255
         msg.scaleFactorOfSecondFixedSurface = 0
         msg.scaledValueOfSecondFixedSurface = 0
 
-        # 8. Adjust decimal scale factor for specific humidity (SPFH) to improve precision
+        # 7. Adjust decimal scale factor for specific humidity (SPFH) to improve precision
+        msg.binaryScaleFactor = 0
         if var_name == "SPFH":
             if surface_value >= 5000 and surface_value <= 10000:
                 msg.decScaleFactor = 12
@@ -262,7 +255,10 @@ class Netcdf2Grib:
             else:
                 msg.decScaleFactor = 8
         else:
-            msg.decScaleFactor = 1
+            msg.decScaleFactor = 2
+
+        # 8. Spatial differencing order (set to 2 for better accuracy)
+        msg.spatialDifferenceOrder = 2
 
         return msg
 
