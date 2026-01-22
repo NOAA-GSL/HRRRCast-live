@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import tensorflow as tf
 import xarray as xr
+import pandas as pd
 from tqdm import tqdm
 
 from nc2grib import Netcdf2Grib
@@ -43,7 +44,6 @@ from diffusion_params import (
 from transform import (
     inverse_log_transform_array,
     inverse_neg_log_transform_array,
-    DEFAULT_LOG_EPS,
 )
 import utils
 from utils import setup_logging
@@ -191,16 +191,16 @@ class WeatherForecaster:
         sfc_vars = self.metadata["sfc_vars"]
         levels = self.metadata["levels"]
         default_predicted = len(pl_vars) * len(levels) + len(sfc_vars)
-        input_shape = data_loader_hrrr.get_model_input().shape
-        total_hrrr = input_shape[-1]
-        nlat, nlon = input_shape[1], input_shape[2] 
+        self.input_shape = data_loader_hrrr.get_model_input().shape
+        hrrr_channels = self.input_shape[-1]
+        nlat, nlon = self.input_shape[1], self.input_shape[2] 
 
         if predicted_channels is None:
             predicted_channels = default_predicted
         if gfs_channels is None:
             gfs_channels = data_loader_gfs.get_model_input().shape[-1]
         if static_channels is None:
-            static_channels = max(total_hrrr - predicted_channels, 0)
+            static_channels = max(hrrr_channels - predicted_channels, 0)
 
         self.predicted_channels = predicted_channels
         self.gfs_channels = gfs_channels
@@ -246,8 +246,13 @@ class WeatherForecaster:
         sfc_vars = self.metadata['sfc_vars']
         levels = self.metadata['levels']
 
-        means = []
-        stds = []
+        fallback_mins_raw, fallback_maxs_raw = self.get_variable_bounds()
+
+        raw_means: List[float] = []
+        raw_stds: List[float] = []
+        raw_mins: List[float] = []
+        raw_maxs: List[float] = []
+        channel_idx = 0
 
         # Pressure-level variables
         # Preprocessing loops over raw GRIB shortNames: u,v,w,t,gh,q corresponding to pl_vars order below
@@ -256,48 +261,97 @@ class WeatherForecaster:
             if var not in ds_norm.variables:
                 # Fallback: fill with zeros/ones to avoid crash
                 logger.warning(f"Normalization stats missing for pressure var {var}; using mean=0,std=1")
-                means.extend([0.0] * len(levels))
-                stds.extend([1.0] * len(levels))
+                for _ in levels:
+                    raw_means.append(0.0)
+                    raw_stds.append(1.0)
+                    raw_mins.append(float(fallback_mins_raw[channel_idx]))
+                    raw_maxs.append(float(fallback_maxs_raw[channel_idx]))
+                    channel_idx += 1
                 continue
-            stats = ds_norm[var].values  # shape (2, level)
+
+            stats = ds_norm[var].values  # shape (stat, level)
             # Safeguard shape
             if stats.shape[0] < 2:
                 logger.warning(f"Stats for {var} malformed; using zeros/ones")
-                means.extend([0.0] * len(levels))
-                stds.extend([1.0] * len(levels))
+                for _ in levels:
+                    raw_means.append(0.0)
+                    raw_stds.append(1.0)
+                    raw_mins.append(float(fallback_mins_raw[channel_idx]))
+                    raw_maxs.append(float(fallback_maxs_raw[channel_idx]))
+                    channel_idx += 1
                 continue
+
             # If level dimension differs, broadcast or truncate
             nlev_stats = stats.shape[1] if stats.ndim > 1 else 1
             for i, lvl in enumerate(levels):
                 if i < nlev_stats:
-                    means.append(float(stats[0, i]))
-                    stds.append(float(stats[1, i]))
+                    stat_mean = float(stats[0, i])
+                    stat_std = float(stats[1, i]) if float(stats[1, i]) != 0 else 1.0
+                    stat_min = float(stats[2, i]) if stats.shape[0] > 2 and i < nlev_stats else float(fallback_mins_raw[channel_idx])
+                    stat_max = float(stats[3, i]) if stats.shape[0] > 3 and i < nlev_stats else float(fallback_maxs_raw[channel_idx])
+                    if np.isnan(stat_min):
+                        stat_min = float(fallback_mins_raw[channel_idx])
+                    if np.isnan(stat_max):
+                        stat_max = float(fallback_maxs_raw[channel_idx])
                 else:
-                    means.append(0.0)
-                    stds.append(1.0)
+                    stat_mean = 0.0
+                    stat_std = 1.0
+                    stat_min = float(fallback_mins_raw[channel_idx])
+                    stat_max = float(fallback_maxs_raw[channel_idx])
+
+                raw_means.append(stat_mean)
+                raw_stds.append(stat_std)
+                raw_mins.append(stat_min)
+                raw_maxs.append(stat_max)
+                channel_idx += 1
 
         # Surface variables (single value per variable)
         for var in sfc_vars:
             if var not in ds_norm.variables:
                 logger.warning(f"Normalization stats missing for surface var {var}; using mean=0,std=1")
-                means.append(0.0)
-                stds.append(1.0)
+                raw_means.append(0.0)
+                raw_stds.append(1.0)
+                raw_mins.append(float(fallback_mins_raw[channel_idx]))
+                raw_maxs.append(float(fallback_maxs_raw[channel_idx]))
+                channel_idx += 1
                 continue
-            stats = ds_norm[var].values  # expect (2, ...) first dim=stat
+
+            stats = ds_norm[var].values  # expect (stat, ...)
             if stats.shape[0] < 2:
                 logger.warning(f"Stats for {var} malformed; using mean=0,std=1")
-                means.append(0.0)
-                stds.append(1.0)
+                raw_means.append(0.0)
+                raw_stds.append(1.0)
+                raw_mins.append(float(fallback_mins_raw[channel_idx]))
+                raw_maxs.append(float(fallback_maxs_raw[channel_idx]))
+                channel_idx += 1
                 continue
-            # Reduce any remaining dims to scalar with nanmean
-            means.append(float(np.nanmean(stats[0])))
-            stds.append(float(np.nanmean(stats[1])) if np.nanmean(stats[1]) != 0 else 1.0)
 
-        self.channel_means = np.array(means, dtype=np.float32)
-        self.channel_stds = np.array(stds, dtype=np.float32)
-        vmin, vmax = self.get_variable_bounds()
-        self.channel_mins = (vmin - self.channel_means) / self.channel_stds
-        self.channel_maxs = (vmax - self.channel_means) / self.channel_stds
+            stat_mean = float(np.nanmean(stats[0]))
+            stat_std = float(np.nanmean(stats[1])) if np.nanmean(stats[1]) != 0 else 1.0
+            stat_min = float(np.nanmean(stats[2])) if stats.shape[0] > 2 else float(fallback_mins_raw[channel_idx])
+            stat_max = float(np.nanmean(stats[3])) if stats.shape[0] > 3 else float(fallback_maxs_raw[channel_idx])
+            if np.isnan(stat_min):
+                stat_min = float(fallback_mins_raw[channel_idx])
+            if np.isnan(stat_max):
+                stat_max = float(fallback_maxs_raw[channel_idx])
+
+            raw_means.append(stat_mean)
+            raw_stds.append(stat_std)
+            raw_mins.append(stat_min)
+            raw_maxs.append(stat_max)
+            channel_idx += 1
+
+        self.raw_means = np.array(raw_means, dtype=np.float32)
+        self.raw_stds = np.array(raw_stds, dtype=np.float32)
+        self.raw_mins = np.array(raw_mins, dtype=np.float32)
+        self.raw_maxs = np.array(raw_maxs, dtype=np.float32)
+
+        self.channel_means = self.raw_means
+        self.channel_stds = self.raw_stds
+        safe_stds = np.where(self.channel_stds == 0, 1.0, self.channel_stds)
+
+        self.channel_mins = (self.raw_mins - self.channel_means) / safe_stds
+        self.channel_maxs = (self.raw_maxs - self.channel_means) / safe_stds
 
     def denormalize(self, output: np.ndarray) -> np.ndarray:
         """Convert model output back to physical units using stored per-channel stats.
@@ -328,12 +382,12 @@ class WeatherForecaster:
             for var in log_vars:
                 if var in ds.variables:
                     data_arr = ds[var].values
-                    ds[var].values[:] = inverse_log_transform_array(data_arr, eps=DEFAULT_LOG_EPS)
+                    ds[var].values[:] = inverse_log_transform_array(data_arr)
                     applied.append(var)
             for var in neg_log_vars:
                 if var in ds.variables:
                     data_arr = ds[var].values
-                    ds[var].values[:] = inverse_neg_log_transform_array(data_arr, eps=DEFAULT_LOG_EPS)
+                    ds[var].values[:] = inverse_neg_log_transform_array(data_arr)
                     applied.append(var)
             if applied:
                 logger.info(f"Applied inverse transforms to: {', '.join(applied)}")
@@ -538,6 +592,49 @@ class WeatherForecaster:
                 maxs.append(vmax)
         return np.array(mins, dtype=np.float32), np.array(maxs, dtype=np.float32)
 
+
+    @staticmethod
+    def compute_time_features(init_times_np, lead_times_np):
+        # Ensure inputs are array-like
+        if not isinstance(init_times_np, (list, np.ndarray)):
+            init_times_np = [init_times_np]
+        if lead_times_np is not None and not isinstance(lead_times_np, (list, np.ndarray)):
+            lead_times_np = [lead_times_np]
+        # compute valid times
+        time_coord = pd.to_datetime(init_times_np)
+        if lead_times_np is not None:
+            time_coord += pd.to_timedelta(lead_times_np, unit='h')
+        # compute cyclical features
+        hours = pd.DatetimeIndex(time_coord).hour.astype(np.float32)
+        doy = pd.DatetimeIndex(time_coord).dayofyear.astype(np.float32)
+        # version masks
+        v4 = (time_coord >= np.datetime64("2021-03-23T00")).astype(np.float32)
+        v3 = ((time_coord >= np.datetime64("2018-07-12T00")) & (time_coord < np.datetime64("2021-03-23T00"))).astype(np.float32)
+        # Stack features into shape [B, 6]
+        features = np.stack([
+            np.sin(2 * np.pi * hours / 24.0).astype(np.float32),
+            np.cos(2 * np.pi * hours / 24.0).astype(np.float32),
+            np.sin(2 * np.pi * doy / 365.0).astype(np.float32),
+            np.cos(2 * np.pi * doy / 365.0).astype(np.float32),
+            v4.astype(np.float32),
+            v3.astype(np.float32),
+        ], axis=-1)
+        return features
+
+    def date_encoding_tensor(self, init_times_np, lead_times_np):
+        """Compute cyclical time encodings and HRRR version masks"""
+
+        def get_encoding_tensor(enc):
+            enc = tf.cast(enc, dtype=tf.float32)
+            batch_size, lat, lon = tf.shape(enc)[0], self.input_shape[1], self.input_shape[2]
+            enc = tf.reshape(enc, (batch_size, 1, 1, 6))
+            enc = tf.broadcast_to(enc, (batch_size, lat, lon, 6))
+            return enc
+
+        enc = self.compute_time_features(init_times_np, lead_times_np)
+        enc = get_encoding_tensor(enc)
+        return enc
+    
     def autoregressive_rollout(self, initial_input: np.ndarray, forcing_input: np.ndarray, model: ForecastModel, 
                              target_hour: int,
                              output_dir: Optional[str] = None,
@@ -593,16 +690,22 @@ class WeatherForecaster:
             step = hour - from_hour
             history[hour] = {"step": step, "from": from_hour}
 
+            # date encoding
+            date_encoding = self.date_encoding_tensor(init_datetime, from_hour)
+            lead_encoding = tf.fill(
+                tf.concat([tf.shape(X)[:-1], [1]], axis=0),
+                step / 6.0,
+            )
+
             # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
             X_base = tf.concat(
                 [
                     X[:, :, :, :self.predicted_channels],
                     forcing_input[hour-1:hour, :, :, :],
-                    X[:, :, :, start_pred_noise:-1],
-                    tf.fill(
-                        tf.concat([tf.shape(X)[:-1], [1]], axis=0),
-                        step / 6.0,
-                    ),
+                    X[:, :, :, start_pred_noise:-2],
+                    date_encoding,
+                    X[:, :, :, -2:-1],
+                    lead_encoding,
                 ],
                 axis=-1,
             )
@@ -621,16 +724,6 @@ class WeatherForecaster:
                 # Predict next-hour fields (predicted channels only)
                 y = self.predict(model, X_member, member)
                 y = tf.clip_by_value(y, self.channel_mins[:y.shape[-1]], self.channel_maxs[:y.shape[-1]])
-
-                # Apply REFC noise suppression: set reflectivity < 5 dBZ to 0 (operate in normalized space)
-                refc_channel = 122
-                refc = y[..., refc_channel]
-                refc = tf.where(refc < 0.05, 0.0, refc)
-                y = tf.concat([
-                    y[..., :refc_channel],
-                    tf.expand_dims(refc, axis=-1),
-                    y[..., refc_channel + 1:]
-                ], axis=-1)
 
                 # Write out per-hour products if requested
                 write_hour_outputs(hour, y.numpy(), member)
