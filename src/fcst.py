@@ -570,7 +570,6 @@ class WeatherForecaster:
             "CAPE":    (0, 7000),
             "CIN":     (-2000, 0),
         }
-        eps = 1e-3
         mins = []
         maxs = []
         log_vars = {"SPFH", "VIS", "APCP", "HGTCC", "CAPE"}
@@ -580,11 +579,11 @@ class WeatherForecaster:
         for i, var in enumerate(raw_bounds):
             vmin, vmax = raw_bounds[var]
             if var in log_vars:
-                vmin = np.log(vmin + eps) - np.log(eps)
-                vmax = np.log(vmax + eps) - np.log(eps)
+                vmin = np.log1p(vmin)
+                vmax = np.log1p(vmax)
             elif var in neg_log_vars:
-                vmin = np.sign(vmin) * (np.log(abs(vmin) + eps) - np.log(eps))
-                vmax = np.sign(vmax) * (np.log(abs(vmax) + eps) - np.log(eps))
+                vmin = np.sign(vmin) * np.log1p(abs(vmin))
+                vmax = np.sign(vmax) * np.log1p(abs(vmax))
             # Repeat for each pressure level if 3D, else once
             n_levels = num_levels if i < 6 else 1
             for _ in range(n_levels):
