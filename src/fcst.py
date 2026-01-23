@@ -702,7 +702,7 @@ class WeatherForecaster:
                 [
                     X[:, :, :, :self.predicted_channels],
                     forcing_input[hour-1:hour, :, :, :],
-                    X[:, :, :, start_pred_noise:-2],
+                    X[:, :, :, start_pred_noise:-8],
                     date_encoding,
                     X[:, :, :, -2:-1],
                     lead_encoding,
@@ -918,6 +918,7 @@ def main():
         gfs_channels = model_input_gfs.shape[-1]
         static_channels = max(model_input_hrrr.shape[-1] - predicted_channels, 0)
 
+        date_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 6), dtype=model_input_hrrr.dtype)
         lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1), dtype=model_input_hrrr.dtype)
         if not args.no_diffusion:
             rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], predicted_channels), dtype=model_input_hrrr.dtype)
@@ -927,12 +928,14 @@ def main():
                 model_input_gfs[0:1, :, :, :],
                 rand_channel,
                 model_input_hrrr[:, :, :, predicted_channels:],
+                date_channel,
                 step_channel, lead_channel], axis=-1)
         else:
             model_input = np.concatenate([
                 model_input_hrrr[:, :, :, :predicted_channels],
                 model_input_gfs[0:1, :, :, :],
                 model_input_hrrr[:, :, :, predicted_channels:],
+                date_channel,
                 lead_channel], axis=-1)
         
         forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, members, not args.no_diffusion,
