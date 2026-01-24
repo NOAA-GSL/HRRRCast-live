@@ -128,14 +128,9 @@ class RecomputeSubModel(tf.keras.layers.Layer):
         super().__init__(name=name, **kwargs)
         self.submodel = submodel
 
-        def _forward_pass(x):
-            return self.submodel(x)
-
-        self.recompute_fn = tf.recompute_grad(_forward_pass)
-
     @tf.function(jit_compile=False)
     def call(self, inputs):
-        return self.recompute_fn(inputs)
+        return tf.recompute_grad(lambda : self.submodel(inputs))()
 
     def compute_output_shape(self, input_shape):
         return self.submodel.compute_output_shape(input_shape)
@@ -168,21 +163,24 @@ class TimeCondLayer(Layer):
         self.use_noise = use_noise
 
     def call(self, inputs):
-        time_feats = tf.gather(inputs, self.time_mask, axis=-1)  # (B, H, W, 2)
-        d = time_feats[:, 0, 0, :]  # (B, 2)
+        def per_sample_fn(sample):
+            time_feats = tf.gather(sample, self.time_mask, axis=-1)  # (H, W, 2)
+            d = tf.reduce_mean(time_feats, axis=[0, 1])  # (2,)
 
-        if not self.use_crps:
-            return d  # Case A: full d vector (lead time + ens_id)
+            if not self.use_crps:
+                return d  # Case A: full d vector (lead time + ens_id)
 
-        lead_time = d[:, -1:]  # (B, 1)
-        if not self.use_noise:
-            return lead_time  # Case B: only lead_time
+            lead_time = d[-1:]  # (1,)
+            if not self.use_noise:
+                return lead_time  # Case B: only lead_time
 
-        # Case C: CRPS + noise
-        ens_id = tf.cast(tf.floor(tf.cast(d[:, 0], tf.float32) * (2**31 - 1)), tf.int32)  # (B,)
-        seed = tf.stack([ens_id, ens_id ^ 0x9E3779B9], axis=1)  # (B,2)
-        z = tf.random.stateless_normal([tf.shape(d)[0], 32], seed=seed, dtype=lead_time.dtype)  # (B,32)
-        return tf.concat([z, lead_time], axis=1)  # (B, 33)
+            # Case C: CRPS + noise
+            ens_id = tf.cast(d[0] * 100, tf.int32)  # scalar int32
+            seed = tf.stack([ens_id, ens_id ^ 0x9E3779B9])  # (2,)
+            z = tf.random.stateless_normal([32], seed=seed)  # (32,)
+            return tf.concat([z, lead_time], axis=0)  # (33,)
+
+        return tf.map_fn(per_sample_fn, inputs)
 
     def compute_output_shape(self, input_shape):
         if not self.use_crps:
