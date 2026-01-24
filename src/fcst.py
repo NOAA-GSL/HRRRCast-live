@@ -186,6 +186,17 @@ class WeatherForecaster:
         self.members = members
         self.use_diffusion = use_diffusion
 
+        # log-transform variables list
+        self.LOG_TRANSFORM_VARS = [
+            "VIS",
+            "APCP",
+            "HGTCC",
+            "CAPE",
+        ]
+        self.NEG_LOG_TRANSFORM_VARS = [
+            "CIN",
+        ]
+
         # Derive dynamic channel counts if not provided
         pl_vars = self.metadata["pl_vars"]
         sfc_vars = self.metadata["sfc_vars"]
@@ -220,28 +231,30 @@ class WeatherForecaster:
             raise
 
         # set member noise for all members
-        if self.use_diffusion:
-            self.member_noise = {}
-            for member in self.members:
+        self.member_noise = {}
+        for member in self.members:
+            if self.use_diffusion:
                 noise = tf.random.stateless_normal(
                     shape=(nlat, nlon, self.predicted_channels),
                     dtype=tf.float32,
                     seed=[member, 0]
                 )
                 noise = tf.expand_dims(noise, axis=0)
-                self.member_noise[member] = noise
+            else:
+                noise = tf.random.stateless_uniform(
+                    shape=(),
+                    minval=0.0,
+                    maxval=1.0,
+                    dtype=tf.float32,
+                    seed=[member, 0]
+                )
+                noise = tf.tile(
+                    tf.reshape(noise, (1, 1, 1, 1)),
+                    [1, nlat, nlon, 1]
+                )
+            self.member_noise[member] = noise
 
-        # log-transform variables list
-        self.LOG_TRANSFORM_VARS = [
-            "VIS",
-            "APCP",
-            "HGTCC",
-            "CAPE",
-        ]
-        self.NEG_LOG_TRANSFORM_VARS = [
-            "CIN",
-        ]
-    
+
 
     def _init_channel_stats(self, ds_norm: xr.Dataset):
         """Build flattened mean/std vectors matching channel ordering in preprocessing.
@@ -253,7 +266,7 @@ class WeatherForecaster:
         by the diffusion / deterministic heads (first 74 channels). We still include them
         at the tail of the vectors if present so slicing remains safe.
         """
-        pl_vars = self.metadata['pl_vars']  # ["UGRD", ...]
+        pl_vars = self.metadata['pl_vars']
         sfc_vars = self.metadata['sfc_vars']
         levels = self.metadata['levels']
 
@@ -266,9 +279,7 @@ class WeatherForecaster:
         channel_idx = 0
 
         # Pressure-level variables
-        # Preprocessing loops over raw GRIB shortNames: u,v,w,t,gh,q corresponding to pl_vars order below
-        pl_order = ["UGRD", "VGRD", "VVEL", "TMP", "HGT", "SPFH"]
-        for var in pl_order:
+        for var in pl_vars:
             if var not in ds_norm.variables:
                 # Fallback: fill with zeros/ones to avoid crash
                 logger.warning(f"Normalization stats missing for pressure var {var}; using mean=0,std=1")
@@ -359,10 +370,8 @@ class WeatherForecaster:
 
         self.channel_means = self.raw_means
         self.channel_stds = self.raw_stds
-        safe_stds = np.where(self.channel_stds == 0, 1.0, self.channel_stds)
-
-        self.channel_mins = (self.raw_mins - self.channel_means) / safe_stds
-        self.channel_maxs = (self.raw_maxs - self.channel_means) / safe_stds
+        self.channel_mins = (self.raw_mins - self.channel_means) / self.channel_stds
+        self.channel_maxs = (self.raw_maxs - self.channel_means) / self.channel_stds
 
     def denormalize(self, output: np.ndarray) -> np.ndarray:
         """Convert model output back to physical units using stored per-channel stats.
@@ -511,45 +520,6 @@ class WeatherForecaster:
             except Exception:
                 pass
         converter.save_grib2(init_datetime, ds_hour, member, outdir)
-    
-    def predict(self, model: ForecastModel, X: tf.Tensor, member: int) -> tf.Tensor:
-        if self.use_diffusion:
-            num_output_channels = self.predicted_channels
-            start = self.predicted_channels + self.gfs_channels
-
-            # start from complete gaussian noise
-            Xn = self.member_noise[member]
-
-            # iterate over diffusion steps
-            for t_ in tqdm(range(NUM_INFERENCE_STEPS - 1)):
-                ti = NUM_INFERENCE_STEPS - 1 - t_
-                t = INFERENCE_STEPS[ti]
-
-                # set the correct time embedding
-                step_encoding = tf.fill(
-                    tf.concat([tf.shape(X)[:-1], [1]], axis=0),
-                    tf.cast(t / NUM_DIFFUSION_STEPS, tf.float32),
-                )
-                X = tf.concat(
-                    [
-                        X[:, :, :, :start],
-                        Xn,
-                        X[:, :, :, start + num_output_channels :-2],
-                        step_encoding,
-                        X[:, :, :, -1:],
-                    ],
-                    axis=-1,
-                )
-
-                # predict total noise
-                x_0 = model.predict(X)
-                epsilon_t = compute_epsilon(Xn, x_0, t)
-                Xn = ddim(Xn, epsilon_t, ti, seed=member)
-
-            return Xn
-        else:
-            return model.predict(X)
-
 
     def get_variable_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -640,7 +610,56 @@ class WeatherForecaster:
         enc = self.compute_time_features(init_times_np, lead_times_np)
         enc = get_encoding_tensor(enc)
         return enc
-    
+
+    def predict(self, model: ForecastModel, X: tf.Tensor, member: int) -> tf.Tensor:
+        if self.use_diffusion:
+            num_output_channels = self.predicted_channels
+            start = self.predicted_channels + self.gfs_channels
+
+            # start from complete gaussian noise
+            Xn = self.member_noise[member]
+
+            # iterate over diffusion steps
+            for t_ in tqdm(range(NUM_INFERENCE_STEPS - 1)):
+                ti = NUM_INFERENCE_STEPS - 1 - t_
+                t = INFERENCE_STEPS[ti]
+
+                # set the correct time embedding
+                step_encoding = tf.fill(
+                    tf.concat([tf.shape(X)[:-1], [1]], axis=0),
+                    tf.cast(t / NUM_DIFFUSION_STEPS, tf.float32),
+                )
+                X = tf.concat(
+                    [
+                        X[:, :, :, :start],
+                        Xn,
+                        X[:, :, :, start + num_output_channels :-2],
+                        step_encoding,
+                        X[:, :, :, -1:],
+                    ],
+                    axis=-1,
+                )
+
+                # predict total noise
+                x_0 = model.predict(X)
+                epsilon_t = compute_epsilon(Xn, x_0, t)
+                Xn = ddim(Xn, epsilon_t, ti, seed=member)
+
+            return Xn
+        else:
+            # set CRPS member
+            Xn = self.member_noise[member]
+            X = tf.concat(
+                [
+                    X[:, :, :, :-2],
+                    Xn,
+                    X[:, :, :, -1:]
+                ],
+                axis=-1,
+            )
+            y = model.predict(X)
+            return y
+
     def autoregressive_rollout(self, initial_input: np.ndarray, forcing_input: np.ndarray, model: ForecastModel, 
                              target_hour: int,
                              output_dir: Optional[str] = None,
@@ -657,7 +676,6 @@ class WeatherForecaster:
         X = tf.convert_to_tensor(initial_input, dtype=tf.float32)
         
         # Track state_from_hour per member
-        num_members = len(self.members)
         state_from_hour = {
             member: tf.identity(X[0:1, :, :, :self.predicted_channels]) for member in self.members
         }
@@ -668,10 +686,7 @@ class WeatherForecaster:
         # Lazily fetch coordinates if writing outputs per hour
         lats = lons = None
         if write_per_hour:
-            try:
-                lats, lons = self.data_loader_hrrr.get_coordinates()
-            except Exception:
-                pass
+            lats, lons = self.data_loader_hrrr.get_coordinates()
 
         # Local helper to write outputs for any hour using shared context
         def write_hour_outputs(hour: int, data: np.ndarray, member: int) -> None:
@@ -717,7 +732,6 @@ class WeatherForecaster:
             )
 
             for member in self.members:
-
                 # update with new state_from_hour for this member
                 X_member = tf.concat(
                     [
@@ -729,15 +743,19 @@ class WeatherForecaster:
 
                 # Predict next-hour fields (predicted channels only)
                 y = self.predict(model, X_member, member)
-                y = tf.clip_by_value(y, self.channel_mins[:y.shape[-1]], self.channel_maxs[:y.shape[-1]])
-
-                # Write out per-hour products if requested
-                write_hour_outputs(hour, y.numpy(), member)
+                y = tf.clip_by_value(
+                    y,
+                    self.channel_mins[:y.shape[-1]],
+                    self.channel_maxs[:y.shape[-1]]
+                )
 
                 # When we reach a 6-hour boundary, update the reference 
                 # state for this member
                 if hour % 6 == 0:
                     state_from_hour[member] = y
+
+                # Write out per-hour products if requested
+                write_hour_outputs(hour, y.numpy(), member)
 
         logger.info("Autoregressive rollout completed")
         return history
@@ -818,7 +836,6 @@ class WeatherForecaster:
         call signature, this returns (None, None[, history]) where history is included if return_history=True.
         """
         try:
-            lats, lons = self.data_loader_hrrr.get_coordinates()
             init_datetime = self.data_loader_hrrr.get_init_datetime()
 
             logger.info(f"Running forecast for {init_datetime} with {lead_hours} hour lead time")
@@ -924,25 +941,38 @@ def main():
         gfs_channels = model_input_gfs.shape[-1]
         static_channels = max(model_input_hrrr.shape[-1] - predicted_channels, 0)
 
-        date_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 6), dtype=model_input_hrrr.dtype)
-        lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1), dtype=model_input_hrrr.dtype)
+        nlat = model_input_hrrr.shape[1]
+        nlon = model_input_hrrr.shape[2]
+        date_channel = np.ones((1, nlat, nlon, 6), dtype=model_input_hrrr.dtype)
+        lead_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
+        step_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
+
         if not args.no_diffusion:
-            rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], predicted_channels), dtype=model_input_hrrr.dtype)
-            step_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1), dtype=model_input_hrrr.dtype)
-            model_input = np.concatenate([
-                model_input_hrrr[:, :, :, :predicted_channels],
-                model_input_gfs[0:1, :, :, :],
-                rand_channel,
-                model_input_hrrr[:, :, :, predicted_channels:],
-                date_channel,
-                step_channel, lead_channel], axis=-1)
+            rand_channel = np.ones((1, nlat, nlon, predicted_channels), dtype=model_input_hrrr.dtype)
+            model_input = np.concatenate(
+                [
+                    model_input_hrrr[:, :, :, :predicted_channels],
+                    model_input_gfs[0:1, :, :, :],
+                    rand_channel,
+                    model_input_hrrr[:, :, :, predicted_channels:],
+                    date_channel,
+                    step_channel,
+                    lead_channel
+                ],
+                axis=-1
+            )
         else:
-            model_input = np.concatenate([
-                model_input_hrrr[:, :, :, :predicted_channels],
-                model_input_gfs[0:1, :, :, :],
-                model_input_hrrr[:, :, :, predicted_channels:],
-                date_channel,
-                lead_channel], axis=-1)
+            model_input = np.concatenate(
+                [
+                    model_input_hrrr[:, :, :, :predicted_channels],
+                    model_input_gfs[0:1, :, :, :],
+                    model_input_hrrr[:, :, :, predicted_channels:],
+                    date_channel,
+                    step_channel,
+                    lead_channel
+                ],
+                axis=-1
+            )
         
         forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, members, not args.no_diffusion,
                                         predicted_channels=predicted_channels,
