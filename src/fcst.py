@@ -230,6 +230,17 @@ class WeatherForecaster:
                 )
                 noise = tf.expand_dims(noise, axis=0)
                 self.member_noise[member] = noise
+
+        # log-transform variables list
+        self.LOG_TRANSFORM_VARS = [
+            "VIS",
+            "APCP",
+            "HGTCC",
+            "CAPE",
+        ]
+        self.NEG_LOG_TRANSFORM_VARS = [
+            "CIN",
+        ]
     
 
     def _init_channel_stats(self, ds_norm: xr.Dataset):
@@ -376,15 +387,13 @@ class WeatherForecaster:
         variables. Safe to call when variables are absent.
         """
         try:
-            log_vars = {"SPFH", "VIS", "APCP", "HGTCC", "CAPE"}
-            neg_log_vars = {"CIN"}
             applied = []
-            for var in log_vars:
+            for var in self.LOG_TRANSFORM_VARS:
                 if var in ds.variables:
                     data_arr = ds[var].values
                     ds[var].values[:] = inverse_log_transform_array(data_arr)
                     applied.append(var)
-            for var in neg_log_vars:
+            for var in self.NEG_LOG_TRANSFORM_VARS:
                 if var in ds.variables:
                     data_arr = ds[var].values
                     ds[var].values[:] = inverse_neg_log_transform_array(data_arr)
@@ -572,16 +581,14 @@ class WeatherForecaster:
         }
         mins = []
         maxs = []
-        log_vars = {"SPFH", "VIS", "APCP", "HGTCC", "CAPE"}
-        neg_log_vars = {"CIN"}
         num_levels = len(self.metadata['levels'])
         # Merge 3D and 2D targets into a single loop
         for i, var in enumerate(raw_bounds):
             vmin, vmax = raw_bounds[var]
-            if var in log_vars:
+            if var in self.LOG_TRANSFORM_VARS:
                 vmin = np.log1p(vmin)
                 vmax = np.log1p(vmax)
-            elif var in neg_log_vars:
+            elif var in self.NEG_LOG_TRANSFORM_VARS:
                 vmin = np.sign(vmin) * np.log1p(abs(vmin))
                 vmax = np.sign(vmax) * np.log1p(abs(vmax))
             # Repeat for each pressure level if 3D, else once

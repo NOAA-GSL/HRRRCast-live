@@ -54,7 +54,6 @@ class WeatherPreprocessConfig:
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
-            "SPFH",
             "VIS",
             "APCP",
             "HGTCC",
