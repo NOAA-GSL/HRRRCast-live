@@ -519,7 +519,7 @@ class WeatherForecaster:
                 # set the correct time embedding
                 step_encoding = tf.fill(
                     tf.concat([tf.shape(X)[:-1], [1]], axis=0),
-                    t / NUM_DIFFUSION_STEPS,
+                    tf.cast(t / NUM_DIFFUSION_STEPS, tf.float32),
                 )
                 X = tf.concat(
                     [
@@ -693,7 +693,7 @@ class WeatherForecaster:
             date_encoding = self.date_encoding_tensor(init_datetime, from_hour)
             lead_encoding = tf.fill(
                 tf.concat([tf.shape(X)[:-1], [1]], axis=0),
-                step / 6.0,
+                tf.cast(step / 6.0, tf.float32),
             )
 
             # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
