@@ -817,8 +817,7 @@ def main():
         # Precompute model_input ONCE
         model_input_hrrr = data_loader_hrrr.get_model_input()
         model_input_gfs = data_loader_gfs.get_model_input()
-        model_input_hrrr = np.nan_to_num(model_input_hrrr, nan=0.0)
-        model_input_gfs = np.nan_to_num(model_input_gfs, nan=0.0)
+
         pl_vars = data_loader_hrrr.metadata["pl_vars"]
         sfc_vars = data_loader_hrrr.metadata["sfc_vars"]
         levels = data_loader_hrrr.metadata["levels"]

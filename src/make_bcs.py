@@ -219,7 +219,10 @@ def process_single_lead_hour(args):
                 mean = float(np.nanmean(proc_vals))
                 std = float(np.nanstd(proc_vals))
             norm_vals = preprocessor.normalize(proc_vals, mean, std)
-            norm_vals[np.isnan(norm_vals)] = 0
+            fillv = 0
+            if isinstance(norm_vals, np.ma.MaskedArray):
+                norm_vals = norm_vals.filled(fillv)
+            norm_vals[np.isnan(norm_vals)] = fillv
             logger.info(f"Variable {mapping['cfg']}-{l_idx}: mean {mean} std {std} min {np.min(proc_vals)} max {np.max(proc_vals)}: mean {np.mean(norm_vals)}, std {np.std(norm_vals)} min {np.min(norm_vals)}, max {np.max(norm_vals)}")
             normalized_pl.append(norm_vals)
 
@@ -327,7 +330,10 @@ def process_single_lead_hour(args):
             var_std = float(np.nanstd(proc_vals))
 
         norm_vals = preprocessor.normalize(proc_vals, var_mean, var_std)
-        norm_vals[np.isnan(norm_vals)] = 0
+        fillv = 0
+        if isinstance(norm_vals, np.ma.MaskedArray):
+            norm_vals = norm_vals.filled(fillv)
+        norm_vals[np.isnan(norm_vals)] = fillv
         logger.info(f"Variable {mapping['cfg']}: mean {var_mean} std {var_std} min {np.min(proc_vals)} max {np.max(proc_vals)}: mean {np.mean(norm_vals)}, std {np.std(norm_vals)} min {np.min(norm_vals)}, max {np.max(norm_vals)}")
         normalized_sfc.append(norm_vals)
         raw_sfc.append(hrrr_vals)
