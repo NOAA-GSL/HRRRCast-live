@@ -51,6 +51,9 @@ GRIB_PARAM_MAP = {
     "D2M":     (0, 0, 6, 103),  # dewpoint at 2m
     "R2M":     (0, 1, 1, 103),  # RH at 2m
     "TCDC":    (0, 6, 1, 10),   # total cloud cover, entire atmosphere
+    "LCDC":    (0, 6, 3, 214),  # low cloud cover, entire atmosphere
+    "MCDC":    (0, 6, 4, 224),  # medium cloud cover, entire atmosphere
+    "HCDC":    (0, 6, 5, 234),  # high cloud cover, entire atmosphere
     "VIS":     (0, 19, 0, 1),   # visibility at surface
     "APCP":    (0, 1, 8, 1),    # total precipitation at surface
     "HGTCC":   (0, 6, 13, 1),   # cloud ceiling height (approx)
@@ -273,6 +276,13 @@ class Netcdf2Grib:
             return 103, 10.0
         if var_name in ("UGRD80M", "VGRD80M"):
             return 103, 80.0
+        # Cloud layer specific surface types
+        if var_name == "LCDC":
+            return 214, None  # low cloud layer
+        if var_name == "MCDC":
+            return 224, None  # middle cloud layer
+        if var_name == "HCDC":
+            return 234, None  # high cloud layer
         # Entire atmosphere
         if var_name in ("TCDC", "REFC"):
             return 10, None

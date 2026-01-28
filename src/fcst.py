@@ -541,8 +541,10 @@ class WeatherForecaster:
             "UGRD80M": (-100, 100),
             "VGRD80M": (-100, 100),
             "D2M":     (180, 340),
-            "R2M":     (0, 100),
             "TCDC":    (0, 100),
+            "LCDC":    (0, 100),
+            "MCDC":    (0, 100),
+            "HCDC":    (0, 100),
             "VIS":     (0, 100000),
             "APCP":    (0, 500),
             "HGTCC":   (0, 20000),
@@ -712,7 +714,7 @@ class WeatherForecaster:
             history[hour] = {"step": step, "from": from_hour}
 
             # date encoding
-            date_encoding = self.date_encoding_tensor(init_datetime, from_hour)
+            date_encoding = self.date_encoding_tensor(init_datetime, hour)
             lead_encoding = tf.fill(
                 tf.concat([tf.shape(X)[:-1], [1]], axis=0),
                 tf.cast(step / 6.0, tf.float32),
