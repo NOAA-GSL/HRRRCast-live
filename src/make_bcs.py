@@ -32,7 +32,6 @@ from utils import setup_logging
 from transform import (
     log_transform_array,
     neg_log_transform_array,
-    DEFAULT_LOG_EPS,
 )
 
 logger = None
@@ -70,7 +69,6 @@ class WeatherPreprocessConfig:
 
           # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
-            "GFS-SPFH",
             "GFS-VIS",
             "GFS-APCP",
             "GFS-HGTCC",
@@ -206,24 +204,32 @@ def process_single_lead_hour(args):
 
             # Apply log transforms where configured
             if cfg_name in config.LOG_TRANSFORM_VARS:
-                proc_vals = log_transform_array(hrrr_vals, eps=DEFAULT_LOG_EPS)
+                proc_vals = log_transform_array(hrrr_vals)
             elif cfg_name in config.NEG_LOG_TRANSFORM_VARS:
-                proc_vals = neg_log_transform_array(hrrr_vals, eps=DEFAULT_LOG_EPS)
+                proc_vals = neg_log_transform_array(hrrr_vals)
             else:
                 proc_vals = hrrr_vals
 
             if stats is not None and l_idx < stats.shape[1]:
-                mean = float(stats[0, l_idx])
-                std = float(stats[1, l_idx])
+                stat_mean = float(stats[0, l_idx])
+                stat_std = float(stats[1, l_idx])
+                stat_min = float(stats[2, l_idx]) if stats.shape[0] > 2 else np.nan
+                stat_max = float(stats[3, l_idx]) if stats.shape[0] > 3 else np.nan
             else:
-                mean = float(np.nanmean(proc_vals))
-                std = float(np.nanstd(proc_vals))
-            norm_vals = preprocessor.normalize(proc_vals, mean, std)
-            fillv = 0
+                stat_mean = float(np.nanmean(proc_vals))
+                stat_std = float(np.nanstd(proc_vals))
+                stat_min = np.nan
+                stat_max = np.nan
+            norm_vals = preprocessor.normalize(proc_vals, stat_mean, stat_std)
+            fillv = (stat_max - stat_mean) / stat_std
             if isinstance(norm_vals, np.ma.MaskedArray):
                 norm_vals = norm_vals.filled(fillv)
             norm_vals[np.isnan(norm_vals)] = fillv
-            logger.info(f"Variable {mapping['cfg']}-{l_idx}: mean {mean} std {std} min {np.min(proc_vals)} max {np.max(proc_vals)}: mean {np.mean(norm_vals)}, std {np.std(norm_vals)} min {np.min(norm_vals)}, max {np.max(norm_vals)}")
+            logger.info(
+                f"Variable {mapping['cfg']}-{l_idx}: stats mean {stat_mean} std {stat_std} min {stat_min} max {stat_max}; "
+                f"data min {np.min(proc_vals)} max {np.max(proc_vals)}; "
+                f"norm min {np.min(norm_vals)} max {np.max(norm_vals)}"
+            )
             normalized_pl.append(norm_vals)
 
     grbs.close()
@@ -309,9 +315,9 @@ def process_single_lead_hour(args):
 
         # Transform if needed
         if mapping['cfg'] in config.LOG_TRANSFORM_VARS:
-            proc_vals = log_transform_array(hrrr_vals, eps=DEFAULT_LOG_EPS)
+            proc_vals = log_transform_array(hrrr_vals)
         elif mapping['cfg'] in config.NEG_LOG_TRANSFORM_VARS:
-            proc_vals = neg_log_transform_array(hrrr_vals, eps=DEFAULT_LOG_EPS)
+            proc_vals = neg_log_transform_array(hrrr_vals)
         else:
             proc_vals = hrrr_vals
 
@@ -319,22 +325,32 @@ def process_single_lead_hour(args):
         if mapping['cfg'] in ds_norm.variables:
             stats = ds_norm[mapping['cfg']].values
             if stats.shape[0] >= 2:
-                var_mean = float(np.nanmean(stats[0]))
-                var_std = float(np.nanmean(stats[1]))
+                stat_mean = float(np.nanmean(stats[0]))
+                stat_std = float(np.nanmean(stats[1]))
+                stat_min = float(np.nanmean(stats[2])) if stats.shape[0] > 2 else np.nan
+                stat_max = float(np.nanmean(stats[3])) if stats.shape[0] > 3 else np.nan
             else:
-                var_mean = float(np.nanmean(proc_vals))
-                var_std = float(np.nanstd(proc_vals))
+                stat_mean = float(np.nanmean(proc_vals))
+                stat_std = float(np.nanstd(proc_vals))
+                stat_min = np.nan
+                stat_max = np.nan
         else:
-            logger.warning(f"No normalization stats for surface var {mapping['norm']}; computing from data")
-            var_mean = float(np.nanmean(proc_vals))
-            var_std = float(np.nanstd(proc_vals))
+            logger.warning(f"No normalization stats for surface var {mapping['cfg']}; computing from data")
+            stat_mean = float(np.nanmean(proc_vals))
+            stat_std = float(np.nanstd(proc_vals))
+            stat_min = np.nan
+            stat_max = np.nan
 
-        norm_vals = preprocessor.normalize(proc_vals, var_mean, var_std)
-        fillv = 0
+        norm_vals = preprocessor.normalize(proc_vals, stat_mean, stat_std)
+        fillv = (stat_max - stat_mean) / stat_std
         if isinstance(norm_vals, np.ma.MaskedArray):
             norm_vals = norm_vals.filled(fillv)
         norm_vals[np.isnan(norm_vals)] = fillv
-        logger.info(f"Variable {mapping['cfg']}: mean {var_mean} std {var_std} min {np.min(proc_vals)} max {np.max(proc_vals)}: mean {np.mean(norm_vals)}, std {np.std(norm_vals)} min {np.min(norm_vals)}, max {np.max(norm_vals)}")
+        logger.info(
+            f"Variable {mapping['cfg']}: stats mean {stat_mean} std {stat_std} min {stat_min} max {stat_max}; "
+            f"data min {np.min(proc_vals)} max {np.max(proc_vals)}; "
+            f"norm min {np.min(norm_vals)} max {np.max(norm_vals)}"
+        )
         normalized_sfc.append(norm_vals)
         raw_sfc.append(hrrr_vals)
 

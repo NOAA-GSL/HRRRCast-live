@@ -27,7 +27,6 @@ import utils
 from transform import (
     log_transform_array,
     neg_log_transform_array,
-    DEFAULT_LOG_EPS,
 )
 
 from utils import setup_logging
@@ -55,7 +54,6 @@ class WeatherPreprocessConfig:
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
-            "SPFH",
             "VIS",
             "APCP",
             "HGTCC",
@@ -111,8 +109,9 @@ class GRIBPreprocessor:
         """Load and normalize pressure-level variables using per-variable stats.
 
         The normalization file now contains separate variables (UGRD, VGRD, VVEL, TMP, HGT, SPFH)
-        each with shape (stat, level). We apply log transforms (e.g., SPFH) before normalization
-        consistent with transform.log_transform_dataset logic.
+        each with shape (stat, level) where stat is ordered [mean, std, min, max]. We apply log
+        transforms (e.g., SPFH) before normalization consistent with transform.log_transform_dataset
+        logic.
         """
         if not os.path.exists(pres_file):
             raise FileNotFoundError(f"Pressure file not found: {pres_file}")
@@ -140,9 +139,9 @@ class GRIBPreprocessor:
                 if norm_name not in ds_norm.variables:
                     logger.warning(f"Normalization stats for {norm_name} not found; skipping variable {var}")
                     continue
-                stats = ds_norm[norm_name].values  # shape (2, nLevels)
+                stats = ds_norm[norm_name].values  # shape (stat, nLevels)
                 if stats.shape[0] < 2:
-                    logger.error(f"Stats for {norm_name} malformed (expected first dim size 2), skipping")
+                    logger.error(f"Stats for {norm_name} malformed (expected first dim size >=2), skipping")
                     continue
 
                 selected = grbs.select(shortName=var, level=self.config.levels)
@@ -161,9 +160,9 @@ class GRIBPreprocessor:
 
                     # Apply log / signed-log transforms if configured (e.g., SPFH)
                     if norm_name in self.config.LOG_TRANSFORM_VARS:
-                        vals_proc = log_transform_array(vals, eps=DEFAULT_LOG_EPS)
+                        vals_proc = log_transform_array(vals)
                     elif norm_name in self.config.NEG_LOG_TRANSFORM_VARS:
-                        vals_proc = neg_log_transform_array(vals, eps=DEFAULT_LOG_EPS)
+                        vals_proc = neg_log_transform_array(vals)
                     else:
                         vals_proc = vals
 
@@ -171,13 +170,20 @@ class GRIBPreprocessor:
                     if l_idx >= stats.shape[1]:
                         logger.error(f"Level index {l_idx} out of bounds for stats {norm_name} (shape {stats.shape})")
                         continue
-                    mean, std = float(stats[0, l_idx]), float(stats[1, l_idx])
-                    norm_vals = self.normalize(vals_proc, mean, std)
-                    fillv = 0
+                    stat_mean = float(stats[0, l_idx])
+                    stat_std = float(stats[1, l_idx])
+                    stat_min = float(stats[2, l_idx]) if stats.shape[0] > 2 else np.nan
+                    stat_max = float(stats[3, l_idx]) if stats.shape[0] > 3 else np.nan
+                    norm_vals = self.normalize(vals_proc, stat_mean, stat_std)
+                    fillv = (stat_max - stat_mean) / stat_std
                     if isinstance(norm_vals, np.ma.MaskedArray):
                         norm_vals = norm_vals.filled(fillv)
                     norm_vals[np.isnan(norm_vals)] = fillv
-                    logger.info(f"Variable {var}: mean {mean} std {std} min {np.min(vals_proc)} max {np.max(vals_proc)}: mean {np.mean(norm_vals)}, std {np.std(norm_vals)} min {np.min(norm_vals)}, max {np.max(norm_vals)}")
+                    logger.info(
+                        f"Variable {var}: stats mean {stat_mean} std {stat_std} min {stat_min} max {stat_max}; "
+                        f"data min {np.min(vals_proc)} max {np.max(vals_proc)}; "
+                        f"norm min {np.min(norm_vals)} max {np.max(norm_vals)}"
+                    )
                     normalized_vals.append(norm_vals)
 
             grbs.close()
@@ -275,29 +281,37 @@ class GRIBPreprocessor:
                     vals = prev_apcp_vals
                 
                 if var in self.config.LOG_TRANSFORM_VARS:
-                    vals_proc = log_transform_array(vals, eps=DEFAULT_LOG_EPS)
+                    vals_proc = log_transform_array(vals)
                 elif var in self.config.NEG_LOG_TRANSFORM_VARS:
-                    vals_proc = neg_log_transform_array(vals, eps=DEFAULT_LOG_EPS)
+                    vals_proc = neg_log_transform_array(vals)
                 else:
                     vals_proc = vals
 
                 # Obtain mean/std from normalization file if present; else compute on-the-fly
                 if var in ds_norm.variables:
                     stats = ds_norm[var].values
-                    # stats shape: (2, ...). Reduce any extra dimensions via nanmean
-                    var_mean = float(np.nanmean(stats[0]))
-                    var_std = float(np.nanmean(stats[1]))
+                    # stats shape: (stat, ...). Reduce any extra dimensions via nanmean
+                    stat_mean = float(np.nanmean(stats[0]))
+                    stat_std = float(np.nanmean(stats[1]))
+                    stat_min = float(np.nanmean(stats[2])) if stats.shape[0] > 2 else np.nan
+                    stat_max = float(np.nanmean(stats[3])) if stats.shape[0] > 3 else np.nan
                 else:
                     logger.warning(f"Normalization stats for {var} not found in {norm_file}; computing from data")
-                    var_mean = float(np.nanmean(vals_proc))
-                    var_std = float(np.nanstd(vals_proc))
+                    stat_mean = float(np.nanmean(vals_proc))
+                    stat_std = float(np.nanstd(vals_proc))
+                    stat_min = np.nan
+                    stat_max = np.nan
 
-                norm_vals = self.normalize(vals_proc, var_mean, var_std)
-                fillv = 0
+                norm_vals = self.normalize(vals_proc, stat_mean, stat_std)
+                fillv = (stat_max - stat_mean) / stat_std
                 if isinstance(norm_vals, np.ma.MaskedArray):
                     norm_vals = norm_vals.filled(fillv)
                 norm_vals[np.isnan(norm_vals)] = fillv
-                logger.info(f"Variable {var}: mean {var_mean}, std {var_std}, min {np.min(vals_proc)}, max {np.max(vals_proc)} : mean {np.mean(norm_vals)}, std {np.std(norm_vals)} min {np.min(norm_vals)}, max {np.max(norm_vals)}")
+                logger.info(
+                    f"Variable {var}: stats mean {stat_mean}, std {stat_std}, min {stat_min}, max {stat_max}; "
+                    f"data min {np.min(vals_proc)}, max {np.max(vals_proc)}; "
+                    f"norm min {np.min(norm_vals)}, max {np.max(norm_vals)}"
+                )
                 norm_arrays.append(norm_vals)
 
                 if var in self.config.consts:

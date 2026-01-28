@@ -1,6 +1,96 @@
 import tensorflow as tf
 from tensorflow.keras.utils import register_keras_serializable, serialize_keras_object, deserialize_keras_object
-from tensorflow.keras.layers import Layer
+from tensorflow.keras.layers import Layer, Conv2D
+
+L2_REG = tf.keras.regularizers.L2(5e-5)
+K_INIT = "glorot_uniform"
+
+@register_keras_serializable()
+class SpatialGroupedConv2D(Layer):
+    """
+    Spatially grouped Conv2D that splits the input spatially into overlapping tiles,
+    applies a shared Conv2D to each tile, and stitches them back together.
+    Produces identical output to a single full-image Conv2D (with padding='same').
+
+    Args:
+        filters (int): Number of output filters for each convolution.
+        kernel_size (int or tuple): Size of the convolution kernel.
+        groups_h (int): Number of groups to split along the height axis.
+        groups_w (int): Number of groups to split along the width axis.
+        **kwargs: Additional keyword arguments for Conv2D (e.g., activation, kernel_regularizer).
+    """
+
+    def __init__(self, filters, kernel_size, groups_h=1, groups_w=1, **kwargs):
+        super().__init__()
+        self.filters = filters
+        self.kernel_size = kernel_size
+        self.groups_h = groups_h
+        self.groups_w = groups_w
+        self.conv_kwargs = kwargs  # for Conv2D
+
+    def build(self, input_shape):
+        # Single shared Conv2D layer across all spatial tiles
+        self.conv = Conv2D(
+            self.filters,
+            self.kernel_size,
+            padding='same',
+            use_bias=False,
+            kernel_initializer=K_INIT,
+            kernel_regularizer=L2_REG,
+            **self.conv_kwargs,
+        )
+
+    def call(self, x):
+        k_h = k_w = self.kernel_size
+        pad_h, pad_w = k_h // 2, k_w // 2  # overlap size for SAME padding
+
+        H, W = tf.shape(x)[1], tf.shape(x)[2]
+        tile_h = tf.cast(tf.math.ceil(tf.cast(H, tf.float32) / self.groups_h), tf.int32)
+        tile_w = tf.cast(tf.math.ceil(tf.cast(W, tf.float32) / self.groups_w), tf.int32)
+
+        outputs = []
+        for i in range(self.groups_h):
+            row_outputs = []
+            for j in range(self.groups_w):
+                # Compute tile boundaries with overlap
+                y0 = tf.maximum(0, i * tile_h - pad_h)
+                y1 = tf.minimum(H, (i + 1) * tile_h + pad_h)
+                x0 = tf.maximum(0, j * tile_w - pad_w)
+                x1 = tf.minimum(W, (j + 1) * tile_w + pad_w)
+
+                tile = x[:, y0:y1, x0:x1, :]
+                tile_conv = self.conv(tile)
+
+                # Crop overlap so tiles fit perfectly when concatenated
+                crop_top = pad_h if i > 0 else 0
+                crop_bottom = pad_h if i < self.groups_h - 1 else 0
+                crop_left = pad_w if j > 0 else 0
+                crop_right = pad_w if j < self.groups_w - 1 else 0
+
+                if any([crop_top, crop_bottom, crop_left, crop_right]):
+                    tile_conv = tile_conv[
+                        :,
+                        crop_top or 0 : tf.shape(tile_conv)[1] - (crop_bottom or 0),
+                        crop_left or 0 : tf.shape(tile_conv)[2] - (crop_right or 0),
+                        :
+                    ]
+
+                row_outputs.append(tile_conv)
+            outputs.append(tf.concat(row_outputs, axis=2))
+        return tf.concat(outputs, axis=1)
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], input_shape[1], input_shape[2], self.filters)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "filters": self.filters,
+            "kernel_size": self.kernel_size,
+            "groups_h": self.groups_h,
+            "groups_w": self.groups_w,
+        })
+        return config
 
 @register_keras_serializable()
 class ChannelPoolAvg(Layer):
@@ -40,7 +130,10 @@ class RecomputeSubModel(tf.keras.layers.Layer):
 
     @tf.function(jit_compile=False)
     def call(self, inputs):
-        return tf.recompute_grad(lambda: self.submodel(inputs))()
+        return tf.recompute_grad(lambda : self.submodel(inputs))()
+
+    def compute_output_shape(self, input_shape):
+        return self.submodel.compute_output_shape(input_shape)
 
     def get_config(self):
         config = super().get_config()
@@ -73,14 +166,14 @@ class TimeCondLayer(Layer):
         def per_sample_fn(sample):
             time_feats = tf.gather(sample, self.time_mask, axis=-1)  # (H, W, 2)
             d = tf.reduce_mean(time_feats, axis=[0, 1])  # (2,)
-            
+
             if not self.use_crps:
                 return d  # Case A: full d vector (lead time + ens_id)
-            
+
             lead_time = d[-1:]  # (1,)
             if not self.use_noise:
                 return lead_time  # Case B: only lead_time
-            
+
             # Case C: CRPS + noise
             ens_id = tf.cast(d[0] * 100, tf.int32)  # scalar int32
             seed = tf.stack([ens_id, ens_id ^ 0x9E3779B9])  # (2,)
@@ -91,7 +184,7 @@ class TimeCondLayer(Layer):
 
     def compute_output_shape(self, input_shape):
         if not self.use_crps:
-            return (input_shape[0], 2)     # Case A
+            return (input_shape[0], len(self.time_mask))     # Case A
         elif not self.use_noise:
             return (input_shape[0], 1)     # Case B
         else:
@@ -169,3 +262,15 @@ class UnpadLayer(Layer):
         h = input_shape[1] - self.padding[0][0] - self.padding[0][1]
         w = input_shape[2] - self.padding[1][0] - self.padding[1][1]
         return (input_shape[0], h, w, input_shape[3])
+
+@register_keras_serializable()
+class CastLayer(Layer):
+    def __init__(self, dtype, **kwargs):
+        super().__init__(**kwargs)
+        self.target_dtype = dtype
+
+    def call(self, inputs):
+        return tf.cast(inputs, self.target_dtype)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape

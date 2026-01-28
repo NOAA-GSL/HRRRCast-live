@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import tensorflow as tf
 import xarray as xr
+import pandas as pd
 from tqdm import tqdm
 
 from nc2grib import Netcdf2Grib
@@ -43,7 +44,6 @@ from diffusion_params import (
 from transform import (
     inverse_log_transform_array,
     inverse_neg_log_transform_array,
-    DEFAULT_LOG_EPS,
 )
 import utils
 from utils import setup_logging
@@ -186,21 +186,32 @@ class WeatherForecaster:
         self.members = members
         self.use_diffusion = use_diffusion
 
+        # log-transform variables list
+        self.LOG_TRANSFORM_VARS = [
+            "VIS",
+            "APCP",
+            "HGTCC",
+            "CAPE",
+        ]
+        self.NEG_LOG_TRANSFORM_VARS = [
+            "CIN",
+        ]
+
         # Derive dynamic channel counts if not provided
         pl_vars = self.metadata["pl_vars"]
         sfc_vars = self.metadata["sfc_vars"]
         levels = self.metadata["levels"]
         default_predicted = len(pl_vars) * len(levels) + len(sfc_vars)
-        input_shape = data_loader_hrrr.get_model_input().shape
-        total_hrrr = input_shape[-1]
-        nlat, nlon = input_shape[1], input_shape[2] 
+        self.input_shape = data_loader_hrrr.get_model_input().shape
+        hrrr_channels = self.input_shape[-1]
+        nlat, nlon = self.input_shape[1], self.input_shape[2] 
 
         if predicted_channels is None:
             predicted_channels = default_predicted
         if gfs_channels is None:
             gfs_channels = data_loader_gfs.get_model_input().shape[-1]
         if static_channels is None:
-            static_channels = max(total_hrrr - predicted_channels, 0)
+            static_channels = max(hrrr_channels - predicted_channels, 0)
 
         self.predicted_channels = predicted_channels
         self.gfs_channels = gfs_channels
@@ -220,17 +231,30 @@ class WeatherForecaster:
             raise
 
         # set member noise for all members
-        if self.use_diffusion:
-            self.member_noise = {}
-            for member in self.members:
+        self.member_noise = {}
+        for member in self.members:
+            if self.use_diffusion:
                 noise = tf.random.stateless_normal(
                     shape=(nlat, nlon, self.predicted_channels),
                     dtype=tf.float32,
                     seed=[member, 0]
                 )
                 noise = tf.expand_dims(noise, axis=0)
-                self.member_noise[member] = noise
-    
+            else:
+                noise = tf.random.stateless_uniform(
+                    shape=(),
+                    minval=0.0,
+                    maxval=1.0,
+                    dtype=tf.float32,
+                    seed=[member, 0]
+                )
+                noise = tf.tile(
+                    tf.reshape(noise, (1, 1, 1, 1)),
+                    [1, nlat, nlon, 1]
+                )
+            self.member_noise[member] = noise
+
+
 
     def _init_channel_stats(self, ds_norm: xr.Dataset):
         """Build flattened mean/std vectors matching channel ordering in preprocessing.
@@ -242,62 +266,112 @@ class WeatherForecaster:
         by the diffusion / deterministic heads (first 74 channels). We still include them
         at the tail of the vectors if present so slicing remains safe.
         """
-        pl_vars = self.metadata['pl_vars']  # ["UGRD", ...]
+        pl_vars = self.metadata['pl_vars']
         sfc_vars = self.metadata['sfc_vars']
         levels = self.metadata['levels']
 
-        means = []
-        stds = []
+        fallback_mins_raw, fallback_maxs_raw = self.get_variable_bounds()
+
+        raw_means: List[float] = []
+        raw_stds: List[float] = []
+        raw_mins: List[float] = []
+        raw_maxs: List[float] = []
+        channel_idx = 0
 
         # Pressure-level variables
-        # Preprocessing loops over raw GRIB shortNames: u,v,w,t,gh,q corresponding to pl_vars order below
-        pl_order = ["UGRD", "VGRD", "VVEL", "TMP", "HGT", "SPFH"]
-        for var in pl_order:
+        for var in pl_vars:
             if var not in ds_norm.variables:
                 # Fallback: fill with zeros/ones to avoid crash
                 logger.warning(f"Normalization stats missing for pressure var {var}; using mean=0,std=1")
-                means.extend([0.0] * len(levels))
-                stds.extend([1.0] * len(levels))
+                for _ in levels:
+                    raw_means.append(0.0)
+                    raw_stds.append(1.0)
+                    raw_mins.append(float(fallback_mins_raw[channel_idx]))
+                    raw_maxs.append(float(fallback_maxs_raw[channel_idx]))
+                    channel_idx += 1
                 continue
-            stats = ds_norm[var].values  # shape (2, level)
+
+            stats = ds_norm[var].values  # shape (stat, level)
             # Safeguard shape
             if stats.shape[0] < 2:
                 logger.warning(f"Stats for {var} malformed; using zeros/ones")
-                means.extend([0.0] * len(levels))
-                stds.extend([1.0] * len(levels))
+                for _ in levels:
+                    raw_means.append(0.0)
+                    raw_stds.append(1.0)
+                    raw_mins.append(float(fallback_mins_raw[channel_idx]))
+                    raw_maxs.append(float(fallback_maxs_raw[channel_idx]))
+                    channel_idx += 1
                 continue
+
             # If level dimension differs, broadcast or truncate
             nlev_stats = stats.shape[1] if stats.ndim > 1 else 1
             for i, lvl in enumerate(levels):
                 if i < nlev_stats:
-                    means.append(float(stats[0, i]))
-                    stds.append(float(stats[1, i]))
+                    stat_mean = float(stats[0, i])
+                    stat_std = float(stats[1, i]) if float(stats[1, i]) != 0 else 1.0
+                    stat_min = float(stats[2, i]) if stats.shape[0] > 2 and i < nlev_stats else float(fallback_mins_raw[channel_idx])
+                    stat_max = float(stats[3, i]) if stats.shape[0] > 3 and i < nlev_stats else float(fallback_maxs_raw[channel_idx])
+                    if np.isnan(stat_min):
+                        stat_min = float(fallback_mins_raw[channel_idx])
+                    if np.isnan(stat_max):
+                        stat_max = float(fallback_maxs_raw[channel_idx])
                 else:
-                    means.append(0.0)
-                    stds.append(1.0)
+                    stat_mean = 0.0
+                    stat_std = 1.0
+                    stat_min = float(fallback_mins_raw[channel_idx])
+                    stat_max = float(fallback_maxs_raw[channel_idx])
+
+                raw_means.append(stat_mean)
+                raw_stds.append(stat_std)
+                raw_mins.append(stat_min)
+                raw_maxs.append(stat_max)
+                channel_idx += 1
 
         # Surface variables (single value per variable)
         for var in sfc_vars:
             if var not in ds_norm.variables:
                 logger.warning(f"Normalization stats missing for surface var {var}; using mean=0,std=1")
-                means.append(0.0)
-                stds.append(1.0)
+                raw_means.append(0.0)
+                raw_stds.append(1.0)
+                raw_mins.append(float(fallback_mins_raw[channel_idx]))
+                raw_maxs.append(float(fallback_maxs_raw[channel_idx]))
+                channel_idx += 1
                 continue
-            stats = ds_norm[var].values  # expect (2, ...) first dim=stat
+
+            stats = ds_norm[var].values  # expect (stat, ...)
             if stats.shape[0] < 2:
                 logger.warning(f"Stats for {var} malformed; using mean=0,std=1")
-                means.append(0.0)
-                stds.append(1.0)
+                raw_means.append(0.0)
+                raw_stds.append(1.0)
+                raw_mins.append(float(fallback_mins_raw[channel_idx]))
+                raw_maxs.append(float(fallback_maxs_raw[channel_idx]))
+                channel_idx += 1
                 continue
-            # Reduce any remaining dims to scalar with nanmean
-            means.append(float(np.nanmean(stats[0])))
-            stds.append(float(np.nanmean(stats[1])) if np.nanmean(stats[1]) != 0 else 1.0)
 
-        self.channel_means = np.array(means, dtype=np.float32)
-        self.channel_stds = np.array(stds, dtype=np.float32)
-        vmin, vmax = self.get_variable_bounds()
-        self.channel_mins = (vmin - self.channel_means) / self.channel_stds
-        self.channel_maxs = (vmax - self.channel_means) / self.channel_stds
+            stat_mean = float(np.nanmean(stats[0]))
+            stat_std = float(np.nanmean(stats[1])) if np.nanmean(stats[1]) != 0 else 1.0
+            stat_min = float(np.nanmean(stats[2])) if stats.shape[0] > 2 else float(fallback_mins_raw[channel_idx])
+            stat_max = float(np.nanmean(stats[3])) if stats.shape[0] > 3 else float(fallback_maxs_raw[channel_idx])
+            if np.isnan(stat_min):
+                stat_min = float(fallback_mins_raw[channel_idx])
+            if np.isnan(stat_max):
+                stat_max = float(fallback_maxs_raw[channel_idx])
+
+            raw_means.append(stat_mean)
+            raw_stds.append(stat_std)
+            raw_mins.append(stat_min)
+            raw_maxs.append(stat_max)
+            channel_idx += 1
+
+        self.raw_means = np.array(raw_means, dtype=np.float32)
+        self.raw_stds = np.array(raw_stds, dtype=np.float32)
+        self.raw_mins = np.array(raw_mins, dtype=np.float32)
+        self.raw_maxs = np.array(raw_maxs, dtype=np.float32)
+
+        self.channel_means = self.raw_means
+        self.channel_stds = self.raw_stds
+        self.channel_mins = (self.raw_mins - self.channel_means) / self.channel_stds
+        self.channel_maxs = (self.raw_maxs - self.channel_means) / self.channel_stds
 
     def denormalize(self, output: np.ndarray) -> np.ndarray:
         """Convert model output back to physical units using stored per-channel stats.
@@ -322,18 +396,16 @@ class WeatherForecaster:
         variables. Safe to call when variables are absent.
         """
         try:
-            log_vars = {"SPFH", "VIS", "APCP", "HGTCC", "CAPE"}
-            neg_log_vars = {"CIN"}
             applied = []
-            for var in log_vars:
+            for var in self.LOG_TRANSFORM_VARS:
                 if var in ds.variables:
                     data_arr = ds[var].values
-                    ds[var].values[:] = inverse_log_transform_array(data_arr, eps=DEFAULT_LOG_EPS)
+                    ds[var].values[:] = inverse_log_transform_array(data_arr)
                     applied.append(var)
-            for var in neg_log_vars:
+            for var in self.NEG_LOG_TRANSFORM_VARS:
                 if var in ds.variables:
                     data_arr = ds[var].values
-                    ds[var].values[:] = inverse_neg_log_transform_array(data_arr, eps=DEFAULT_LOG_EPS)
+                    ds[var].values[:] = inverse_neg_log_transform_array(data_arr)
                     applied.append(var)
             if applied:
                 logger.info(f"Applied inverse transforms to: {', '.join(applied)}")
@@ -448,45 +520,6 @@ class WeatherForecaster:
             except Exception:
                 pass
         converter.save_grib2(init_datetime, ds_hour, member, outdir)
-    
-    def predict(self, model: ForecastModel, X: tf.Tensor, member: int) -> tf.Tensor:
-        if self.use_diffusion:
-            num_output_channels = self.predicted_channels
-            start = self.predicted_channels + self.gfs_channels
-
-            # start from complete gaussian noise
-            Xn = self.member_noise[member]
-
-            # iterate over diffusion steps
-            for t_ in tqdm(range(NUM_INFERENCE_STEPS - 1)):
-                ti = NUM_INFERENCE_STEPS - 1 - t_
-                t = INFERENCE_STEPS[ti]
-
-                # set the correct time embedding
-                step_encoding = tf.fill(
-                    tf.concat([tf.shape(X)[:-1], [1]], axis=0),
-                    t / NUM_DIFFUSION_STEPS,
-                )
-                X = tf.concat(
-                    [
-                        X[:, :, :, :start],
-                        Xn,
-                        X[:, :, :, start + num_output_channels :-2],
-                        step_encoding,
-                        X[:, :, :, -1:],
-                    ],
-                    axis=-1,
-                )
-
-                # predict total noise
-                x_0 = model.predict(X)
-                epsilon_t = compute_epsilon(Xn, x_0, t)
-                Xn = ddim(Xn, epsilon_t, ti, seed=member)
-
-            return Xn
-        else:
-            return model.predict(X)
-
 
     def get_variable_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -516,27 +549,116 @@ class WeatherForecaster:
             "CAPE":    (0, 7000),
             "CIN":     (-2000, 0),
         }
-        eps = 1e-3
         mins = []
         maxs = []
-        log_vars = {"SPFH", "VIS", "APCP", "HGTCC", "CAPE"}
-        neg_log_vars = {"CIN"}
         num_levels = len(self.metadata['levels'])
         # Merge 3D and 2D targets into a single loop
         for i, var in enumerate(raw_bounds):
             vmin, vmax = raw_bounds[var]
-            if var in log_vars:
-                vmin = np.log(vmin + eps) - np.log(eps)
-                vmax = np.log(vmax + eps) - np.log(eps)
-            elif var in neg_log_vars:
-                vmin = np.sign(vmin) * (np.log(abs(vmin) + eps) - np.log(eps))
-                vmax = np.sign(vmax) * (np.log(abs(vmax) + eps) - np.log(eps))
+            if var in self.LOG_TRANSFORM_VARS:
+                vmin = np.log1p(vmin)
+                vmax = np.log1p(vmax)
+            elif var in self.NEG_LOG_TRANSFORM_VARS:
+                vmin = np.sign(vmin) * np.log1p(abs(vmin))
+                vmax = np.sign(vmax) * np.log1p(abs(vmax))
             # Repeat for each pressure level if 3D, else once
             n_levels = num_levels if i < 6 else 1
             for _ in range(n_levels):
                 mins.append(vmin)
                 maxs.append(vmax)
         return np.array(mins, dtype=np.float32), np.array(maxs, dtype=np.float32)
+
+
+    @staticmethod
+    def compute_time_features(init_times_np, lead_times_np):
+        # Ensure inputs are array-like
+        if not isinstance(init_times_np, (list, np.ndarray)):
+            init_times_np = [init_times_np]
+        if lead_times_np is not None and not isinstance(lead_times_np, (list, np.ndarray)):
+            lead_times_np = [lead_times_np]
+        # compute valid times
+        time_coord = pd.to_datetime(init_times_np)
+        if lead_times_np is not None:
+            time_coord += pd.to_timedelta(lead_times_np, unit='h')
+        # compute cyclical features
+        hours = pd.DatetimeIndex(time_coord).hour.astype(np.float32)
+        doy = pd.DatetimeIndex(time_coord).dayofyear.astype(np.float32)
+        # version masks
+        v4 = (time_coord >= np.datetime64("2021-03-23T00")).astype(np.float32)
+        v3 = ((time_coord >= np.datetime64("2018-07-12T00")) & (time_coord < np.datetime64("2021-03-23T00"))).astype(np.float32)
+        # Stack features into shape [B, 6]
+        features = np.stack([
+            np.sin(2 * np.pi * hours / 24.0).astype(np.float32),
+            np.cos(2 * np.pi * hours / 24.0).astype(np.float32),
+            np.sin(2 * np.pi * doy / 365.0).astype(np.float32),
+            np.cos(2 * np.pi * doy / 365.0).astype(np.float32),
+            v4.astype(np.float32),
+            v3.astype(np.float32),
+        ], axis=-1)
+        return features
+
+    def date_encoding_tensor(self, init_times_np, lead_times_np):
+        """Compute cyclical time encodings and HRRR version masks"""
+
+        def get_encoding_tensor(enc):
+            enc = tf.cast(enc, dtype=tf.float32)
+            batch_size, lat, lon = tf.shape(enc)[0], self.input_shape[1], self.input_shape[2]
+            enc = tf.reshape(enc, (batch_size, 1, 1, 6))
+            enc = tf.broadcast_to(enc, (batch_size, lat, lon, 6))
+            return enc
+
+        enc = self.compute_time_features(init_times_np, lead_times_np)
+        enc = get_encoding_tensor(enc)
+        return enc
+
+    def predict(self, model: ForecastModel, X: tf.Tensor, member: int) -> tf.Tensor:
+        if self.use_diffusion:
+            num_output_channels = self.predicted_channels
+            start = self.predicted_channels + self.gfs_channels
+
+            # start from complete gaussian noise
+            Xn = self.member_noise[member]
+
+            # iterate over diffusion steps
+            for t_ in tqdm(range(NUM_INFERENCE_STEPS - 1)):
+                ti = NUM_INFERENCE_STEPS - 1 - t_
+                t = INFERENCE_STEPS[ti]
+
+                # set the correct time embedding
+                step_encoding = tf.fill(
+                    tf.concat([tf.shape(X)[:-1], [1]], axis=0),
+                    tf.cast(t / NUM_DIFFUSION_STEPS, tf.float32),
+                )
+                X = tf.concat(
+                    [
+                        X[:, :, :, :start],
+                        Xn,
+                        X[:, :, :, start + num_output_channels :-2],
+                        step_encoding,
+                        X[:, :, :, -1:],
+                    ],
+                    axis=-1,
+                )
+
+                # predict total noise
+                x_0 = model.predict(X)
+                epsilon_t = compute_epsilon(Xn, x_0, t)
+                Xn = ddim(Xn, epsilon_t, ti, seed=member)
+
+            return Xn
+        else:
+            # set CRPS member
+            Xn = self.member_noise[member]
+            X = tf.concat(
+                [
+                    X[:, :, :, :-2],
+                    Xn,
+                    X[:, :, :, -1:]
+                ],
+                axis=-1,
+            )
+            y = model.predict(X)
+            return y
 
     def autoregressive_rollout(self, initial_input: np.ndarray, forcing_input: np.ndarray, model: ForecastModel, 
                              target_hour: int,
@@ -554,7 +676,6 @@ class WeatherForecaster:
         X = tf.convert_to_tensor(initial_input, dtype=tf.float32)
         
         # Track state_from_hour per member
-        num_members = len(self.members)
         state_from_hour = {
             member: tf.identity(X[0:1, :, :, :self.predicted_channels]) for member in self.members
         }
@@ -565,10 +686,7 @@ class WeatherForecaster:
         # Lazily fetch coordinates if writing outputs per hour
         lats = lons = None
         if write_per_hour:
-            try:
-                lats, lons = self.data_loader_hrrr.get_coordinates()
-            except Exception:
-                pass
+            lats, lons = self.data_loader_hrrr.get_coordinates()
 
         # Local helper to write outputs for any hour using shared context
         def write_hour_outputs(hour: int, data: np.ndarray, member: int) -> None:
@@ -593,22 +711,27 @@ class WeatherForecaster:
             step = hour - from_hour
             history[hour] = {"step": step, "from": from_hour}
 
+            # date encoding
+            date_encoding = self.date_encoding_tensor(init_datetime, from_hour)
+            lead_encoding = tf.fill(
+                tf.concat([tf.shape(X)[:-1], [1]], axis=0),
+                tf.cast(step / 6.0, tf.float32),
+            )
+
             # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
             X_base = tf.concat(
                 [
                     X[:, :, :, :self.predicted_channels],
                     forcing_input[hour-1:hour, :, :, :],
-                    X[:, :, :, start_pred_noise:-1],
-                    tf.fill(
-                        tf.concat([tf.shape(X)[:-1], [1]], axis=0),
-                        step / 6.0,
-                    ),
+                    X[:, :, :, start_pred_noise:-8],
+                    date_encoding,
+                    X[:, :, :, -2:-1],
+                    lead_encoding,
                 ],
                 axis=-1,
             )
 
             for member in self.members:
-
                 # update with new state_from_hour for this member
                 X_member = tf.concat(
                     [
@@ -620,25 +743,19 @@ class WeatherForecaster:
 
                 # Predict next-hour fields (predicted channels only)
                 y = self.predict(model, X_member, member)
-                y = tf.clip_by_value(y, self.channel_mins[:y.shape[-1]], self.channel_maxs[:y.shape[-1]])
-
-                # Apply REFC noise suppression: set reflectivity < 5 dBZ to 0 (operate in normalized space)
-                refc_channel = 122
-                refc = y[..., refc_channel]
-                refc = tf.where(refc < 0.05, 0.0, refc)
-                y = tf.concat([
-                    y[..., :refc_channel],
-                    tf.expand_dims(refc, axis=-1),
-                    y[..., refc_channel + 1:]
-                ], axis=-1)
-
-                # Write out per-hour products if requested
-                write_hour_outputs(hour, y.numpy(), member)
+                y = tf.clip_by_value(
+                    y,
+                    self.channel_mins[:y.shape[-1]],
+                    self.channel_maxs[:y.shape[-1]]
+                )
 
                 # When we reach a 6-hour boundary, update the reference 
                 # state for this member
                 if hour % 6 == 0:
                     state_from_hour[member] = y
+
+                # Write out per-hour products if requested
+                write_hour_outputs(hour, y.numpy(), member)
 
         logger.info("Autoregressive rollout completed")
         return history
@@ -719,7 +836,6 @@ class WeatherForecaster:
         call signature, this returns (None, None[, history]) where history is included if return_history=True.
         """
         try:
-            lats, lons = self.data_loader_hrrr.get_coordinates()
             init_datetime = self.data_loader_hrrr.get_init_datetime()
 
             logger.info(f"Running forecast for {init_datetime} with {lead_hours} hour lead time")
@@ -825,22 +941,38 @@ def main():
         gfs_channels = model_input_gfs.shape[-1]
         static_channels = max(model_input_hrrr.shape[-1] - predicted_channels, 0)
 
-        lead_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1), dtype=model_input_hrrr.dtype)
+        nlat = model_input_hrrr.shape[1]
+        nlon = model_input_hrrr.shape[2]
+        date_channel = np.ones((1, nlat, nlon, 6), dtype=model_input_hrrr.dtype)
+        lead_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
+        step_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
+
         if not args.no_diffusion:
-            rand_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], predicted_channels), dtype=model_input_hrrr.dtype)
-            step_channel = np.ones((1, model_input_hrrr.shape[1], model_input_hrrr.shape[2], 1), dtype=model_input_hrrr.dtype)
-            model_input = np.concatenate([
-                model_input_hrrr[:, :, :, :predicted_channels],
-                model_input_gfs[0:1, :, :, :],
-                rand_channel,
-                model_input_hrrr[:, :, :, predicted_channels:],
-                step_channel, lead_channel], axis=-1)
+            rand_channel = np.ones((1, nlat, nlon, predicted_channels), dtype=model_input_hrrr.dtype)
+            model_input = np.concatenate(
+                [
+                    model_input_hrrr[:, :, :, :predicted_channels],
+                    model_input_gfs[0:1, :, :, :],
+                    rand_channel,
+                    model_input_hrrr[:, :, :, predicted_channels:],
+                    date_channel,
+                    step_channel,
+                    lead_channel
+                ],
+                axis=-1
+            )
         else:
-            model_input = np.concatenate([
-                model_input_hrrr[:, :, :, :predicted_channels],
-                model_input_gfs[0:1, :, :, :],
-                model_input_hrrr[:, :, :, predicted_channels:],
-                lead_channel], axis=-1)
+            model_input = np.concatenate(
+                [
+                    model_input_hrrr[:, :, :, :predicted_channels],
+                    model_input_gfs[0:1, :, :, :],
+                    model_input_hrrr[:, :, :, predicted_channels:],
+                    date_channel,
+                    step_channel,
+                    lead_channel
+                ],
+                axis=-1
+            )
         
         forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, members, not args.no_diffusion,
                                         predicted_channels=predicted_channels,

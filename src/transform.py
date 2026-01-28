@@ -1,50 +1,81 @@
 import numpy as np
 import xarray as xr
 
-# Reusable epsilon constant (can be imported elsewhere if needed)
-DEFAULT_LOG_EPS = 1e-3
-
-
-def log_transform_array(arr: np.ndarray, eps: float = DEFAULT_LOG_EPS) -> np.ndarray:
-    """Apply log(x+eps)-log(eps) transform to a non-negative array.
+def log_transform_array(arr: np.ndarray) -> np.ndarray:
+    """
+    Apply log(1 + max(x, 0)) transform to a non-negative array.
 
     Parameters
     ----------
     arr : np.ndarray
         Input array (values assumed >= 0, any negatives clipped to 0).
-    eps : float
-        Small constant to stabilize the log.
+    eps : float, optional
+        Small constant to stabilize the log (unused in this implementation).
+
+    Returns
+    -------
+    np.ndarray
+        Transformed array with log(1 + x) applied elementwise.
     """
-    return np.log(np.clip(arr, 0, None) + eps) - np.log(eps)
+    return np.log1p(np.clip(arr, 0, None))
 
 
-def neg_log_transform_array(arr: np.ndarray, eps: float = DEFAULT_LOG_EPS) -> np.ndarray:
-    """Apply signed log transform: sign(x)*(log(|x|+eps)-log(eps)).
+def neg_log_transform_array(arr: np.ndarray) -> np.ndarray:
+    """
+    Apply signed log transform: sign(x) * log(1 + |x|).
 
     Parameters
     ----------
     arr : np.ndarray
         Input array that may contain negative values.
-    eps : float
-        Small constant to stabilize the log.
+    eps : float, optional
+        Small constant to stabilize the log (unused in this implementation).
+
+    Returns
+    -------
+    np.ndarray
+        Transformed array with signed log(1 + |x|) applied elementwise.
     """
-    return np.sign(arr) * (np.log(np.abs(arr) + eps) - np.log(eps))
+    return np.sign(arr) * np.log1p(np.abs(arr))
 
 
-def inverse_log_transform_array(arr: np.ndarray, eps: float = DEFAULT_LOG_EPS) -> np.ndarray:
-    """Inverse of log_transform_array.
-
-    y = log(x+eps) - log(eps)  =>  x = exp(y + log(eps)) - eps
+def inverse_log_transform_array(arr: np.ndarray) -> np.ndarray:
     """
-    return np.exp(arr + np.log(eps)) - eps
+    Inverse of log_transform_array.
 
+    For y = log(1 + x), returns x = exp(y) - 1.
 
-def inverse_neg_log_transform_array(arr: np.ndarray, eps: float = DEFAULT_LOG_EPS) -> np.ndarray:
-    """Inverse of neg_log_transform_array.
+    Parameters
+    ----------
+    arr : np.ndarray
+        Transformed array.
+    eps : float, optional
+        Small constant to stabilize the log (unused in this implementation).
 
-    y = sign(x)*(log(|x|+eps)-log(eps))
-    sign(x)=sign(y); |x| = exp(|y|+log(eps)) - eps
+    Returns
+    -------
+    np.ndarray
+        Inverse transformed array.
     """
-    sign_x = np.sign(arr)
-    abs_x = np.exp(np.abs(arr) + np.log(eps)) - eps
-    return sign_x * abs_x
+    return np.expm1(arr)
+
+
+def inverse_neg_log_transform_array(arr: np.ndarray) -> np.ndarray:
+    """
+    Inverse of neg_log_transform_array.
+
+    For y = sign(x) * log(1 + |x|), returns x = sign(y) * (exp(|y|) - 1).
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Transformed array.
+    eps : float, optional
+        Small constant to stabilize the log (unused in this implementation).
+
+    Returns
+    -------
+    np.ndarray
+        Inverse transformed array.
+    """
+    return np.sign(arr) * np.expm1(np.abs(arr))
