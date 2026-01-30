@@ -51,7 +51,7 @@ class ForecastPlotterConfig:
         # Updated surface variable list (matches preprocessing)
         self.sfc_vars = [
             "PRES", "MSLMA", "REFC", "T2M", "UGRD10M", "VGRD10M", "UGRD80M", "VGRD80M",
-            "D2M", "R2M", "TCDC", "VIS", "APCP", "HGTCC", "CAPE", "CIN"
+            "D2M", "R2M", "TCDC", "LCDC", "MCDC", "HCDC", "VIS", "APCP", "HGTCC", "CAPE", "CIN"
         ]
         
         # Pressure levels (hPa)
@@ -84,6 +84,9 @@ class ForecastPlotterConfig:
             'D2M':     {'cmap': 'coolwarm', 'units': 'K',     'long_name': '2m Dewpoint'},
             'R2M':     {'cmap': 'YlGnBu',   'units': '%',     'long_name': '2m Relative Humidity'},
             'TCDC':    {'cmap': 'Greys',    'units': 'frac',  'long_name': 'Total Cloud Cover'},
+            'LCDC':    {'cmap': 'Blues',    'units': 'frac',  'long_name': 'Low Cloud Cover'},
+            'MCDC':    {'cmap': 'Greens',   'units': 'frac',  'long_name': 'Medium Cloud Cover'},
+            'HCDC':    {'cmap': 'Reds',     'units': 'frac',  'long_name': 'High Cloud Cover'},
             'VIS':     {'cmap': 'plasma_r', 'units': 'm',     'long_name': 'Visibility'},
             'APCP':    {'cmap': 'Blues',    'units': 'mm',    'long_name': 'Accumulated Precipitation'},
             'HGTCC':   {'cmap': 'cividis',  'units': 'm',     'long_name': 'Cloud Ceiling Height'},

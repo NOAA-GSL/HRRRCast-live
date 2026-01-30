@@ -43,7 +43,7 @@ class WeatherPreprocessConfig:
     def __init__(self, hrrr_grid_file: Optional[str] = None):
         # 3D and 2D variables for GFS
         self.pl_vars = ["GFS-HGT", "GFS-SPFH", "GFS-TMP", "GFS-UGRD", "GFS-VGRD", "GFS-VVEL"]
-        self.sfc_vars = ["GFS-PRES", "GFS-PRMSL", "GFS-REFC", "GFS-T2M", "GFS-UGRD10M", "GFS-VGRD10M", "GFS-UGRD80M", "GFS-VGRD80M", "GFS-D2M", "GFS-R2M", "GFS-TCDC", "GFS-VIS", "GFS-APCP", "GFS-HGTCC", "GFS-CAPE", "GFS-CIN"]
+        self.sfc_vars = ["GFS-PRES", "GFS-PRMSL", "GFS-REFC", "GFS-T2M", "GFS-UGRD10M", "GFS-VGRD10M", "GFS-UGRD80M", "GFS-VGRD80M", "GFS-D2M", "GFS-TCDC", "GFS-LCDC", "GFS-MCDC", "GFS-HCDC", "GFS-VIS", "GFS-APCP", "GFS-HGTCC", "GFS-CAPE", "GFS-CIN"]
         
         # Pressure levels (hPa)
         self.levels = [250, 500, 850, 1000]
@@ -247,8 +247,10 @@ def process_single_lead_hour(args):
         {'shortName': 'u',      'cfg': 'GFS-UGRD80M', 'typeOfLevel': 'heightAboveGround', 'level': 80},
         {'shortName': 'v',      'cfg': 'GFS-VGRD80M', 'typeOfLevel': 'heightAboveGround', 'level': 80},
         {'shortName': '2d',     'cfg': 'GFS-D2M'},
-        {'shortName': '2r',     'cfg': 'GFS-R2M'},
         {'shortName': 'tcc',    'cfg': 'GFS-TCDC', "typeOfLevel": "atmosphere"},
+        {'shortName': 'lcc',    'cfg': 'GFS-LCDC'},
+        {'shortName': 'mcc',    'cfg': 'GFS-MCDC'},
+        {'shortName': 'hcc',    'cfg': 'GFS-HCDC'},
         {'shortName': 'vis',    'cfg': 'GFS-VIS'},
         {'shortName': 'tp',     'cfg': 'GFS-APCP'},
         {'shortName': 'gh',     'cfg': 'GFS-HGTCC',  'typeOfLevel': 'cloudCeiling'},

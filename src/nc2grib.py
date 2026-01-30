@@ -31,34 +31,37 @@ from utils import setup_logging
 logger = setup_logging("INFO")
 
 
-# Minimal GRIB parameter map: var -> (discipline, category, number, default_surface_type)
+# Minimal GRIB parameter map: var -> (discipline, category, number, default_surface_type, default_surface_value)
 GRIB_PARAM_MAP = {
     # Pressure level fields
-    "UGRD": (0, 2, 2, 100),   # u-wind
-    "VGRD": (0, 2, 3, 100),   # v-wind
-    "VVEL": (0, 2, 8, 100),   # vertical velocity (Pa/s)
-    "TMP":  (0, 0, 0, 100),   # temperature
-    "HGT":  (0, 3, 5, 100),   # geopotential height
-    "SPFH": (0, 1, 0, 100),   # specific humidity
+    "UGRD": (0, 2, 2, 100, None),   # u-wind
+    "VGRD": (0, 2, 3, 100, None),   # v-wind
+    "VVEL": (0, 2, 8, 100, None),   # vertical velocity (Pa/s)
+    "TMP":  (0, 0, 0, 100, None),   # temperature
+    "HGT":  (0, 3, 5, 100, None),   # geopotential height
+    "SPFH": (0, 1, 0, 100, None),   # specific humidity
     # Surface/height fields
-    "PRES":    (0, 3, 0, 1),    # pressure (surface)
-    "MSLMA":   (0, 3, 1, 102),  # mean sea level pressure
-    "T2M":     (0, 0, 0, 103),  # temperature at 2m
-    "UGRD10M": (0, 2, 2, 103),
-    "VGRD10M": (0, 2, 3, 103),
-    "UGRD80M": (0, 2, 2, 103),
-    "VGRD80M": (0, 2, 3, 103),
-    "D2M":     (0, 0, 6, 103),  # dewpoint at 2m
-    "R2M":     (0, 1, 1, 103),  # RH at 2m
-    "TCDC":    (0, 6, 1, 10),   # total cloud cover, entire atmosphere
-    "VIS":     (0, 19, 0, 1),   # visibility at surface
-    "APCP":    (0, 1, 8, 1),    # total precipitation at surface
-    "HGTCC":   (0, 6, 13, 1),   # cloud ceiling height (approx)
-    "CAPE":    (0, 7, 6, 1),
-    "CIN":     (0, 7, 7, 1),
-    "REFC":    (0, 16, 196, 10),# reflectivity, entire atmosphere
-    "LAND":    (2, 0, 0, 1),    # land-sea mask
-    "OROG":    (0, 3, 5, 1),    # orography
+    "PRES":    (0, 3, 0, 1, None),    # pressure (surface)
+    "MSLMA":   (0, 3, 1, 102, None),  # mean sea level pressure
+    "T2M":     (0, 0, 0, 103, 2.0),   # temperature at 2m
+    "UGRD10M": (0, 2, 2, 103, 10.0),
+    "VGRD10M": (0, 2, 3, 103, 10.0),
+    "UGRD80M": (0, 2, 2, 103, 80.0),
+    "VGRD80M": (0, 2, 3, 103, 80.0),
+    "D2M":     (0, 0, 6, 103, 2.0),   # dewpoint at 2m
+    "R2M":     (0, 1, 1, 103, None),  # RH at 2m
+    "TCDC":    (0, 6, 1, 10, None),   # total cloud cover, entire atmosphere
+    "LCDC":    (0, 6, 3, 214, None),  # low cloud cover, entire atmosphere
+    "MCDC":    (0, 6, 4, 224, None),  # medium cloud cover, entire atmosphere
+    "HCDC":    (0, 6, 5, 234, None),  # high cloud cover, entire atmosphere
+    "VIS":     (0, 19, 0, 1, None),   # visibility at surface
+    "APCP":    (0, 1, 8, 1, None),    # total precipitation at surface
+    "HGTCC":   (0, 6, 13, 1, None),   # cloud ceiling height (approx)
+    "CAPE":    (0, 7, 6, 1, None),
+    "CIN":     (0, 7, 7, 1, None),
+    "REFC":    (0, 16, 196, 10, None),# reflectivity, entire atmosphere
+    "LAND":    (2, 0, 0, 1, None),    # land-sea mask
+    "OROG":    (0, 3, 5, 1, None),    # orography
 }
 
 
@@ -213,17 +216,13 @@ class Netcdf2Grib:
         )
 
         # 3. Set parameter keys
-        if var_name in GRIB_PARAM_MAP:
-            disc, cat, num, default_surface = GRIB_PARAM_MAP[var_name]
-            msg.discipline = disc
-            msg.parameterCategory = cat
-            msg.parameterNumber = num
-            msg.typeOfFirstFixedSurface = surface_type if surface_type is not None else default_surface
-        else:
-            msg.discipline = 0
-            msg.parameterCategory = 255
-            msg.parameterNumber = 255
-            msg.typeOfFirstFixedSurface = surface_type if surface_type is not None else 1
+        if var_name not in GRIB_PARAM_MAP:
+            raise ValueError(f"Unknown variable {var_name} not in GRIB_PARAM_MAP")
+        disc, cat, num, default_surface, _ = GRIB_PARAM_MAP[var_name]
+        msg.discipline = disc
+        msg.parameterCategory = cat
+        msg.parameterNumber = num
+        msg.typeOfFirstFixedSurface = surface_type if surface_type is not None else default_surface
 
         if surface_value is not None:
             msg.scaledValueOfFirstFixedSurface = int(surface_value)
@@ -263,21 +262,10 @@ class Netcdf2Grib:
         return msg
 
     def _get_surface_type_and_value(self, var_name: str, ds: xr.Dataset, da: xr.DataArray) -> Tuple[int, Optional[float]]:
-        # Pressure-level variables have a 'level' coordinate in Pa
-        if "level" in da.coords:
-            return 100, None  # pressure surface, value set per-level during loop
-        # Height AGL variables
-        if var_name in ("T2M", "D2M", "R2M"):
-            return 103, 2.0
-        if var_name in ("UGRD10M", "VGRD10M"):
-            return 103, 10.0
-        if var_name in ("UGRD80M", "VGRD80M"):
-            return 103, 80.0
-        # Entire atmosphere
-        if var_name in ("TCDC", "REFC"):
-            return 10, None
-        # Surface
-        return GRIB_PARAM_MAP.get(var_name, (0, 0, 0, 1))[3], None
+        if var_name not in GRIB_PARAM_MAP:
+            raise ValueError(f"Unknown variable {var_name} not in GRIB_PARAM_MAP")
+        _, _, _, surface_type, surface_value = GRIB_PARAM_MAP[var_name]
+        return surface_type, surface_value
 
     def save_grib2(self, forecast_starttime: datetime, ds_hour: xr.Dataset, member, outdir: str) -> None:
         """Write a single-hour GRIB2 file from an xarray.Dataset using grib2io.

@@ -39,7 +39,7 @@ class WeatherPreprocessConfig:
     def __init__(self):
         # Pressure level and surface variables
         self.pl_vars = ["UGRD", "VGRD", "VVEL", "TMP", "HGT", "SPFH"]
-        self.sfc_vars = ["PRES", "MSLMA", "REFC", "T2M", "UGRD10M", "VGRD10M", "UGRD80M", "VGRD80M", "D2M", "R2M", "TCDC", "VIS", "APCP", "HGTCC", "CAPE", "CIN"]
+        self.sfc_vars = ["PRES", "MSLMA", "REFC", "T2M", "UGRD10M", "VGRD10M", "UGRD80M", "VGRD80M", "D2M", "TCDC", "LCDC", "MCDC", "HCDC", "VIS", "APCP", "HGTCC", "CAPE", "CIN"]
         self.consts = ["LAND", "OROG"]
         
         # Pressure levels (hPa)
@@ -78,8 +78,10 @@ class WeatherPreprocessConfig:
             "UGRD80M": {"shortName": "u", "typeOfLevel": "heightAboveGround", "level": 80},
             "VGRD80M": {"shortName": "v", "typeOfLevel": "heightAboveGround", "level": 80},
             "D2M": {"shortName": "2d"},
-            "R2M": {"shortName": "2r"},
             "TCDC": {"shortName": "tcc", "typeOfLevel": "atmosphere"},
+            "LCDC": {"shortName": "lcc"},
+            "MCDC": {"shortName": "mcc"},
+            "HCDC": {"shortName": "hcc"},
             "VIS": {"shortName": "vis"},
             "APCP": {"shortName": "tp"},  # accumulated precip
             "HGTCC": {"shortName": "gh", "typeOfLevel": "cloudCeiling"},  # cloud ceiling height (may vary)
