@@ -56,7 +56,7 @@ GRIB_PARAM_MAP = {
     "HCDC":    (0, 6, 5, 234, None),  # high cloud cover, entire atmosphere
     "VIS":     (0, 19, 0, 1, None),   # visibility at surface
     "APCP":    (0, 1, 8, 1, None),    # total precipitation at surface
-    "HGTCC":   (0, 6, 13, 1, None),   # cloud ceiling height (approx)
+    "HGTCC":   (0, 3, 5, 215, None),  # cloud ceiling height (approx)
     "CAPE":    (0, 7, 6, 1, None),
     "CIN":     (0, 7, 7, 1, None),
     "REFC":    (0, 16, 196, 10, None),# reflectivity, entire atmosphere
