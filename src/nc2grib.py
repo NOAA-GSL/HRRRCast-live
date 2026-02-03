@@ -42,14 +42,14 @@ GRIB_PARAM_MAP = {
     "SPFH": (0, 1, 0, 100, None),   # specific humidity
     # Surface/height fields
     "PRES":    (0, 3, 0, 1, None),    # pressure (surface)
-    "MSLMA":   (0, 3, 198, 101, None),  # mean sea level pressure
+    "MSLMA":   (0, 3, 198, 101, None),# mean sea level pressure
     "T2M":     (0, 0, 0, 103, 2.0),   # temperature at 2m
     "UGRD10M": (0, 2, 2, 103, 10.0),
     "VGRD10M": (0, 2, 3, 103, 10.0),
     "UGRD80M": (0, 2, 2, 103, 80.0),
     "VGRD80M": (0, 2, 3, 103, 80.0),
     "D2M":     (0, 0, 6, 103, 2.0),   # dewpoint at 2m
-    "R2M":     (0, 1, 1, 103, 2.0),  # RH at 2m
+    "R2M":     (0, 1, 1, 103, 2.0),   # RH at 2m
     "TCDC":    (0, 6, 1, 10, None),   # total cloud cover, entire atmosphere
     "LCDC":    (0, 6, 3, 214, None),  # low cloud cover, entire atmosphere
     "MCDC":    (0, 6, 4, 224, None),  # medium cloud cover, entire atmosphere
@@ -256,8 +256,11 @@ class Netcdf2Grib:
         else:
             msg.decScaleFactor = 2
 
-        # 8. Spatial differencing order (set to 2 for better accuracy)
-        msg.spatialDifferenceOrder = 2
+        # 8. Spatial differencing order (disable for discontinuous fields like visibility)
+        if var_name in ["VIS", "HGTCC"]:
+            msg.spatialDifferenceOrder = 0
+        else:
+            msg.spatialDifferenceOrder = 2
 
         return msg
 
