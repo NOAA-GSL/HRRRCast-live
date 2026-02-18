@@ -720,11 +720,17 @@ class WeatherForecaster:
                 tf.cast(step / 6.0, tf.float32),
             )
 
+            # Add phase uncertainity to the forcing input for this hour.
+            # Width of uncertainity Δt(t)=min(4,⌊0.5+2(1−e−t/18)⌋)
+            phase_width = min(3, int(0.5 + 4 * (1 - np.exp(-hour / 24))))
+            forcing_idx = hour - 1 + np.random.randint(-phase_width, phase_width + 1)
+            forcing_idx = np.clip(forcing_idx, 0, forcing_input.shape[0] - 1)
+
             # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
             X_base = tf.concat(
                 [
                     X[:, :, :, :self.predicted_channels],
-                    forcing_input[hour-1:hour, :, :, :],
+                    forcing_input[forcing_idx:forcing_idx + 1, :, :, :],
                     X[:, :, :, start_pred_noise:-8],
                     date_encoding,
                     X[:, :, :, -2:-1],
