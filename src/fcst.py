@@ -47,6 +47,7 @@ from transform import (
 )
 import utils
 from utils import setup_logging
+from diagnostics import compute_diagnostics
 
 logger = None
 
@@ -461,6 +462,10 @@ class WeatherForecaster:
 
         # Apply inverse transforms to recover physical units
         ds_hour = self._apply_inverse_transforms(ds_hour)
+
+        # compute diagnostics
+        ds_hour = compute_diagnostics(ds_hour)
+
         return ds_hour
 
     def write_single_hour_netcdf(
@@ -767,24 +772,6 @@ class WeatherForecaster:
 
         logger.info("Autoregressive rollout completed")
         return history
-    
-    @staticmethod
-    def compute_r2m(ds: xr.Dataset) -> xr.Dataset:
-        """
-        Compute relative humidity at 2m (R2M) using T2M and D2M.
-        Assumes T2M and D2M are in Kelvin.
-        """
-        # Convert to Celsius
-        T_c = ds["T2M"] - 273.15
-        Td_c = ds["D2M"] - 273.15
-        # Magnus formula for saturation vapor pressure (hPa)
-        es = 6.112 * np.exp((17.67 * T_c) / (T_c + 243.5))
-        e = 6.112 * np.exp((17.67 * Td_c) / (Td_c + 243.5))
-        # Relative humidity (%)
-        RH = 100.0 * (e / es)
-        # Clip to [0, 100]
-        ds["R2M"] = RH.clip(min=0.0, max=100.0)
-        return ds
 
     def create_xarray_dataset(self, init_datetime: datetime, times: List[int], 
                             lats: np.ndarray, lons: np.ndarray, data: np.ndarray) -> xr.Dataset:
@@ -830,9 +817,6 @@ class WeatherForecaster:
             var_index += 1
         
         ds = xr.Dataset(data_vars)
-
-        # compute relative humidity at 2m
-        ds = self.compute_r2m(ds)
 
         return ds
     
