@@ -50,6 +50,8 @@ GRIB_PARAM_MAP = {
     "VGRD80M": (0, 2, 3, 103, 80.0),
     "D2M":     (0, 0, 6, 103, 2.0),   # dewpoint at 2m
     "R2M":     (0, 1, 1, 103, 2.0),   # RH at 2m
+    "SPFH2M":  (0, 1, 0, 103, 2.0),   # specific humidity at 2m
+    "POT2M":   (0, 0, 2, 103, 2.0),   # potential temperature at 2m
     "TCDC":    (0, 6, 1, 10, None),   # total cloud cover, entire atmosphere
     "LCDC":    (0, 6, 3, 214, None),  # low cloud cover, entire atmosphere
     "MCDC":    (0, 6, 4, 224, None),  # medium cloud cover, entire atmosphere
@@ -62,6 +64,57 @@ GRIB_PARAM_MAP = {
     "REFC":    (0, 16, 196, 10, None),# reflectivity, entire atmosphere
     "LAND":    (2, 0, 0, 1, None),    # land-sea mask
     "OROG":    (0, 3, 5, 1, None),    # orography
+    # Diagnostic fields - precipitable water
+    "PWAT":    (0, 1, 3, 10, None),   # precipitable water, entire atmosphere
+    # Diagnostic fields - conditional rain/freezing rain
+    "CRAIN":   (0, 1, 33, 1, None),  # conditional rain rate at surface
+    #"RAIN_FRACTION": (0, 1, 194, 1, None), # rain fraction
+    #"RAIN_MASK": (0, 1, 193, 1, None),# rain mask at surface
+    "CFRZR":   (0, 1, 34, 1, None),  # conditional freezing rain at surface
+    #"FRZR_FRACTION": (0, 1, 197, 1, None), # freezing rain fraction
+    #"FRZR_MASK": (0, 1, 196, 1, None),# freezing rain mask at surface
+    #"WARM_LAYER_DEPTH": (0, 3, 192, 1, None), # warm layer depth (hPa)
+    #"COLD_LAYER_DEPTH": (0, 3, 193, 1, None), # cold layer depth (hPa)
+    # Diagnostic fields - wind gust
+    "GUST":    (0, 2, 22, 1, None),   # wind gust at surface
+    #"GUST_FACTOR": (0, 2, 192, 1, None), # empirical gust factor
+    #"GUST_CONV": (0, 2, 193, 1, None),# convective gust enhancement
+    "WIND_10M": (0, 2, 1, 103, 10.0), # 10m wind speed
+    #"WIND_MAX": (0, 2, 194, 1, None), # maximum wind in column
+    # Diagnostic fields - convective parameters (shear)
+    "VUCSH_0_1km": (0, 2, 15, 103, (1000.0, 0.0)),  # U shear rate 1000-0m AGL (layer)
+    "VVCSH_0_1km": (0, 2, 16, 103, (1000.0, 0.0)),  # V shear rate 1000-0m AGL (layer)
+    "VUCSH_0_6km": (0, 2, 15, 103, (6000.0, 0.0)),  # U shear rate 6000-0m AGL (layer)
+    "VVCSH_0_6km": (0, 2, 16, 103, (6000.0, 0.0)),  # V shear rate 6000-0m AGL (layer)
+    # Diagnostic fields - convective parameters (vorticity)
+    "RELV_max_0_1km": (0, 2, 12, 103, (1000.0, 0.0)), # max relative vorticity 1000-0m AGL (layer)
+    "RELV_max_0_2km": (0, 2, 12, 103, (2000.0, 0.0)), # max relative vorticity 2000-0m AGL (layer)
+    # Diagnostic fields - storm motion
+    "USTM_0_6km":    (0, 2, 194, 103, (0.0, 6000.0)),  # U-component storm motion 6000-0m AGL (layer)
+    "VSTM_0_6km":    (0, 2, 195, 103, (0.0, 6000.0)),  # V-component storm motion 6000-0m AGL (layer)
+    # Diagnostic fields - helicity
+    "HLCY_0_1km": (0, 7, 8, 103, (1000.0, 0.0)),  # storm-relative helicity 1000-0m AGL (layer)
+    "HLCY_0_3km": (0, 7, 8, 103, (3000.0, 0.0)),  # storm-relative helicity 3000-0m AGL (layer)
+    # Diagnostic fields - updraft helicity
+    "MXUPHL_max_0_2km": (0, 7, 199, 103, (2000.0, 0.0)),  # max updraft helicity 2000-0m AGL (layer)
+    "MNUPHL_min_0_2km": (0, 7, 200, 103, (2000.0, 0.0)),  # min updraft helicity 2000-0m AGL (layer)
+    "MXUPHL_max_0_3km": (0, 7, 199, 103, (3000.0, 0.0)),  # max updraft helicity 3000-0m AGL (layer)
+    "MNUPHL_min_0_3km": (0, 7, 200, 103, (3000.0, 0.0)),  # min updraft helicity 3000-0m AGL (layer)
+    "MXUPHL_max_2_5km": (0, 7, 199, 103, (5000.0, 2000.0)),  # max updraft helicity 5000-2000m AGL (layer)
+    "MNUPHL_min_2_5km": (0, 7, 200, 103, (5000.0, 2000.0)),  # min updraft helicity 5000-2000m AGL (layer)
+    # Diagnostic fields - vertical velocity extrema
+    "MAXUVV_max_100_1000mb": (0, 2, 220, 100, (10000.0, 100000.0)),  # max upward vert velocity 100-1000mb (layer, in Pa)
+    "MAXDVV_max_100_1000mb": (0, 2, 221, 100, (10000.0, 100000.0)),  # max downward vert velocity 100-1000mb (layer, in Pa)
+    # Diagnostic fields - 0C isotherm
+    "HGT_0C":  (0, 3, 5, 4, None),    # height AGL at 0C isotherm
+    "UGRD_0C": (0, 2, 2, 4, None),    # U-wind at 0C isotherm
+    "VGRD_0C": (0, 2, 3, 4, None),    # V-wind at 0C isotherm
+    "WIND_0C": (0, 2, 1, 4, None),    # wind speed at 0C isotherm
+    "SPFH_0C": (0, 1, 0, 4, None),    # specific humidity at 0C isotherm
+    #"DU_SFC_0C": (0, 2, 192, 4, None),# U-wind shear surface to 0C
+    #"DV_SFC_0C": (0, 2, 193, 4, None),# V-wind shear surface to 0C
+    #"SHEAR_SFC_0C": (0, 2, 194, 4, None), # wind shear magnitude surface to 0C
+    "RH_0C":   (0, 1, 1, 4, None),    # relative humidity at 0C isotherm
 }
 
 
@@ -225,11 +278,29 @@ class Netcdf2Grib:
         msg.typeOfFirstFixedSurface = surface_type if surface_type is not None else default_surface
 
         if surface_value is not None:
-            msg.scaledValueOfFirstFixedSurface = int(surface_value)
-            msg.scaleFactorOfFirstFixedSurface = 0
+            # Check if surface_value is a tuple (layer) or a single value
+            if isinstance(surface_value, tuple):
+                # Layer specification: (top, bottom)
+                top_value, bottom_value = surface_value
+                msg.scaledValueOfFirstFixedSurface = int(top_value)
+                msg.scaleFactorOfFirstFixedSurface = 0
+                msg.typeOfSecondFixedSurface = surface_type if surface_type is not None else default_surface
+                msg.scaledValueOfSecondFixedSurface = int(bottom_value)
+                msg.scaleFactorOfSecondFixedSurface = 0
+            else:
+                # Single level specification
+                msg.scaledValueOfFirstFixedSurface = int(surface_value)
+                msg.scaleFactorOfFirstFixedSurface = 0
+                msg.typeOfSecondFixedSurface = 255
+                msg.scaleFactorOfSecondFixedSurface = 0
+                msg.scaledValueOfSecondFixedSurface = 0
         else:
             msg.scaledValueOfFirstFixedSurface = 0
             msg.scaleFactorOfFirstFixedSurface = 0
+
+            msg.typeOfSecondFixedSurface = 255
+            msg.scaleFactorOfSecondFixedSurface = 0
+            msg.scaledValueOfSecondFixedSurface = 0
 
         # 4. Time metadata
         msg.unitOfForecastTime = 1  # hours
@@ -239,12 +310,7 @@ class Netcdf2Grib:
         msg.typeOfStatisticalProcessing = 0
         msg.numberOfTimeRanges = 0
 
-        # 6. Second surface (unused)
-        msg.typeOfSecondFixedSurface = 255
-        msg.scaleFactorOfSecondFixedSurface = 0
-        msg.scaledValueOfSecondFixedSurface = 0
-
-        # 7. Adjust decimal scale factor for specific humidity (SPFH) to improve precision
+        # 6. Adjust decimal scale factor for specific humidity (SPFH) to improve precision
         msg.binaryScaleFactor = 0
         if var_name == "SPFH":
             if surface_value >= 5000 and surface_value <= 10000:
@@ -256,7 +322,7 @@ class Netcdf2Grib:
         else:
             msg.decScaleFactor = 2
 
-        # 8. Spatial differencing order (disable for discontinuous fields like visibility)
+        # 7. Spatial differencing order (disable for discontinuous fields like visibility)
         if var_name in ["VIS", "HGTCC"]:
             msg.spatialDifferenceOrder = 0
         else:
