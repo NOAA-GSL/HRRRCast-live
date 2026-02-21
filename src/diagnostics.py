@@ -133,14 +133,14 @@ def compute_pot2m(ds: xr.Dataset) -> xr.Dataset:
     Notes:
         - Uses the dry adiabatic formula: θ = T * (P_ref / P)^(R/cp)
         - P_ref = 100000 Pa (1000 hPa) is the reference pressure
-        - R/cp ≈ 0.286 (specific gas constant / specific heat at constant pressure)
+        - R/cp ≈ 0.2857 (specific gas constant / specific heat at constant pressure)
         - The formula assumes dry air; moisture content is neglected for potential temperature
         - Potential temperature is always greater than or equal to actual temperature 
           (except at reference pressure where they're equal)
     """
     # Constants
     P_ref = 100000.0    # Reference pressure (Pa)
-    R_cp = 0.286        # Ratio of gas constant to specific heat at constant pressure (R/cp = 2/7)
+    R_cp = 0.2857       # Ratio of gas constant to specific heat at constant pressure (R/cp = 2/7)
     
     # Extract variables
     T2m = ds["T2M"]     # Temperature at 2m (K)
@@ -166,9 +166,6 @@ def compute_pwat(ds: xr.Dataset) -> xr.Dataset:
     Args:
         ds (xr.Dataset): Input dataset containing the following required fields:
             - SPFH: Specific humidity at all pressure levels (kg/kg)
-            - TMP: Temperature at all pressure levels (K)
-            - HGT: Geopotential height at all pressure levels (m)
-            - OROG: Orography/surface elevation (m)
             - level: Pressure levels (hPa)
 
             Dataset must have dimensions: level, latitude, longitude
@@ -178,51 +175,31 @@ def compute_pwat(ds: xr.Dataset) -> xr.Dataset:
             - PWAT: Precipitable water (kg/m²)
 
     Notes:
-        - Computed using: PWAT = ∫ ρ * q * dz, where ρ is air density, q is specific 
-          humidity, and dz is layer thickness
-        - Air density calculated from the ideal gas law: ρ = P / (Rd * T)
-        - Vertical integration uses hydrostatic approximation with layer thicknesses 
-          from geopotential heights
-        - Specific gas constant for dry air (Rd) = 287.0 J/(kg·K)
+        - Computed using the hydrostatic formula: PWAT = (1/g) * ∫ q * dp
+        - Numerically integrated using mid-layer average specific humidity between
+          adjacent pressure levels to reduce discretization error
+        - Gravitational acceleration (g) = 9.81 m/s²
         - Output is typically 0-70 kg/m² globally, with higher values in tropics
     """
-    Rd = 287.0  # Specific gas constant for dry air (J/(kg·K))
-    
-    # Validate required variables
-    required_vars = ["SPFH", "TMP", "HGT", "OROG"]
-    missing = [v for v in required_vars if v not in ds.data_vars]
-    if missing:
-        raise ValueError(f"Missing required variables for PWAT: {missing}")
-    
-    # Extract variables
-    q = ds["SPFH"]      # Specific humidity (kg/kg)
-    T = ds["TMP"]       # Temperature (K)
-    z = ds["HGT"]       # Geopotential height (m)
-    orog = ds["OROG"]   # Orography (m)
-    
+    g = 9.81  # Gravitational acceleration (m/s²)
+
+    # Extract specific humidity
+    q = ds["SPFH"]  # (kg/kg)
+
     # Pressure levels (convert from hPa to Pa)
     p = xr.DataArray(ds.level.values * 100.0, dims=["level"])
-    
-    # Compute height above ground level (AGL)
-    z_agl = z - orog
-    
-    # Compute layer thickness (dz) from heights
-    dz = z_agl.diff("level", label="lower")  # Thickness of each layer
-    
-    # Compute air density at each level: ρ = P / (Rd * T)
-    # Need to broadcast pressure to match shape of T
-    p_broadcast = p.broadcast_like(T)
-    rho = p_broadcast / (Rd * T)
-    
-    # Compute water vapor mass per unit area for each layer: rho * q * dz
-    # dz is positive (thickness), so take absolute value
-    pwat_layers = rho * q * np.abs(dz)
-    
-    # Integrate vertically (sum over all levels)
-    pwat = pwat_layers.sum("level", skipna=True)
-    
+
+    # Mid-layer average specific humidity between adjacent levels
+    q_mid = (q + q.shift(level=1)).isel(level=slice(1, None)) / 2.0
+
+    # Pressure thickness of each layer (Pa, positive)
+    dp = np.abs(p.diff("level"))
+
+    # PWAT = (1/g) * integral(q * dp)
+    pwat = (q_mid * dp).sum("level", skipna=True) / g
+
     ds["PWAT"] = pwat
-    
+
     return ds
 
 
@@ -244,7 +221,7 @@ def compute_conditional_rain(ds: xr.Dataset, precip_threshold: float = 0.254) ->
 
     Returns:
         xr.Dataset: Input dataset augmented with the following variables:
-            - CRAIN: Conditional rain rate (mm where APCP > threshold, NaN elsewhere)
+            - CRAIN: Conditional rain rate (mm where APCP > threshold, 0 elsewhere)
             - RAIN_MASK: Binary mask (1 where raining, 0 elsewhere)
             - RAIN_FRACTION: Fraction of grid points with precipitation > threshold
 
@@ -260,12 +237,10 @@ def compute_conditional_rain(ds: xr.Dataset, precip_threshold: float = 0.254) ->
     
     # Create rain mask (1 where raining, 0 elsewhere)
     rain_mask = (precip > precip_threshold).astype(np.float32)
-    
-    # Conditional rain: precipitation where it exceeds threshold, NaN elsewhere
-    # Create a float32 array filled with NaN, then copy precip values where condition is met
-    conditional_rain = xr.full_like(precip, fill_value=np.nan, dtype=np.float32)
-    conditional_rain = conditional_rain.where(precip <= precip_threshold, precip).fillna(0).astype(np.float32)
-    
+
+    # Conditional rain: precipitation where it exceeds threshold, 0 elsewhere
+    conditional_rain = precip.where(precip > precip_threshold, 0).astype(np.float32)
+
     # Compute fraction of raining grid points
     rain_fraction = rain_mask.mean(dim=["latitude", "longitude"])
     
@@ -303,7 +278,7 @@ def compute_conditional_freezing_rain(ds: xr.Dataset, precip_threshold: float = 
 
     Returns:
         xr.Dataset: Input dataset augmented with the following variables:
-            - CFRZR: Conditional freezing rain rate (mm where conditions met, NaN elsewhere)
+            - CFRZR: Conditional freezing rain rate (mm where conditions met, 0 elsewhere)
             - FRZR_MASK: Binary mask (1 where freezing rain conditions, 0 elsewhere)
             - FRZR_FRACTION: Fraction of grid points with freezing rain
             - WARM_LAYER_DEPTH: Depth of warm layer aloft in hPa (where T > 0°C)
@@ -363,10 +338,8 @@ def compute_conditional_freezing_rain(ds: xr.Dataset, precip_threshold: float = 
     # Combined freezing rain mask: cold surface + precipitation + warm layer aloft
     frzr_mask = (cold_surface & precip_mask & has_warm_layer).astype(np.float32)
     
-    # Conditional freezing rain: precipitation where conditions are met
-    # Create a float32 array filled with NaN, then copy precip values where condition is met
-    conditional_frzr = xr.full_like(precip, fill_value=np.nan, dtype=np.float32)
-    conditional_frzr = conditional_frzr.where(frzr_mask <= 0, precip).fillna(0).astype(np.float32)
+    # Conditional freezing rain: precipitation where conditions are met, 0 elsewhere
+    conditional_frzr = precip.where(frzr_mask > 0, 0).astype(np.float32)
     
     # Compute fraction of freezing rain
     frzr_fraction = frzr_mask.mean(dim=["latitude", "longitude"])
@@ -534,7 +507,6 @@ def compute_convective(ds):
 
     Rd = 287.0
     g  = 9.81
-    Re = 6371000.0
 
     u = ds["UGRD"]
     v = ds["VGRD"]
@@ -550,9 +522,7 @@ def compute_convective(ds):
     z_agl = z - orog
     mask1 = (z_agl>=0) & (z_agl<=1000)
     mask2 = (z_agl>=0) & (z_agl<=2000)
-    mask3 = (z_agl>=0) & (z_agl<=3000)
     mask6 = (z_agl>=0) & (z_agl<=6000)
-    mask2_5 = (z_agl>=2000) & (z_agl<=5000)
     dz = z_agl.diff("level")
 
     # =====================================================
@@ -569,23 +539,25 @@ def compute_convective(ds):
     # Lambert Conformal projection parameters
     phi0 = np.deg2rad(38.5)      # Standard latitude (projection center)
     lon0 = -97.5                  # Standard longitude (projection center)
-    Re = 6371200.0                # Earth radius (m)
-    n = np.sin(phi0)              # Map convergence factor
-    
-    # Compute map scale factor for each latitude point
-    # Scale factor accounts for the variation in grid spacing with latitude
-    # in a Lambert Conformal projection: m(phi) = cos(phi) / cos(phi0)
-    m_lats = np.cos(np.deg2rad(ds.latitude)) / np.cos(phi0)
-    
+    n = np.sin(phi0)              # Map convergence factor (cone constant)
+
+    # Compute map scale factor for each latitude point using the correct LCC formula:
+    # m(phi) = cos(phi0)/cos(phi) * [tan(pi/4 + phi0/2) / tan(pi/4 + phi/2)]^n
+    phi = np.deg2rad(ds.latitude)
+    m_lats = (
+        (np.cos(phi0) / np.cos(phi)) *
+        (np.tan(np.pi/4 + phi0/2) / np.tan(np.pi/4 + phi/2)) ** n
+    )
+
     # Grid spacing in x and y (model grid is 6 km)
     dx_model = 6000.0
     dy_model = 6000.0
-    
-    # Actual distance varies with latitude due to projection
-    # dx varies with latitude (north-south variation of convergence)
-    # dy is more stable but still varies slightly
-    dx = dx_model / m_lats  # dx increases away from center latitude
-    dy = dy_model           # dy is relatively constant
+
+    # Physical (true Earth) distance = grid distance / map scale factor
+    # m > 1 near standard parallel, < 1 away from it
+    # so physical spacing increases away from the standard parallel
+    dx = dx_model / m_lats
+    dy = dy_model / m_lats
     
     # Rotation angle for coordinate transformation
     gamma = n * np.deg2rad(ds.longitude - lon0)
@@ -610,7 +582,6 @@ def compute_convective(ds):
         # Select the level closest to (but not exceeding) the top height
         z_agl_above = z_agl.where(z_agl <= top)
         level_top_idx = z_agl_above.argmax(dim="level").compute()
-
         u_top = u.isel(level=level_top_idx)
         v_top = v.isel(level=level_top_idx)
 
@@ -640,7 +611,7 @@ def compute_convective(ds):
     # =====================================================
     # 6. Storm motion (Bunkers)
     # =====================================================
-    u06, v06 = du6, dv6
+    u06, v06 = du6 * 6000, dv6 * 6000
 
     shear_mag = np.sqrt(u06**2 + v06**2) + 1e-6
 
@@ -659,39 +630,57 @@ def compute_convective(ds):
     # =====================================================
     # 7. HLCY 0–1 km
     # =====================================================
-    du_dz = u.differentiate("level") / z_agl.differentiate("level")
-    dv_dz = v.differentiate("level") / z_agl.differentiate("level")
-    hlcy = ((u - cu) * dv_dz - (v - cv) * du_dz) * dz
-    ds["HLCY_0_1km"] = hlcy.where(mask1).sum("level", skipna=True)
-    ds["HLCY_0_3km"] = hlcy.where(mask3).sum("level", skipna=True)
+    du_dz = u.diff("level") / dz
+    dv_dz = v.diff("level") / dz
+
+    # Mid-layer winds to match the N-1 staggered grid of the derivatives
+    u_mid  = (u  + u.shift(level=1)).isel(level=slice(1, None)) / 2.0
+    v_mid  = (v  + v.shift(level=1)).isel(level=slice(1, None)) / 2.0
+
+    # Mid-layer masks
+    z_agl_mid = (z_agl + z_agl.shift(level=1)).isel(level=slice(1, None)) / 2.0
+    mask1_mid = (z_agl_mid >= 0) & (z_agl_mid <= 1000)
+    mask3_mid = (z_agl_mid >= 0) & (z_agl_mid <= 3000)
+
+    hlcy = ((u_mid - cu) * dv_dz - (v_mid - cv) * du_dz) * dz
+    ds["HLCY_0_1km"] = hlcy.where(mask1_mid).sum("level", skipna=True)
+    ds["HLCY_0_3km"] = hlcy.where(mask3_mid).sum("level", skipna=True)
 
     # =====================================================
     # 8. Updraft helicity 0-2 km, 0-3 km, 2–5 km
     # =====================================================
-    uh_inst = (w * zeta * dz)
+    w_mid    = (w    + w.shift(level=1)   ).isel(level=slice(1, None)) / 2.0
+    zeta_mid = (zeta + zeta.shift(level=1)).isel(level=slice(1, None)) / 2.0
+
+    mask2_mid   = (z_agl_mid >= 0)    & (z_agl_mid <= 2000)
+    mask3_mid   = (z_agl_mid >= 0)    & (z_agl_mid <= 3000)
+    mask2_5_mid = (z_agl_mid >= 2000) & (z_agl_mid <= 5000)
+
+    uh_inst = w_mid * zeta_mid * dz
 
     # 0-2 km updraft helicity
-    uh_inst_0_2 = uh_inst.where(mask2)
-    ds["MXUPHL_max_0_2km"] = uh_inst_0_2.max("level", skipna=True).fillna(0).astype(np.float32)
-    ds["MNUPHL_min_0_2km"] = uh_inst_0_2.min("level", skipna=True).fillna(0).astype(np.float32)
+    uh_inst_0_2 = uh_inst.where(mask2_mid)
+    ds["MXUPHL_max_0_2km"] = uh_inst_0_2.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    ds["MNUPHL_min_0_2km"] = uh_inst_0_2.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
 
     # 0-3 km updraft helicity
-    uh_inst_0_3 = uh_inst.where(mask3)
-    ds["MXUPHL_max_0_3km"] = uh_inst_0_3.max("level", skipna=True).fillna(0).astype(np.float32)
-    ds["MNUPHL_min_0_3km"] = uh_inst_0_3.min("level", skipna=True).fillna(0).astype(np.float32)
+    uh_inst_0_3 = uh_inst.where(mask3_mid)
+    ds["MXUPHL_max_0_3km"] = uh_inst_0_3.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    ds["MNUPHL_min_0_3km"] = uh_inst_0_3.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
 
     # 2-5 km updraft helicity
-    uh_inst_2_5 = uh_inst.where(mask2_5)
-    ds["MXUPHL_max_2_5km"] = uh_inst_2_5.max("level", skipna=True).fillna(0).astype(np.float32)
-    ds["MNUPHL_min_2_5km"] = uh_inst_2_5.min("level", skipna=True).fillna(0).astype(np.float32)
+    uh_inst_2_5 = uh_inst.where(mask2_5_mid)
+    ds["MXUPHL_max_2_5km"] = uh_inst_2_5.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    ds["MNUPHL_min_2_5km"] = uh_inst_2_5.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
 
     # =====================================================
-    # 9. Maximum updraft velocity in between 100-1000mb
+    # 9. Maximum updraft velocity between 100-1000 mb
     # =====================================================
-    mask_v = (z_agl >= 100) & (z_agl <= 1000)
+    level_hpa = w["level"]
+    mask_v = (level_hpa >= 100) & (level_hpa <= 1000)
     w_layer = w.where(mask_v)
 
-    # upward/downward vertical velocity maxima/minima in lowest 1 km
+    # upward/downward vertical velocity maxima/minima in 100-1000 mb layer
     ds["MAXUVV_max_100_1000mb"] = w_layer.clip(min=0).max("level", skipna=True).fillna(0).astype(np.float32)
     ds["MAXDVV_max_100_1000mb"] = w_layer.clip(max=0).min("level", skipna=True).fillna(0).astype(np.float32)
 
