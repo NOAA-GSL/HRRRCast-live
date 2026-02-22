@@ -711,6 +711,11 @@ class WeatherForecaster:
             write_hour_outputs(0, state_from_hour[member].numpy(), member)
         history[0] = {"step": 0, "from": 0}
 
+        # phase shift of GFS forcing input
+        phase_angle = {
+            member: 0 if member == 0 else np.random.uniform(-1, 1) for member in self.members
+        }
+
         # Process all hourly steps
         for hour in tqdm(range(1, target_hour + 1), desc="Forecasting"):
             from_hour = ((hour - 1) // 6) * 6
@@ -724,17 +729,9 @@ class WeatherForecaster:
                 tf.cast(step / 6.0, tf.float32),
             )
 
-            # Add phase uncertainity to the forcing input for this hour.
-            # Width of uncertainity Δt(t)=min(4,⌊0.5+2(1−e−t/18)⌋)
-            phase_width = min(3, int(0.5 + 4 * (1 - np.exp(-hour / 24))))
-            forcing_idx = hour - 1 + np.random.randint(-phase_width, phase_width + 1)
-            forcing_idx = np.clip(forcing_idx, 0, forcing_input.shape[0] - 1)
-
             # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
             X_base = tf.concat(
                 [
-                    X[:, :, :, :self.predicted_channels],
-                    forcing_input[forcing_idx:forcing_idx + 1, :, :, :],
                     X[:, :, :, start_pred_noise:-8],
                     date_encoding,
                     X[:, :, :, -2:-1],
@@ -744,11 +741,19 @@ class WeatherForecaster:
             )
 
             for member in self.members:
+
+                # apply phase shift to forcing input index for this member
+                phase_width = from_hour // 12
+                phase_shift = round(phase_width * phase_angle[member])
+                forcing_idx = hour - 1 + phase_shift
+                forcing_idx = np.clip(forcing_idx, 0, forcing_input.shape[0] - 1)
+
                 # update with new state_from_hour for this member
                 X_member = tf.concat(
                     [
                         state_from_hour[member],
-                        X_base[:, :, :, self.predicted_channels:],
+                        forcing_input[forcing_idx:forcing_idx + 1, :, :, :],
+                        X_base,
                     ],
                     axis=-1,
                 )
