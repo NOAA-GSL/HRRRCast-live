@@ -6,14 +6,21 @@ HRRRCast is a neural network-based, high‑resolution regional weather forecasti
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Ensemble and PMM Support](#ensemble-and-pmm-support)
 - [End‑to‑End Pipeline](#end-to-end-pipeline)
 - [Model Usage](#model-usage)
 - [Data & Channels](#data--channels)
+- [Diagnostic Variables](#diagnostic-variables)
 - [APCP Handling Logic](#apcp-handling-logic)
 - [GRIB2 Export](#grib2-export)
-- [Examples](#examples)
+- [Outputs & Naming](#outputs--naming)
+- [Available Models](#available-models)
+- [Logging & Utilities](#logging--utilities)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
+- [License](#license)
+- [Citation](#citation)
+- [Support](#support)
 
 ## Installation
 
@@ -31,7 +38,7 @@ HRRRCast is a neural network-based, high‑resolution regional weather forecasti
 
 ```bash
 conda env create -f environment.yaml
-conda activate hrrrcast-live
+conda activate hrrrcast
 ```
 
 ### HPC Installation (No Internet on Compute Nodes)
@@ -108,15 +115,11 @@ python src/plot.py <inittime> <lead_hour> --members 0-2 --forecast_dir <forecast
 
 **Note:** This will generate plots for all hours from 1 to `lead_hour` (inclusive) for each member, saving each hour's plots in a separate subdirectory.
 
-#### GRIB2 Conversion (optional)
+#### GRIB2 Output (default)
 
-After generating NetCDF forecasts you can convert to GRIB2 (requires `cf-units`, `iris`, `iris-grib`, `eccodes`, `wgrib2`):
+Forecasts run via `src/fcst.py` write **both NetCDF and GRIB2** outputs by default (per-hour files during rollout). GRIB2 export uses `grib2io`, `eccodes`, and system `wgrib2`.
 
-```bash
-python src/nc2grib.py  # (create a small driver if needed, see class Netcdf2Grib)
-```
-
-The `Netcdf2Grib` class applies GRIB template tweaks (centre, parameter overrides) and writes index (`.idx`) files via `wgrib2`.
+If you need a standalone conversion utility, use `src/nc2grib.py` (see `Netcdf2Grib`).
 
 ## Ensemble and PMM Support
 
@@ -132,9 +135,9 @@ The `Netcdf2Grib` class applies GRIB template tweaks (centre, parameter override
 | 2. Build IC dataset | `src/make_ics.py` | Reads HRRR GRIB, applies per‑variable / per‑level normalization, log transforms, APCP replacement strategy, saves `.npz` |
 | 3. Download GFS boundary GRIBs | `src/get_bcs.py` | Selects appropriate synoptic cycle(s); can ensure required f006 and window coverage |
 | 4. Build BC dataset | `src/make_bcs.py` | Interpolates GFS fields to downsampled HRRR grid (xESMF), normalizes, APCP future synoptic sourcing, saves `.npz` |
-| 5. Run forecast | `src/fcst.py` | Loads IC + BC arrays, assembles inputs, runs deterministic or diffusion model, writes NetCDF outputs (`hrrrcast_memX.nc`) |
+| 5. Run forecast | `src/fcst.py` | Loads IC + BC arrays, assembles inputs, runs deterministic or diffusion model, writes per-hour NetCDF **and GRIB2** outputs |
 | 6. Plot results | `src/plot.py` | Parallel (per lead hour) map plots for pressure & surface variables + summary panels |
-| 7. (Optional) GRIB2 export | `src/nc2grib.py` | Converts NetCDF member/mean outputs to GRIB2 with parameter metadata |
+| 7. (Optional) Standalone GRIB2 export | `src/nc2grib.py` | Converts NetCDF member/mean outputs to GRIB2 with parameter metadata |
 
 All scripts use centralized utilities in `src/utils.py` for logging (`setup_logging`), directory creation, datetime validation, and resilient downloading.
 
@@ -152,59 +155,34 @@ model = tf.keras.models.load_model("net-deterministic/model.keras", safe_mode=Fa
 
 ### Input/Output Dimensions
 
-- **Input**: `(batch_size, 530, 900, 77)`
-- **Output**: `(batch_size, 530, 900, 74)`
-
 The spatial grid (530×900) represents every other grid point from the original HRRR grid (1059×1799).
 
 ## Data & Channels
 
-Channel counts are now dynamic and driven by configuration in `make_ics.py` / `make_bcs.py`:
+Channel counts are dynamic and driven by configuration in `make_ics.py` / `make_bcs.py`. Use those scripts (or `fcst.py`) to confirm the exact channel counts for a given model. The default configuration in `make_ics.py` is:
 
 | Category | Components | Count (default) |
 |----------|------------|-----------------|
 | Pressure-level variables | 6 vars × 20 levels (UGRD,VGRD,VVEL,TMP,HGT,SPFH) | 120 |
-| Surface dynamic variables | 15 (PRES, MSLMA, REFC, T2M, UGRD10M, VGRD10M, UGRD80M, VGRD80M, D2M, R2M, TCDC, VIS, APCP, HGTCC, CAPE, CIN) | 15 |
+| Surface dynamic variables | 18 (PRES, MSLMA, REFC, T2M, UGRD10M, VGRD10M, UGRD80M, VGRD80M, D2M, TCDC, LCDC, MCDC, HCDC, VIS, APCP, HGTCC, CAPE, CIN) | 18 |
 | Static constants | LAND, OROG | 2 |
 | Lead time (per step, autoregressive) | 1 | 1 |
-| Total model input (IC) | 120 + 15 + 2 + 1 | 138 |
+| Total model input (IC) | 120 + 18 + 2 + 1 | 141 |
 
-The forecast model typically predicts only the dynamic meteorological fields (pressure-level + surface set, excluding static + lead-time). This predicted channel count is inferred automatically in `fcst.py`.
+The forecast model typically predicts only the dynamic meteorological fields (pressure-level + surface set, excluding static + lead-time). The exact predicted channel count is inferred automatically in `fcst.py` and depends on the model configuration.
 
-### Lead Time Encoding
-Lead time channel value per step: `lead_hours / MAX_STEP` (default max step = 6 for base model cadence). Autoregressive rollouts update this channel each inference slice.
+## Diagnostic Variables
 
-### Normalization
+Diagnostics are computed in [src/diagnostics.py](src/diagnostics.py) via `compute_diagnostics()`. You can run all diagnostics or select a subset with `include`/`exclude` flags.
 
-All inputs are normalized using:
-```
-x_normalized = (x - mean) / std
-```
+Available diagnostic groups (see function docstrings for full variable lists):
 
-Per-variable / per-level statistics are stored in `normalize.nc` (pressure variables stored with shape `(2, nLevels)`; surface as `(2, ...)`).
-
-#### Static Variables Normalization
-```python
-c_mean = constants.mean(("lat", "lon"))
-c_std = constants.std(("lat", "lon"))
-constants_normalized = (constants - c_mean) / c_std
-constants_normalized = constants_normalized.fillna(0)
-```
-
-### Output Denormalization
-
-Model outputs are normalized and must be denormalized:
-```
-x = x_normalized * std + mean
-```
-
-### Extended Forecasts
-
-For forecasts beyond 6 hours, use rollout prediction:
-
-**Example**: 16-hour forecast decomposition:
-- 2 × 6-hour steps
-- 1 × 4-hour step  
+- **Surface thermodynamics**: R2M, SPFH2M, POT2M
+- **Column-integrated**: PWAT
+- **Precipitation diagnostics**: CRAIN, CFRZR, and related masks/fractions
+- **Wind diagnostics**: GUST, GUST_FACTOR, GUST_CONV, WIND_10M, WIND_MAX
+- **Convective diagnostics**: shear, helicity, vorticity, storm motion, updraft helicity, and vertical velocity extrema
+- **Vertical profile**: 0°C isotherm height/pressure and RH_0C
 
 ## APCP Handling Logic
 
@@ -218,71 +196,40 @@ Logging clearly notes when APCP is substituted (INFO) or when fallback occurs (D
 
 ## GRIB2 Export
 
-`nc2grib.py` converts NetCDF forecast outputs to GRIB2 with:
+GRIB2 export is handled in `src/fcst.py` during forecasts. For standalone conversion, `nc2grib.py` converts NetCDF forecast outputs to GRIB2 with:
 * Parameter overrides (`GRIB_PARAM_OVERRIDE`) and center metadata
 * Cube attribute mapping (`ATTR_MAPS`)
 * Optional index generation via `wgrib2` (`.idx` files)
 
-Dependencies: `iris`, `iris-grib`, `cf-units`, `eccodes`, `wgrib2`. These are optional and not required for core inference/plotting.
+Dependencies: `grib2io`, `eccodes`, `wgrib2`. These are optional and not required for core inference/plotting.
+
+## Outputs & Naming
+
+Forecast outputs are written per hour into:
+
+```
+<output_dir>/<YYYYMMDD>/<HH>/
+```
+
+Where `<YYYYMMDD>` and `<HH>` come from the initialization time.
+
+**NetCDF** (per hour):
+
+- Members: `hrrrcast_mem<NN>_f<HH>.nc` (e.g., `hrrrcast_mem0_f03.nc`)
+- Ensemble mean: `hrrrcast_avg_f<HH>.nc`
+
+**GRIB2** (per hour):
+
+- Members: `hrrrcast.m<NN>.t<HH>z.pgrb2.f<HH>`
+- Ensemble mean: `hrrrcast.avg.t<HH>z.pgrb2.f<HH>`
+
+Hour `f00` is written for the initial state when per-hour outputs are enabled.
 
 ## Available Models
 
 | Model | Use |
 |-------|------------|
 | net-diffusion | For probabilistic forecast |
-| net-deterministic | For deterministic forecast |
-
-## Examples
-
-### Basic Prediction
-
-```python
-import tensorflow as tf
-import numpy as np
-
-# Load model
-model = tf.keras.models.load_model("net-deterministic/model.keras", safe_mode=False, compile=False)
-
-# Prepare input (example dimensions)
-batch_size = 1
-input_data = np.random.randn(batch_size, 530, 900, 77)
-
-# Run prediction
-prediction = model.predict(input_data)
-print(f"Prediction shape: {prediction.shape}")  # (1, 530, 900, 74)
-```
-
-### Multi-Step Forecast
-
-```python
-def rollout_forecast(model, initial_state, target_hours):
-    """
-    Perform multi-step forecast using rollout approach
-    """
-    current_state = initial_state.copy()
-    forecasts = []
-    
-    remaining_hours = target_hours
-    
-    while remaining_hours > 0:
-        if remaining_hours >= 6:
-            lead_time = 6
-        else:
-            lead_time = remaining_hours
-            
-        # Set lead time channel
-        current_state[:, :, :, -1] = lead_time / 6.0
-        
-        # Predict
-        forecast = model.predict(current_state)
-        forecasts.append(forecast)
-        
-        # Update state for next iteration
-        current_state[:, :, :, :74] = forecast
-        remaining_hours -= lead_time
-    
-    return forecasts
-```
 
 ## Logging & Utilities
 
@@ -322,8 +269,7 @@ Customize log verbosity with `--log_level` on each CLI.
 5. Submit a pull request
 
 ## License
-
-[Add your license information here]
+MIT License. See [LICENSE](LICENSE).
 
 ## Citation
 
@@ -345,4 +291,4 @@ For questions or issues not covered in this README, please open an issue in the 
 
 ---
 
-*This README reflects the live (feature/hrrrcast_v2) pipeline. Refer to source code and the cited paper for deeper architectural details.*
+*This README reflects the live pipeline as of 2026-02-23. Refer to source code and the cited paper for deeper architectural details.*
