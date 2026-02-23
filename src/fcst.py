@@ -29,7 +29,6 @@ from nc2grib import Netcdf2Grib
 # Import custom modules (assuming they exist)
 try:
     import resnet
-    import losses
 except ImportError as e:
     logging.warning(f"Could not import custom modules: {e}")
 
