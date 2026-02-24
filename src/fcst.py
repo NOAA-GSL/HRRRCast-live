@@ -174,6 +174,7 @@ class WeatherForecaster:
         self,
         data_loader_hrrr: PreprocessedDataLoader,
         data_loader_gfs: PreprocessedDataLoader,
+        num_members: int,
         members: List[int],
         use_diffusion: bool,
         predicted_channels: Optional[int] = None,
@@ -183,6 +184,7 @@ class WeatherForecaster:
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
         self.metadata = data_loader_hrrr.metadata
+        self.num_members = num_members
         self.members = members
         self.use_diffusion = use_diffusion
 
@@ -712,9 +714,17 @@ class WeatherForecaster:
         history[0] = {"step": 0, "from": 0}
 
         # phase shift of GFS forcing input
-        phase_angle = {
-            member: 0 if member == 0 else np.random.uniform(-1, 1) for member in self.members
-        }
+        num_members = self.num_members
+        members_sorted = list(range(num_members))
+        half_count = num_members // 2  # Half count for symmetry
+        step = 1.0 / (half_count + (num_members % 2))  # Adjust step for odd/even
+        seq = []
+        if num_members % 2 == 1:  # Add zero phase shift for odd
+            seq.append(0.0)
+        for i in range(half_count):
+            seq.append(step * (i + 1))  # Positive phase shifts
+            seq.append(-step * (i + 1))  # Negative phase shifts
+        phase_angle = {member: seq[i] for i, member in enumerate(members_sorted)}
 
         # Process all hourly steps
         for hour in tqdm(range(1, target_hour + 1), desc="Forecasting"):
@@ -883,6 +893,7 @@ def parse_arguments():
     parser.add_argument("model_path", help="Path to the trained model")
     parser.add_argument('inittime', help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hours", type=int, help="Lead time in hours")
+    parser.add_argument("--num_members", type=int, default=1, help="Number of ensemble members to generate")
     parser.add_argument("--members", nargs='+', required=True, help="List of ensemble member IDs (e.g., 0 1 2 or 0,1,2)")
     parser.add_argument("--no_diffusion", default=False, action="store_true", help="Turn off diffusion")
     parser.add_argument("--base_dir", default="./", help="Base directory for input preprocessed files")
@@ -970,7 +981,9 @@ def main():
                 axis=-1
             )
         
-        forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs, members, not args.no_diffusion,
+        forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs,
+                                        args.num_members, members,
+                                        not args.no_diffusion,
                                         predicted_channels=predicted_channels,
                                         gfs_channels=gfs_channels,
                                         static_channels=static_channels)
