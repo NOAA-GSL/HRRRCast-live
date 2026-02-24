@@ -176,6 +176,7 @@ class WeatherForecaster:
         data_loader_gfs: PreprocessedDataLoader,
         num_members: int,
         members: List[int],
+        batch_size: int,
         use_diffusion: bool,
         predicted_channels: Optional[int] = None,
         gfs_channels: Optional[int] = None,
@@ -186,6 +187,7 @@ class WeatherForecaster:
         self.metadata = data_loader_hrrr.metadata
         self.num_members = num_members
         self.members = members
+        self.batch_size = batch_size
         self.use_diffusion = use_diffusion
 
         # log-transform variables list
@@ -619,13 +621,31 @@ class WeatherForecaster:
         enc = get_encoding_tensor(enc)
         return enc
 
-    def predict(self, model: ForecastModel, X: tf.Tensor, member: int) -> tf.Tensor:
+    def predict(self, model: ForecastModel, X: tf.Tensor, members: Union[int, List[int]]) -> tf.Tensor:
+        """Predict using diffusion or CRPS model.
+        
+        Args:
+            model: ForecastModel to use for predictions
+            X: Input tensor, shape (batch_size, H, W, C)
+            members: Single member ID (int) for batch_size=1, or list of member IDs for batch_size>1
+                    Length must match batch_size of X.
+        
+        Returns:
+            Predicted tensor of shape (batch_size, H, W, predicted_channels)
+        """
+        # Normalize members to list
+        if isinstance(members, int):
+            members = [members]
+        
+        batch_size = X.shape[0]
+        
         if self.use_diffusion:
             num_output_channels = self.predicted_channels
             start = self.predicted_channels + self.gfs_channels
 
-            # start from complete gaussian noise
-            Xn = self.member_noise[member]
+            # Start from complete gaussian noise (per member)
+            Xn_list = [self.member_noise[m] for m in members]
+            Xn = tf.concat(Xn_list, axis=0)  # (batch_size, H, W, C)
 
             # iterate over diffusion steps
             for t_ in tqdm(range(NUM_INFERENCE_STEPS - 1)):
@@ -651,12 +671,13 @@ class WeatherForecaster:
                 # predict total noise
                 x_0 = model.predict(X)
                 epsilon_t = compute_epsilon(Xn, x_0, t)
-                Xn = ddim(Xn, epsilon_t, ti, seed=member)
+                Xn = ddim(Xn, epsilon_t, ti, seed=members)
 
             return Xn
         else:
-            # set CRPS member
-            Xn = self.member_noise[member]
+            # set CRPS member (per-member noise)
+            Xn_list = [self.member_noise[m] for m in members]
+            Xn = tf.concat(Xn_list, axis=0)  # (batch_size, H, W, C)
             X = tf.concat(
                 [
                     X[:, :, :, :-2],
@@ -750,39 +771,55 @@ class WeatherForecaster:
                 axis=-1,
             )
 
-            for member in self.members:
+            # Process members in batches
+            batch_size = self.batch_size
+            for batch_start in range(0, len(self.members), batch_size):
+                batch_end = min(batch_start + batch_size, len(self.members))
+                batch_members_list = self.members[batch_start:batch_end]
+                
+                # Collect inputs for this batch of members
+                batch_X_members = []
+                
+                for member in batch_members_list:
+                    # apply phase shift to forcing input index for this member
+                    phase_width = from_hour // 12
+                    phase_shift = round(phase_width * phase_angle[member])
+                    forcing_idx = hour - 1 + phase_shift
+                    forcing_idx = np.clip(forcing_idx, 0, forcing_input.shape[0] - 1)
 
-                # apply phase shift to forcing input index for this member
-                phase_width = from_hour // 12
-                phase_shift = round(phase_width * phase_angle[member])
-                forcing_idx = hour - 1 + phase_shift
-                forcing_idx = np.clip(forcing_idx, 0, forcing_input.shape[0] - 1)
-
-                # update with new state_from_hour for this member
-                X_member = tf.concat(
-                    [
-                        state_from_hour[member],
-                        forcing_input[forcing_idx:forcing_idx + 1, :, :, :],
-                        X_base,
-                    ],
-                    axis=-1,
+                    # Assemble input for this member
+                    X_member = tf.concat(
+                        [
+                            state_from_hour[member],
+                            forcing_input[forcing_idx:forcing_idx + 1, :, :, :],
+                            X_base,
+                        ],
+                        axis=-1,
+                    )
+                    batch_X_members.append(X_member)
+                
+                # Stack batch inputs
+                X_batch = tf.concat(batch_X_members, axis=0)
+                
+                # Predict next-hour fields for entire batch
+                y_batch = self.predict(model, X_batch, batch_members_list)
+                y_batch = tf.clip_by_value(
+                    y_batch,
+                    self.channel_mins[:y_batch.shape[-1]],
+                    self.channel_maxs[:y_batch.shape[-1]]
                 )
+                
+                # Process outputs for each member in batch
+                for batch_idx, member in enumerate(batch_members_list):
+                    y = y_batch[batch_idx:batch_idx+1]
+                    
+                    # When we reach a 6-hour boundary, update the reference 
+                    # state for this member
+                    if hour % 6 == 0:
+                        state_from_hour[member] = y
 
-                # Predict next-hour fields (predicted channels only)
-                y = self.predict(model, X_member, member)
-                y = tf.clip_by_value(
-                    y,
-                    self.channel_mins[:y.shape[-1]],
-                    self.channel_maxs[:y.shape[-1]]
-                )
-
-                # When we reach a 6-hour boundary, update the reference 
-                # state for this member
-                if hour % 6 == 0:
-                    state_from_hour[member] = y
-
-                # Write out per-hour products if requested
-                write_hour_outputs(hour, y.numpy(), member)
+                    # Write out per-hour products if requested
+                    write_hour_outputs(hour, y.numpy(), member)
 
         logger.info("Autoregressive rollout completed")
         return history
@@ -895,6 +932,7 @@ def parse_arguments():
     parser.add_argument("lead_hours", type=int, help="Lead time in hours")
     parser.add_argument("--num_members", type=int, default=1, help="Number of ensemble members to generate")
     parser.add_argument("--members", nargs='+', required=True, help="List of ensemble member IDs (e.g., 0 1 2 or 0,1,2)")
+    parser.add_argument("--batch_size", type=int, default=3, help="Batch size for model inference")
     parser.add_argument("--no_diffusion", default=False, action="store_true", help="Turn off diffusion")
     parser.add_argument("--base_dir", default="./", help="Base directory for input preprocessed files")
     parser.add_argument("--output_dir", default="./", help="Output directory for forecast files")
@@ -983,7 +1021,7 @@ def main():
         
         forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs,
                                         args.num_members, members,
-                                        not args.no_diffusion,
+                                        args.batch_size, not args.no_diffusion,
                                         predicted_channels=predicted_channels,
                                         gfs_channels=gfs_channels,
                                         static_channels=static_channels)

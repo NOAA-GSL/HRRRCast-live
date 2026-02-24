@@ -22,6 +22,7 @@ Functions:
 
 import numpy as np
 import tensorflow as tf
+from typing import Union
 
 
 # ==== Diffusion and CRPS configuration ====
@@ -204,17 +205,24 @@ def compute_epsilon(x_t: tf.Tensor, x_0: tf.Tensor, t: tf.Tensor) -> tf.Tensor:
     return epsilon
 
 
-def ddpm(x_t: tf.Tensor, pred_noise: tf.Tensor, t_: int, seed: int = 0) -> tf.Tensor:
+def ddpm(x_t: tf.Tensor, pred_noise: tf.Tensor, t_: int, seed: Union[int, list] = 0) -> tf.Tensor:
     """
     Reverse diffusion step using DDPM.
     Args:
-        x_t (tf.Tensor): Noised tensor at time t.
-        pred_noise (tf.Tensor): Predicted noise.
+        x_t (tf.Tensor): Noised tensor at time t, shape (batch_size, H, W, C).
+        pred_noise (tf.Tensor): Predicted noise, shape (batch_size, H, W, C).
         t_ (int): Inference step index.
-        seed (int): Random seed for reproducibility.
+        seed (int or list): Random seed for reproducibility. If list, must match batch_size.
     Returns:
         x_{t-1} (tf.Tensor): tensor after one reverse step.
     """
+    # Normalize seed to list
+    batch_size = tf.shape(x_t)[0]
+    if isinstance(seed, int):
+        seeds = [seed] * batch_size
+    else:
+        seeds = seed
+    
     t = tf.gather(list(INFERENCE_STEPS), t_ - 1)
     ALPHA_t = tf.gather(ALPHA, t)
     ALPHA_BAR_t = tf.gather(ALPHA_BAR, t)
@@ -223,15 +231,17 @@ def ddpm(x_t: tf.Tensor, pred_noise: tf.Tensor, t_: int, seed: int = 0) -> tf.Te
     mean = (1.0 / tf.sqrt(ALPHA_t)) * (x_t - eps_coef * pred_noise)
     var = tf.where(t > 0, BETA_t, tf.zeros([], tf.float32))
 
-    # add stochasticity
-    batch_size = tf.shape(x_t)[0]
+    # add stochasticity per sample
     z_shape = tf.shape(x_t)[1:]
-    z = tf.random.stateless_normal(
-        shape=tf.concat([[1], z_shape], axis=0),
-        seed=tf.stack([seed, t]),
-        dtype=tf.float32
-    )
-    z = tf.tile(z, [batch_size] + [1] * (len(z_shape)))
+    z_samples = []
+    for batch_idx, s in enumerate(seeds):
+        z = tf.random.stateless_normal(
+            shape=tf.concat([[1], z_shape], axis=0),
+            seed=tf.stack([s, t]),
+            dtype=tf.float32
+        )
+        z_samples.append(z)
+    z = tf.concat(z_samples, axis=0)  # (batch_size, H, W, C)
 
     return mean + tf.sqrt(var) * z
 
@@ -240,20 +250,27 @@ def ddim(
     x_t: tf.Tensor,
     pred_noise: tf.Tensor,
     t_: int,
-    seed: int = 0,
+    seed: Union[int, list] = 0,
     eta: float = 0.0,
 ) -> tf.Tensor:
     """
     DDIM + stochasticity using DDIM η-schedule (stable).
     Args:
-        x_t: Noised sample at DDIM inference step.
-        pred_noise: Predicted noise ε_θ(x_t, t).
+        x_t: Noised sample at DDIM inference step, shape (batch_size, H, W, C).
+        pred_noise: Predicted noise ε_θ(x_t, t), shape (batch_size, H, W, C).
         t_: Inference index (not training timestep index).
-        seed: RNG seed.
+        seed: RNG seed. If int, use for all samples. If list, must match batch_size.
         eta: DDIM stochasticity parameter (0 = deterministic, 1 = DDPM-level variance).
     Returns:
         x_{t-1} (tf.Tensor): tensor after one reverse step.
     """
+    # Normalize seed to list
+    batch_size = tf.shape(x_t)[0]
+    if isinstance(seed, int):
+        seeds = [seed] * batch_size
+    else:
+        seeds = seed
+    
     t = tf.gather(list(INFERENCE_STEPS), t_)
     tm1 = tf.gather(list(INFERENCE_STEPS), t_ - 1)
     ALPHA_BAR_t = tf.gather(ALPHA_BAR, t)
@@ -276,16 +293,18 @@ def ddim(
         tf.sqrt(1.0 - ALPHA_BAR_tm1 - sigma_t**2) * pred_noise
     )
 
-    # Add stochastic residual noise
+    # Add stochastic residual noise per sample
     if eta > 0.0:
-        batch_size = tf.shape(x_t)[0]
         z_shape = tf.shape(x_t)[1:]
-        z = tf.random.stateless_normal(
-            shape=tf.concat([[1], z_shape], axis=0),
-            seed=tf.stack([seed, t]),
-            dtype=tf.float32
-        )
-        z = tf.tile(z, [batch_size] + [1] * (len(z_shape)))
+        z_samples = []
+        for batch_idx, s in enumerate(seeds):
+            z = tf.random.stateless_normal(
+                shape=tf.concat([[1], z_shape], axis=0),
+                seed=tf.stack([s, t]),
+                dtype=tf.float32
+            )
+            z_samples.append(z)
+        z = tf.concat(z_samples, axis=0)  # (batch_size, H, W, C)
         x_tm1 = mean + sigma_t * z
     else:
         x_tm1 = mean
