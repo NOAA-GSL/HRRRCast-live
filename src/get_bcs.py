@@ -6,16 +6,13 @@ Downloads GFS GRIB2 files for lateral boundary conditions.
 
 import argparse
 import logging
-import os
 import sys
 from datetime import datetime, timedelta
-from dateutil import parser
 from pathlib import Path
 from typing import List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import utils
 from utils import setup_logging, create_output_directory, download_file_with_retry
-import math
 
 # -------------------------------
 # Configuration

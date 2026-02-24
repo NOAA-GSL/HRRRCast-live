@@ -14,8 +14,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timedelta
-from dateutil import parser
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed

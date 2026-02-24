@@ -1,5 +1,4 @@
 import numpy as np
-import xarray as xr
 
 def log_transform_array(arr: np.ndarray) -> np.ndarray:
     """

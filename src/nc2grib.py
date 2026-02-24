@@ -1,23 +1,28 @@
 """
 GRIB2 writer using grib2io for HRRRCast outputs.
 
-This module replaces the earlier iris/eccodes-based writer with a direct grib2io
-implementation inspired by NOAA-EMC MLGlobal's grib2writer.py.
+This module converts NetCDF forecast output to GRIB2 format using grib2io,
+inspired by NOAA-EMC MLGlobal's grib2writer.py.
+
+The Netcdf2Grib class handles per-member forecast writes, supporting both
+single-hour and multi-hour datasets. Per-hour writes enable overlapped I/O
+during autoregressive forecasting.
 
 Notes/assumptions:
-- We require a valid GRIB2 Section 3 (grid definition) for the HRRRCast Lambert
-    Conformal grid. Provide this via the Netcdf2Grib(section3=...) constructor or
-    by setting the environment variable NETCDF2GRIB_SECTION3 to a .npy file containing
-    the section3 integer array. If neither is provided, we auto-construct a canonical
-    HRRR-like Lambert Conformal Section 3 for the downsampled 6 km grid (Nx=900, Ny=530).
-- Product Definition Template Numbers (pdtn) and Data Representation Template
-  Numbers (drtn) default to 0 (instantaneous forecast, simple packing). For
-  accumulated fields (e.g., APCP) you may wish to adjust pdtn and the duration
-  semantics to match downstream consumers.
+- Grid Definition: We require a valid GRIB2 Section 3 for the HRRRCast Lambert
+  Conformal grid. Provide via Netcdf2Grib(section3=...) constructor or set the
+  environment variable NETCDF2GRIB_SECTION3 to a .npy file. If neither is provided,
+  we auto-construct a canonical HRRR Lambert Conformal Section 3 for the 6 km
+  downsampled grid (Nx=900, Ny=530).
+- Template Numbers: Product Definition Template Numbers (pdtn) and Data Representation
+  Template Numbers (drtn) default to 0 (instantaneous forecast, simple packing).
+  For accumulated fields (e.g., APCP), adjust pdtn and duration semantics to match
+  downstream consumers.
+- Member IDs: Each member forecast can be written independently, allowing per-member
+  outputs with consistent naming conventions.
 """
 
 import os
-import json
 import subprocess
 from datetime import datetime, timedelta
 from typing import Optional, Tuple

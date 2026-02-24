@@ -22,6 +22,5 @@ dependencies:
   - pygrib
   - tensorflow==2.15.0
   - eccodes
-  - scitools-iris
-  - iris-grib
   - cf-units
+  - grib2io

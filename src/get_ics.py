@@ -6,10 +6,8 @@ Downloads HRRR GRIB2 files for initial conditions.
 
 import argparse
 import logging
-import os
 import sys
-from datetime import datetime, timedelta
-from dateutil import parser
+from datetime import timedelta
 from pathlib import Path
 from typing import List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed

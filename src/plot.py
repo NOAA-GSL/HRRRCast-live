@@ -17,17 +17,14 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime, timedelta
-from dateutil import parser
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from datetime import timedelta
+from typing import Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
 import xarray as xr
-from matplotlib.patches import Rectangle
 try:
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
