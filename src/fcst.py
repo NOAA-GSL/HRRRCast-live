@@ -944,7 +944,7 @@ def parse_arguments():
     parser.add_argument("lead_hours", type=int, help="Lead time in hours")
     parser.add_argument("--num_members", type=int, default=1, help="Number of ensemble members to generate")
     parser.add_argument("--members", nargs='+', required=True, help="List of ensemble member IDs (e.g., 0 1 2 or 0,1,2)")
-    parser.add_argument("--batch_size", type=int, default=3, help="Batch size for model inference")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for model inference")
     parser.add_argument("--no_diffusion", default=False, action="store_true", help="Turn off diffusion")
     parser.add_argument("--base_dir", default="./", help="Base directory for input preprocessed files")
     parser.add_argument("--output_dir", default="./", help="Output directory for forecast files")
