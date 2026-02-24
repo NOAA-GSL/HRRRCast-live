@@ -13,16 +13,17 @@ import argparse
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from dateutil import parser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import tensorflow as tf
 import xarray as xr
 import pandas as pd
-from tqdm import tqdm
 
 from nc2grib import Netcdf2Grib
 
@@ -633,12 +634,6 @@ class WeatherForecaster:
         Returns:
             Predicted tensor of shape (batch_size, H, W, predicted_channels)
         """
-        # Normalize members to list
-        if isinstance(members, int):
-            members = [members]
-        
-        batch_size = X.shape[0]
-        
         if self.use_diffusion:
             num_output_channels = self.predicted_channels
             start = self.predicted_channels + self.gfs_channels
@@ -648,7 +643,7 @@ class WeatherForecaster:
             Xn = tf.concat(Xn_list, axis=0)  # (batch_size, H, W, C)
 
             # iterate over diffusion steps
-            for t_ in tqdm(range(NUM_INFERENCE_STEPS - 1)):
+            for t_ in range(NUM_INFERENCE_STEPS - 1):
                 ti = NUM_INFERENCE_STEPS - 1 - t_
                 t = INFERENCE_STEPS[ti]
 
@@ -693,13 +688,18 @@ class WeatherForecaster:
                              target_hour: int,
                              output_dir: Optional[str] = None,
                              init_datetime: Optional[datetime] = None,
-                             write_per_hour: bool = False) -> Dict[int, Dict]:
-        """Perform greedy autoregressive rollout.
+                             write_per_hour: bool = False,
+                             max_io_workers: int = 4) -> Dict[int, Dict]:
+        """Perform greedy autoregressive rollout with overlapped I/O.
 
         When write_per_hour=True, persist single-hour NetCDF and GRIB2 files for each lead hour,
-        including f00 representing the initial state.
+        including f00 representing the initial state. I/O is done in background threads to overlap
+        with forecasting.
+        
+        Args:
+            max_io_workers: Maximum number of threads for concurrent output writing (default 4)
         """
-        logger.info(f"Starting autoregressive rollout for {target_hour} hours")
+        logger.info(f"Starting autoregressive rollout for {target_hour} hours with max_io_workers={max_io_workers}")
         
         # Initial input (updated during rollout)
         X = tf.convert_to_tensor(initial_input, dtype=tf.float32)
@@ -708,7 +708,6 @@ class WeatherForecaster:
         state_from_hour = {
             member: tf.identity(X[0:1, :, :, :self.predicted_channels]) for member in self.members
         }
-        history = {0: {'step': 0, 'from': None}}
 
         start_pred_noise = self.predicted_channels + self.gfs_channels
 
@@ -726,13 +725,21 @@ class WeatherForecaster:
                 ds_hour = self.build_single_hour_dataset(init_datetime, hour, lats, lons, data)
                 _ = self.write_single_hour_netcdf(init_datetime, hour, ds_hour, output_dir, member)
                 self.write_single_hour_grib2(init_datetime, hour, ds_hour, output_dir, member)
+                logger.debug(f"Completed writing hour {hour} for member {member}")
             except Exception as e:
                 logger.error(f"Failed writing hour {hour} outputs for member {member}: {e}")
 
+        # ThreadPoolExecutor for overlapped I/O
+        io_executor = ThreadPoolExecutor(max_workers=max_io_workers) if write_per_hour else None
+        io_futures = []
+
         # Write out hour 0 (f00) products representing the initial state for each member
         for member in self.members:
-            write_hour_outputs(0, state_from_hour[member].numpy(), member)
-        history[0] = {"step": 0, "from": 0}
+            if io_executor:
+                future = io_executor.submit(write_hour_outputs, 0, state_from_hour[member].numpy().copy(), member)
+                io_futures.append(future)
+            else:
+                write_hour_outputs(0, state_from_hour[member].numpy(), member)
 
         # phase shift of GFS forcing input
         num_members = self.num_members
@@ -748,10 +755,10 @@ class WeatherForecaster:
         phase_angle = {member: seq[i] for i, member in enumerate(members_sorted)}
 
         # Process all hourly steps
-        for hour in tqdm(range(1, target_hour + 1), desc="Forecasting"):
+        for hour in range(1, target_hour + 1):
             from_hour = ((hour - 1) // 6) * 6
             step = hour - from_hour
-            history[hour] = {"step": step, "from": from_hour}
+            logger.info(f"Forecasting hour {hour:2d}: from hour {from_hour:2d} using step {step}h")
 
             # date encoding
             date_encoding = self.date_encoding_tensor(init_datetime, hour)
@@ -802,7 +809,11 @@ class WeatherForecaster:
                 X_batch = tf.concat(batch_X_members, axis=0)
                 
                 # Predict next-hour fields for entire batch
+                t0 = time.time()
                 y_batch = self.predict(model, X_batch, batch_members_list)
+                predict_time = time.time() - t0
+                logger.info(f"Hour {hour}, batch {batch_start//batch_size + 1}: predict took {predict_time:.3f}s")
+                
                 y_batch = tf.clip_by_value(
                     y_batch,
                     self.channel_mins[:y_batch.shape[-1]],
@@ -818,11 +829,25 @@ class WeatherForecaster:
                     if hour % 6 == 0:
                         state_from_hour[member] = y
 
-                    # Write out per-hour products if requested
-                    write_hour_outputs(hour, y.numpy(), member)
+                    # Write out per-hour products asynchronously
+                    if io_executor:
+                        future = io_executor.submit(write_hour_outputs, hour, y.numpy().copy(), member)
+                        io_futures.append(future)
+                    else:
+                        write_hour_outputs(hour, y.numpy(), member)
+
+        # Wait for all I/O operations to complete
+        if io_executor:
+            logger.info(f"Waiting for {len(io_futures)} I/O operations to complete...")
+            for future in as_completed(io_futures):
+                try:
+                    future.result()  # Raise any exceptions that occurred
+                except Exception as e:
+                    logger.error(f"I/O operation failed: {e}")
+            io_executor.shutdown(wait=True)
+            logger.info("All I/O operations completed")
 
         logger.info("Autoregressive rollout completed")
-        return history
 
     def create_xarray_dataset(self, init_datetime: datetime, times: List[int], 
                             lats: np.ndarray, lons: np.ndarray, data: np.ndarray) -> xr.Dataset:
@@ -871,12 +896,11 @@ class WeatherForecaster:
 
         return ds
     
-    def run_forecast(self, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str = "./", return_history: bool = False):
+    def run_forecast(self, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str = "./"):
         """Run the forecasting pipeline with per-hour streaming outputs. Requires precomputed model_input.
 
         This function now avoids building a single multi-hour xarray Dataset and avoids bulk NetCDF/GRIB2 writes.
-        Instead, per-hour NetCDF/GRIB2 files are written during the autoregressive rollout. To preserve the
-        call signature, this returns (None, None[, history]) where history is included if return_history=True.
+        Instead, per-hour NetCDF/GRIB2 files are written during the autoregressive rollout.
         """
         try:
             init_datetime = self.data_loader_hrrr.get_init_datetime()
@@ -886,7 +910,7 @@ class WeatherForecaster:
             logger.info(self.metadata)
 
             # Run autoregressive forecast and write per-hour outputs to disk
-            history = self.autoregressive_rollout(
+            self.autoregressive_rollout(
                 model_input,
                 self.data_loader_gfs.get_model_input(),
                 model,
@@ -896,25 +920,14 @@ class WeatherForecaster:
                 write_per_hour=True,
             )
             logger.info("Forecast completed successfully (per-hour outputs written during rollout)")
-            if return_history:
-                return history
-            else:
-                return None
         except Exception as e:
             logger.error(f"Forecast failed: {e}")
             raise
 
-def run_weather_forecast(forecaster: WeatherForecaster, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str, print_history: bool = False):
-    """Run forecast for a single member, optionally printing forecast step history. Requires precomputed model_input."""
+def run_weather_forecast(forecaster: WeatherForecaster, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str):
+    """Run forecast for a single member. Requires precomputed model_input."""
     try:
-        history = forecaster.run_forecast(model, lead_hours, model_input, output_dir, return_history=True)
-        if print_history:
-            logger.info("Forecast schedule:")
-            for hour in range(1, min(lead_hours + 1, 25)):
-                info = history[hour]
-                logger.info(f"Hour {hour:2d}: from hour {info['from']:2d} using step {info['step']}h")
-            if lead_hours > 24:
-                logger.info(f"... (showing first 24 hours of {lead_hours} total)")
+        forecaster.run_forecast(model, lead_hours, model_input, output_dir)
     except Exception as e:
         logger.error(f"Forecast failed : {e}")
         raise
@@ -1026,7 +1039,7 @@ def main():
                                         gfs_channels=gfs_channels,
                                         static_channels=static_channels)
         run_weather_forecast(
-            forecaster, model, args.lead_hours, model_input, args.output_dir, print_history=True
+            forecaster, model, args.lead_hours, model_input, args.output_dir
         )
         logger.info(f"All forecasts complete.")
         
