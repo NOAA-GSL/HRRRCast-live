@@ -42,12 +42,12 @@ class WeatherPreprocessConfig:
         # Pressure levels (hPa)
         self.levels = [200, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 825, 850, 875, 900, 925, 950, 975, 1000]
         
-        # Grid downsampling factor
-        self.downsample_factor = 2
+        # Grid downsampling factor (1 = no downsampling; full HRRR grid)
+        self.downsample_factor = 1
         
-        # Expected grid dimensions after downsampling
-        self.grid_height = 530
-        self.grid_width = 900
+        # Expected grid dimensions (full HRRR grid)
+        self.grid_height = 1059
+        self.grid_width = 1799
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [

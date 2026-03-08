@@ -550,8 +550,8 @@ def compute_convective(ds):
     )
 
     # Grid spacing in x and y (model grid is 6 km)
-    dx_model = 6000.0
-    dy_model = 6000.0
+    dx_model = 3000.0
+    dy_model = 3000.0
 
     # Physical (true Earth) distance = grid distance / map scale factor
     # m > 1 near standard parallel, < 1 away from it
