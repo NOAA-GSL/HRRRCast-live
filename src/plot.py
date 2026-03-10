@@ -514,7 +514,7 @@ def plot_forecast_data(datetime_str: str,
         logger.info(f"Parallel plotting using {n_workers} workers (one per lead hour)")
         # Parallel plotting over lead hours
         args_list = []
-        for h in range(0, lead_hour_int + 1):
+        for h in range(1, lead_hour_int + 1):
             # Build per-hour file path
             if str(member_norm).lower() == 'avg':
                 ds_path = f"{forecast_dir}/{date_str}/hrrrcast_memavg_f{h:02d}.nc"
