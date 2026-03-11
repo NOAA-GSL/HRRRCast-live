@@ -25,6 +25,9 @@ ENVMODE=@[ENVMODE]
 N_ENSEMBLES=@[N_ENSEMBLES]
 N_GPUS=@[N_GPUS]
 
+export NETCDF2GRIB_SECTION3=@[NETCDF2GRIB_SECTION3]
+export WGRIB2=@[WGRIB2]
+
 # conda
 if [ "$ENVMODE" == "OPN" ]; then
     source ${PACKAGEROOT}/etc/env_emc.sh
