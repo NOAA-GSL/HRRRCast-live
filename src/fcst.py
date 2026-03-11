@@ -183,7 +183,7 @@ class WeatherForecaster:
         predicted_channels: Optional[int] = None,
         gfs_channels: Optional[int] = None,
         static_channels: Optional[int] = None,
-        pmm_alpha: float = 0.7,
+        pmm_alpha: float = 0.65,
     ):
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs

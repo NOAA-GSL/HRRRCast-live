@@ -205,7 +205,7 @@ def wait_for_hour_files(date_str: str,
                         hour: int,
                         n_ensembles: int,
                         poll_seconds: int = 60,
-                        min_age_seconds: int = 30) -> List[str]:
+                        min_age_seconds: int = 90) -> List[str]:
     """Wait until all expected member files exist and are stable for the given hour.
 
     Stability is defined as not modified within the last min_age_seconds.
