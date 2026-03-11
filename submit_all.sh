@@ -28,6 +28,13 @@ MAKE_ICS_WALLTIME="00:10:00"
 MAKE_BCS_WALLTIME="00:30:00"
 PLOT_WALLTIME="00:30:00"
 
+# set environment variables
+export PMM_POLL_SECONDS="60"
+export PMM_MIN_AGE_SECONDS="90"
+export NETCDF2GRIB_SECTION3=
+export WGRIB2="wgrib2"
+
+# submit job and check for failures
 submit_with_check() {
     local jobid
     jobid=$(eval "$@")

@@ -288,7 +288,7 @@ def compute_ensemble_pmm(datetime_str: str,
 
         # Polling configuration (overridable via env)
         poll_seconds = int(os.environ.get("PMM_POLL_SECONDS", "60"))
-        min_age_seconds = int(os.environ.get("PMM_MIN_AGE_SECONDS", "30"))
+        min_age_seconds = int(os.environ.get("PMM_MIN_AGE_SECONDS", "90"))
 
         for h in range(0, int(lead_hour) + 1):
             # Wait until files are present and stable before processing this hour
