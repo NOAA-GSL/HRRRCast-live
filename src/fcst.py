@@ -819,18 +819,14 @@ class WeatherForecaster:
                              target_hour: int,
                              output_dir: Optional[str] = None,
                              init_datetime: Optional[datetime] = None,
-                             write_per_hour: bool = False,
-                             max_io_workers: int = 4) -> Dict[int, Dict]:
+                             write_per_hour: bool = False) -> Dict[int, Dict]:
         """Perform greedy autoregressive rollout with overlapped I/O.
 
         When write_per_hour=True, persist single-hour NetCDF and GRIB2 files for each lead hour,
         including f00 representing the initial state. I/O is done in background threads to overlap
         with forecasting.
-        
-        Args:
-            max_io_workers: Maximum number of threads for concurrent output writing (default 4)
         """
-        logger.info(f"Starting autoregressive rollout for {target_hour} hours with max_io_workers={max_io_workers}")
+        logger.info(f"Starting autoregressive rollout for {target_hour} hours")
         
         # Initial input (updated during rollout)
         X = tf.convert_to_tensor(initial_input, dtype=tf.float32)
@@ -860,8 +856,9 @@ class WeatherForecaster:
             except Exception as e:
                 logger.error(f"Failed writing hour {hour} outputs for member {member}: {e}")
 
-        # ThreadPoolExecutor for overlapped I/O
-        io_executor = ThreadPoolExecutor(max_workers=max_io_workers) if write_per_hour else None
+        # ThreadPoolExecutor for non-blocking I/O submission
+        # Note: Only 1 worker since the _io_write_lock serializes all writes anyway
+        io_executor = ThreadPoolExecutor(max_workers=1) if write_per_hour else None
         io_futures = []
 
         # Write out hour 0 (f00) products representing the initial state for each member
