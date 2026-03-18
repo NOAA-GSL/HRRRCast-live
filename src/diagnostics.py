@@ -490,8 +490,8 @@ def compute_convective(ds):
             - MNUPHL_min_0_3km: Minimum updraft helicity 0-3 km AGL (m²/s²)
             - MXUPHL_max_2_5km: Maximum updraft helicity 2-5 km AGL (m²/s²)
             - MNUPHL_min_2_5km: Minimum updraft helicity 2-5 km AGL (m²/s²)
-            - MAXUVV_max_100_1000mb: Maximum upward vertical velocity 100-1000m AGL (m/s)
-            - MAXDVV_max_100_1000mb: Maximum downward vertical velocity 100-1000m AGL (m/s)
+            - MAXUVV_max_100_1000mb: Maximum upward vertical velocity 100-1000 mb (m/s)
+            - MAXDVV_max_100_1000mb: Maximum downward vertical velocity 100-1000 mb (m/s)
 
     Notes:
         - Uses Lambert Conformal projection centered at 38.5°N, 97.5°W
@@ -560,7 +560,9 @@ def compute_convective(ds):
     dy = dy_model / m_lats
     
     # Rotation angle for coordinate transformation
-    gamma = n * np.deg2rad(ds.longitude - lon0)
+    # Convert longitude from 0-360 to -180-180 convention
+    lon_180 = ds.longitude.where(ds.longitude <= 180, ds.longitude - 360)
+    gamma = n * np.deg2rad(lon_180 - lon0)
 
     ug = u*np.cos(gamma) + v*np.sin(gamma)
     vg = -u*np.sin(gamma) + v*np.cos(gamma)
