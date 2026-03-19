@@ -138,7 +138,7 @@ class ForecastModel:
             logger.warning("No GPUs used, running on CPU only.")
 
         # set JIT compilation of graphs
-        tf.config.optimizer.set_jit(False)
+        tf.config.optimizer.set_jit(True)
     
     def _load_model(self):
         """Load the TensorFlow model."""
@@ -184,6 +184,7 @@ class WeatherForecaster:
         gfs_channels: Optional[int] = None,
         static_channels: Optional[int] = None,
         pmm_alpha: float = 0.65,
+        use_nudging: bool = True,
     ):
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
@@ -193,6 +194,7 @@ class WeatherForecaster:
         self.batch_size = batch_size
         self.use_diffusion = use_diffusion
         self.pmm_alpha = pmm_alpha
+        self.use_nudging = use_nudging and len(members) > 1
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
@@ -865,8 +867,11 @@ class WeatherForecaster:
         hour0_outputs: Dict[int, np.ndarray] = {
             member: state_from_hour[member].numpy().copy() for member in self.members
         }
-        pmm0_values, pmm0_channels = self._compute_pmm_mean(hour0_outputs)
-        nudged_hour0 = self._nudge_members_toward_pmm(hour0_outputs, pmm0_values, pmm0_channels, self.pmm_alpha)
+        if self.use_nudging:
+            pmm0_values, pmm0_channels = self._compute_pmm_mean(hour0_outputs)
+            nudged_hour0 = self._nudge_members_toward_pmm(hour0_outputs, pmm0_values, pmm0_channels, self.pmm_alpha)
+        else:
+            nudged_hour0 = hour0_outputs
         for member in self.members:
             if io_executor:
                 future = io_executor.submit(write_hour_outputs, 0, nudged_hour0[member], member)
@@ -964,11 +969,14 @@ class WeatherForecaster:
                         state_from_hour[member] = y
                     hour_member_outputs[member] = y.numpy().copy()
 
-            # Compute PMM mean for this hour and nudge members before writing
-            pmm_values, pmm_channels = self._compute_pmm_mean(hour_member_outputs)
-            nudged_outputs = self._nudge_members_toward_pmm(
-                hour_member_outputs, pmm_values, pmm_channels, self.pmm_alpha
-            )
+            # Compute PMM mean for this hour and nudge members before writing (if enabled)
+            if self.use_nudging:
+                pmm_values, pmm_channels = self._compute_pmm_mean(hour_member_outputs)
+                nudged_outputs = self._nudge_members_toward_pmm(
+                    hour_member_outputs, pmm_values, pmm_channels, self.pmm_alpha
+                )
+            else:
+                nudged_outputs = hour_member_outputs
 
             # Write out per-hour products asynchronously after all members computed
             for member in self.members:
@@ -1095,6 +1103,8 @@ def parse_arguments():
                        help="Logging level")
     parser.add_argument("--pmm_alpha", type=float, default=0.7,
                         help="Nudge factor toward PMM mean for member outputs (0..1)")
+    parser.add_argument("--no_nudging", default=False, action="store_true",
+                        help="Disable nudging (member perturbation toward consensus)")
     
     return parser.parse_args()
 
@@ -1182,7 +1192,8 @@ def main():
                                         predicted_channels=predicted_channels,
                                         gfs_channels=gfs_channels,
                                         static_channels=static_channels,
-                                        pmm_alpha=args.pmm_alpha)
+                                        pmm_alpha=args.pmm_alpha,
+                                        use_nudging=not args.no_nudging)
         run_weather_forecast(
             forecaster, model, args.lead_hours, model_input, args.output_dir
         )

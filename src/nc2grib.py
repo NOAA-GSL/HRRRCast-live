@@ -10,10 +10,10 @@ during autoregressive forecasting.
 
 Notes/assumptions:
 - Grid Definition: We require a valid GRIB2 Section 3 for the HRRRCast Lambert
-  Conformal grid. Provide via Netcdf2Grib(section3=...) constructor or set the
-  environment variable NETCDF2GRIB_SECTION3 to a .npy file. If neither is provided,
-  we auto-construct a canonical HRRR Lambert Conformal Section 3 for the 6 km
-  downsampled grid (Nx=900, Ny=530).
+    Conformal grid. Provide via Netcdf2Grib(section3=...) constructor or set the
+    environment variable NETCDF2GRIB_SECTION3 to a .npy file. If neither is provided,
+    we auto-construct a canonical HRRR Lambert Conformal Section 3 for the full
+    3 km grid (Nx=1799, Ny=1059).
 - Template Numbers: Product Definition Template Numbers (pdtn) and Data Representation
   Template Numbers (drtn) default to 0 (instantaneous forecast, simple packing).
   For accumulated fields (e.g., APCP), adjust pdtn and duration semantics to match
@@ -129,17 +129,17 @@ class Netcdf2Grib:
         self.pdtn_default = pdtn_default
         self.drtn_default = drtn_default
 
-    def construct_section3_hrrr_6km(self, nx: int = 900, ny: int = 530) -> np.ndarray:
-        """Construct GRIB2 Section 3 for HRRR-like CONUS Lambert Conformal grid at 6 km.
+    def construct_section3_hrrr(self, nx: int = 1799, ny: int = 1059) -> np.ndarray:
+        """Construct GRIB2 Section 3 for HRRR-like CONUS Lambert Conformal grid at 3 km.
 
-        This uses canonical HRRR projection parameters and the downsampled dimensions
-        defined in preprocessing (grid_width=900, grid_height=530).
+        This uses canonical HRRR projection parameters and the full-resolution dimensions
+        defined in preprocessing (grid_width=1799, grid_height=1059).
 
         Parameters used:
         - First grid point (La1/Lo1): 21.138123N, 237.280472E
         - Orientation longitude (LoV): 262.5E
         - Standard parallels (Latin1, Latin2): 38.5N, 38.5N
-        - Grid spacing (Dx/Dy): 6000 m
+        - Grid spacing (Dx/Dy): 3000 m
         - Earth radius: 6371229 m
 
         Returns a numpy array suitable for the `section3` argument of grib2io.Grib2Message.
@@ -148,14 +148,14 @@ class Netcdf2Grib:
         this function will attempt to use it. Otherwise, it constructs a fixed array using
         canonical HRRR parameters. You can override via NETCDF2GRIB_SECTION3.
         """
-        # Canonical HRRR LCC parameters (matching earlier code and HRRR docs)
+        # Canonical HRRR LCC parameters (matching HRRR docs)
         lat1 = 21.138123    # degrees North
         lon1 = 237.280472   # degrees East
         lov = 262.5         # degrees East
         latin1 = 38.5       # degrees North
         latin2 = 38.5       # degrees North
-        dx = 6000           # meters
-        dy = 6000           # meters
+        dx = 3000           # meters
+        dy = 3000           # meters
         earth_radius = 6371229  # meters (spherical)
 
         # Build a best-effort fixed array for GRIB2 Template 3.30 (Lambert Conformal)
@@ -184,7 +184,7 @@ class Netcdf2Grib:
         proj_center_flag = 0
 
         # Section 3 structure (template 3.30 Lambert Conformal) matching grib_dump order:
-        # Fields reflect wgrib2/grib_dump output: res=8, scanningMode=64 (WE:SN), LaD=38500000, Dx/Dy=6000000
+        # Fields reflect wgrib2/grib_dump output: res=8, scanningMode=64 (WE:SN), LaD=38500000
         section3 = np.array([
             0,                   # Source of grid definition
             nx * ny,             # Number of data points = Ni * Nj
@@ -227,9 +227,9 @@ class Netcdf2Grib:
                 return np.asarray(arr, dtype=np.int64)
             except Exception as e:
                 raise RuntimeError(f"Failed to load section3 from {env_path}: {e}")
-        # Fallback: attempt to construct HRRR-like 6 km LCC Section 3 using known dims (Nx=900, Ny=530)
+        # Fallback: attempt to construct HRRR-like 3 km LCC Section 3 using known dims (Nx=1799, Ny=1059)
         try:
-            return self.construct_section3_hrrr_6km(nx=900, ny=530)
+            return self.construct_section3_hrrr(nx=1799, ny=1059)
         except Exception as e:
             raise RuntimeError(
                 "GRIB2 Section 3 (grid definition) is required and could not be auto-constructed. "

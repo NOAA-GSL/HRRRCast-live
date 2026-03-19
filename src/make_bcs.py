@@ -44,17 +44,17 @@ class WeatherPreprocessConfig:
         # Pressure levels (hPa)
         self.levels = [250, 500, 850, 1000]
         
-        # Grid downsampling factor (applied after HRRR interpolation)
-        self.downsample_factor = 2
+        # Grid downsampling factor (1 = no downsampling; full HRRR grid)
+        self.downsample_factor = 1
         
         # HRRR grid specifications (CONUS domain)
         # These are typical HRRR grid dimensions - adjust as needed
         self.hrrr_grid_height = 1059  # Full HRRR grid height
         self.hrrr_grid_width = 1799   # Full HRRR grid width
         
-        # Final grid dimensions after downsampling HRRR grid
-        self.grid_height = 530
-        self.grid_width = 900
+        # Final grid dimensions (full HRRR grid)
+        self.grid_height = 1059
+        self.grid_width = 1799
         
         # HRRR grid file for reference coordinates
         self.hrrr_grid_file = hrrr_grid_file
@@ -76,7 +76,7 @@ class WeatherPreprocessConfig:
 
 
 class GridInterpolator:
-    """Handles grid interpolation from GFS to downsampled HRRR grid using xESMF."""
+    """Handles grid interpolation from GFS to HRRR grid using xESMF."""
 
     def __init__(self, config: WeatherPreprocessConfig):
         self.config = config
@@ -98,7 +98,7 @@ class GridInterpolator:
             lons = np.linspace(lon_min, lon_max, self.config.hrrr_grid_width)
             lons, lats = np.meshgrid(lons, lats)
 
-        # Downsample before interpolation
+        # Downsample before interpolation (noop when downsample_factor=1)
         lats_ds = lats[::self.config.downsample_factor, ::self.config.downsample_factor]
         lons_ds = lons[::self.config.downsample_factor, ::self.config.downsample_factor]
 
@@ -194,7 +194,7 @@ def process_single_lead_hour(args):
                 logger.warning(f"Failed reading values for {short} level {l_idx}: {e}")
                 continue
 
-            # Interpolate to HRRR grid and downsample implicitly via HRRR grid choice
+            # Interpolate to HRRR grid
             hrrr_vals = preprocessor.interpolator.interpolate_to_hrrr_grid(vals, gfs_lats, gfs_lons)
             raw_pl.append(hrrr_vals)
 
@@ -426,18 +426,18 @@ class GRIBPreprocessor:
         try:
             logger.info(f"Processing surface variables for lead times {'1' if skip_zero else '0'} to {max_lead_hours}h using {n_workers} workers...")
             
-            # Get HRRR coordinates for output (downsampled)
+            # Get HRRR coordinates for output
             if not self.interpolator.hrrr_coords_loaded:
                 self.config.hrrr_lats, self.config.hrrr_lons = self.interpolator.load_hrrr_grid_coordinates(
                     self.config.hrrr_grid_file
                 )
                 self.interpolator.hrrr_coords_loaded = True
             
-            # Downsample HRRR coordinates
+            # HRRR coordinates (full grid when downsample_factor=1)
             hrrr_lats_ds = self.config.hrrr_lats
             hrrr_lons_ds = self.config.hrrr_lons
             
-            logger.info(f"Final grid shape after HRRR interpolation and downsampling: {hrrr_lats_ds.shape}")
+            logger.info(f"Final grid shape after HRRR interpolation: {hrrr_lats_ds.shape}")
             
             # Prepare arguments for parallel processing
             if skip_zero:
@@ -514,7 +514,7 @@ class GRIBPreprocessor:
             logger.info(f"Preprocessed data saved successfully")
             logger.info(f"Model input shape: {model_inputs.shape}")
             logger.info(f"Number of lead times processed: {num_lead_times}")
-            logger.info(f"Grid dimensions (HRRR-based, downsampled): {self.config.grid_height} x {self.config.grid_width}")
+            logger.info(f"Grid dimensions (HRRR-based): {self.config.grid_height} x {self.config.grid_width}")
             
         except Exception as e:
             logger.error(f"Error saving preprocessed data: {e}")
@@ -530,7 +530,7 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
         # Validate inputs
         max_lead_time = int(lead_hours)
         logger.info(f"Preprocessing GFS data initialized at {datetime_str} with lead times 1 to {max_lead_time}h (skipping 0th hour)")
-        logger.info("Data will be interpolated to HRRR grid before downsampling")
+        logger.info("Data will be interpolated to HRRR grid (no downsampling)")
         logger.info("Reading from separate GRIB files for each lead time based on valid time")
         
         # Set n_workers to number of lead hours (1 to max_lead_time inclusive)
