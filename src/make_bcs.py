@@ -379,7 +379,7 @@ class GRIBPreprocessor:
         valid_date_str = valid_datetime.strftime("%Y%m%d_%H")
         return f"{base_dir}/{init_date_str}/gfs_{valid_date_str}.grib2"
     
-    def process_pressure_levels(self, init_datetime: datetime, base_dir: str, norm_file: str, max_lead_hours: int, n_workers: int = 1, skip_zero: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+    def process_pressure_levels(self, init_datetime: datetime, base_dir: str, norm_file: str, max_lead_hours: int, n_workers: int = 1, skip_zero: bool = False) -> np.ndarray:
         """Load, interpolate to HRRR grid, and normalize pressure-level variables from separate GFS files for all lead times."""
         try:
             logger.info(f"Processing pressure level variables for lead times {'1' if skip_zero else '0'} to {max_lead_hours}h using {n_workers} workers...")
@@ -393,14 +393,12 @@ class GRIBPreprocessor:
                             for lead_time in range(max_lead_hours + 1)]
             
             all_normalized_vals = [None] * len(args_list)
-            all_raw_vals = [None] * len(args_list)
             
             if n_workers == 1:
                 # Sequential processing
                 for i, args in enumerate(args_list):
-                    lead_time, pres_norm, pres_raw, _, _ = process_single_lead_hour(args)
+                    lead_time, pres_norm, _, _, _ = process_single_lead_hour(args)
                     all_normalized_vals[i] = pres_norm
-                    all_raw_vals[i] = pres_raw
             else:
                 # Parallel processing
                 with ProcessPoolExecutor(max_workers=n_workers) as executor:
@@ -410,18 +408,17 @@ class GRIBPreprocessor:
                     # Collect results as they complete
                     for future in as_completed(future_to_idx):
                         i = future_to_idx[future]
-                        lead_time, pres_norm, pres_raw, _, _ = future.result()
+                        lead_time, pres_norm, _, _, _ = future.result()
                         all_normalized_vals[i] = pres_norm
-                        all_raw_vals[i] = pres_raw
                         logger.info(f"Completed processing lead time {lead_time}h")
             
-            return np.array(all_normalized_vals), np.array(all_raw_vals)
+            return np.array(all_normalized_vals)
             
         except Exception as e:
             logger.error(f"Error processing pressure levels: {e}")
             raise
     
-    def process_surface_variables(self, init_datetime: datetime, base_dir: str, norm_file: str, max_lead_hours: int, n_workers: int = 1, skip_zero: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def process_surface_variables(self, init_datetime: datetime, base_dir: str, norm_file: str, max_lead_hours: int, n_workers: int = 1, skip_zero: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Load, interpolate to HRRR grid, and normalize surface variables from separate GFS files for all lead times."""
         try:
             logger.info(f"Processing surface variables for lead times {'1' if skip_zero else '0'} to {max_lead_hours}h using {n_workers} workers...")
@@ -448,14 +445,12 @@ class GRIBPreprocessor:
                             for lead_time in range(max_lead_hours + 1)]
             
             all_normalized = [None] * len(args_list)
-            all_raw = [None] * len(args_list)
             
             if n_workers == 1:
                 # Sequential processing
                 for i, args in enumerate(args_list):
-                    lead_time, _, _, sfc_norm, sfc_raw = process_single_lead_hour(args)
+                    lead_time, _, _, sfc_norm, _ = process_single_lead_hour(args)
                     all_normalized[i] = sfc_norm
-                    all_raw[i] = sfc_raw
             else:
                 # Parallel processing
                 with ProcessPoolExecutor(max_workers=n_workers) as executor:
@@ -465,19 +460,18 @@ class GRIBPreprocessor:
                     # Collect results as they complete
                     for future in as_completed(future_to_idx):
                         i = future_to_idx[future]
-                        lead_time, _, _, sfc_norm, sfc_raw = future.result()
+                        lead_time, _, _, sfc_norm, _ = future.result()
                         all_normalized[i] = sfc_norm
-                        all_raw[i] = sfc_raw
                         logger.info(f"Completed processing surface variables for lead time {lead_time}h")
             
-            return np.array(all_normalized), np.array(all_raw), hrrr_lats_ds, hrrr_lons_ds
+            return np.array(all_normalized), hrrr_lats_ds, hrrr_lons_ds
             
         except Exception as e:
             logger.error(f"Error processing surface variables: {e}")
             raise
     
-    def save_preprocessed_data(self, output_file: str, pres_norm: np.ndarray, pres_raw: np.ndarray,
-                              sfc_norm: np.ndarray, sfc_raw: np.ndarray, lats: np.ndarray, 
+    def save_preprocessed_data(self, output_file: str, pres_norm: np.ndarray,
+                              sfc_norm: np.ndarray, lats: np.ndarray, 
                               lons: np.ndarray, metadata: Dict) -> None:
         """Save preprocessed data for all lead times to compressed numpy format."""
         try:
@@ -501,9 +495,6 @@ class GRIBPreprocessor:
                 output_file,
                 # Model input (ready for inference) - all lead times
                 model_input=model_inputs,
-                # Raw data for potential analysis - all lead times
-                pres_raw=pres_raw,
-                sfc_raw=sfc_raw,
                 # Coordinate information (same for all lead times)
                 lats=lats,
                 lons=lons,
@@ -601,10 +592,10 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
         
         # Process GRIB data for all lead times (skipping 0th hour)
         logger.info("Processing pressure level data for all lead times with HRRR grid interpolation...")
-        pres_norm, pres_raw = preprocessor.process_pressure_levels(init_datetime, base_dir, norm_file, max_lead_time, n_workers, skip_zero=True)
+        pres_norm = preprocessor.process_pressure_levels(init_datetime, base_dir, norm_file, max_lead_time, n_workers, skip_zero=True)
         
         logger.info("Processing surface data for all lead times with HRRR grid interpolation...")
-        sfc_norm, sfc_raw, lats, lons = preprocessor.process_surface_variables(init_datetime, base_dir, norm_file, max_lead_time, n_workers, skip_zero=True)
+        sfc_norm, lats, lons = preprocessor.process_surface_variables(init_datetime, base_dir, norm_file, max_lead_time, n_workers, skip_zero=True)
         
         # Validate grid dimensions
         expected_shape = (config.grid_height, config.grid_width)
@@ -639,7 +630,7 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
         
         # Save preprocessed data
         preprocessor.save_preprocessed_data(
-            output_file, pres_norm, pres_raw, sfc_norm, sfc_raw, lats, lons, metadata
+            output_file, pres_norm, sfc_norm, lats, lons, metadata
         )
         
         logger.info("GFS to HRRR grid preprocessing completed successfully")
