@@ -194,7 +194,7 @@ class WeatherForecaster:
         self.batch_size = batch_size
         self.use_diffusion = use_diffusion
         self.pmm_alpha = pmm_alpha
-        self.use_nudging = use_nudging
+        self.use_nudging = use_nudging and len(members) > 1
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [

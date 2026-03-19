@@ -131,7 +131,7 @@ def _compute_log_snr_spaced_steps(num_inference_steps: int, num_diffusion_steps:
     log_snr_max = np.max(log_snr)
 
     # Start with more candidates than needed
-    num_candidates = num_inference_steps * 178 // 1000
+    num_candidates = num_inference_steps * 178 // 100
     target_log_snr = np.linspace(log_snr_max, log_snr_min, num_candidates)
 
     # For each target, find the closest actual timestep
