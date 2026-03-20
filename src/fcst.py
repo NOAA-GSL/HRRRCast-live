@@ -582,7 +582,7 @@ class WeatherForecaster:
         for cname in ["LAND", "OROG"]:
             raw_key = f"{cname}_raw"
             if hasattr(self.data_loader_hrrr, "data") and raw_key in self.data_loader_hrrr.data.files and cname not in ds_hour:
-                cvals = self.data_loader_hrrr.data[raw_key]
+                cvals = self.data_loader_hrrr.data[raw_key].astype(np.float32)
                 const_4d = np.tile(cvals[None, None, :, :], (1, len(times), 1, 1))
                 ds_hour[cname] = xr.DataArray(
                     const_4d,

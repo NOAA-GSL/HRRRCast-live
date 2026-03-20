@@ -9,6 +9,61 @@ import numpy as np
 import xarray as xr
 
 
+def get_lcc_grid_params(ds: xr.Dataset, lat_dim: str = "latitude", lon_dim: str = "longitude"):
+    """
+    Compute Lambert Conformal Conic (LCC) projection grid parameters.
+
+    This helper function calculates the map scale factor, physical grid spacing, 
+    rotation angle, and cone constant for an LCC-projected grid (e.g., HRRR).
+
+    Args:
+        ds (xr.Dataset): Input dataset containing latitude and longitude coordinates
+        lat_dim (str): Name of latitude dimension (default: "latitude")
+        lon_dim (str): Name of longitude dimension (default: "longitude")
+
+    Returns:
+        tuple: (m_lats, dx, dy, gamma, n) where:
+            - m_lats: Map scale factor (latitude-dependent)
+            - dx: Physical grid spacing in x direction (m)
+            - dy: Physical grid spacing in y direction (m)
+            - gamma: Rotation angle between earth and grid coordinates (radians)
+            - n: Cone constant (map convergence factor)
+
+    Notes:
+        - Assumes HRRR-standard LCC projection (phi0=38.5°N, lon0=97.5°W)
+        - Model grid spacing is 3 km in both x and y directions
+        - Map scale factor accounts for projection distortion with latitude
+    """
+    # LCC projection parameters (HRRR standard)
+    phi0 = np.deg2rad(38.5)      # Standard latitude (projection center)
+    lon0 = -97.5                  # Standard longitude (projection center)
+    n = np.sin(phi0)              # Map convergence factor (cone constant)
+
+    # Compute map scale factor for each latitude point using LCC formula:
+    # m(phi) = cos(phi0)/cos(phi) * [tan(pi/4 + phi0/2) / tan(pi/4 + phi/2)]^n
+    phi = np.deg2rad(ds[lat_dim])
+    m_lats = (
+        (np.cos(phi0) / np.cos(phi)) *
+        (np.tan(np.pi/4 + phi0/2) / np.tan(np.pi/4 + phi/2)) ** n
+    )
+
+    # Model grid spacing (3 km in x, 3 km in y for standard HRRR)
+    dx_model = 3000.0
+    dy_model = 3000.0
+
+    # Physical (true Earth) distance = grid distance / map scale factor
+    # m > 1 near standard parallel, < 1 away from it
+    dx = dx_model / m_lats
+    dy = dy_model / m_lats
+    
+    # Rotation angle for coordinate transformation
+    # Convert longitude from 0-360 to -180-180 convention
+    lon_180 = ds[lon_dim].where(ds[lon_dim] <= 180, ds[lon_dim] - 360)
+    gamma = n * np.deg2rad(lon_180 - lon0)
+
+    return m_lats, dx, dy, gamma, n
+
+
 def compute_r2m(ds: xr.Dataset) -> xr.Dataset:
     """
     Compute relative humidity at 2m (R2M) from surface temperature and dew point.
@@ -193,10 +248,10 @@ def compute_pwat(ds: xr.Dataset) -> xr.Dataset:
     q_mid = (q + q.shift(level=1)).isel(level=slice(1, None)) / 2.0
 
     # Pressure thickness of each layer (Pa, positive)
-    dp = np.abs(p.diff("level"))
+    dp = np.abs(p.diff("level").astype(np.float32))
 
     # PWAT = (1/g) * integral(q * dp)
-    pwat = (q_mid * dp).sum("level", skipna=True) / g
+    pwat = ((q_mid * dp).sum("level", skipna=True) / np.float32(g)).astype(np.float32)
 
     ds["PWAT"] = pwat
 
@@ -401,22 +456,22 @@ def compute_wind_gust(ds: xr.Dataset, gust_factor: float = 1.4) -> xr.Dataset:
     v10 = ds["VGRD10M"]
     
     # Compute 10-meter wind speed
-    wind_10m = np.sqrt(u10**2 + v10**2)
+    wind_10m = np.sqrt(u10**2 + v10**2).astype(np.float32)
     
     # Method 1: Gust factor method (empirical)
-    gust_empirical = gust_factor * wind_10m
+    gust_empirical = (np.float32(gust_factor) * wind_10m).astype(np.float32)
     
     # Method 2: Maximum wind speed in the column
     # Useful for elevated wind maxima (e.g., low-level jet)
     if "level" in ds["UGRD"].dims:
         u3d = ds["UGRD"]
         v3d = ds["VGRD"]
-        wind_3d = np.sqrt(u3d**2 + v3d**2)
+        wind_3d = np.sqrt(u3d**2 + v3d**2).astype(np.float32)
         
         # Find maximum wind in the column (typically in lowest 3-4 km)
         # Focus on lower atmosphere (pressure > 700 hPa) where gusts are most relevant
         wind_lower = wind_3d.where(wind_3d.level >= 700, drop=True)
-        wind_max_column = wind_lower.max(dim="level", skipna=True)
+        wind_max_column = wind_lower.max(dim="level", skipna=True).astype(np.float32)
     else:
         wind_max_column = wind_10m
     
@@ -432,8 +487,8 @@ def compute_wind_gust(ds: xr.Dataset, gust_factor: float = 1.4) -> xr.Dataset:
         
         # Enhanced gust when updraft strength exceeds -1 Pa/s
         # Empirical: 0.5 m/s per -1 Pa/s of updraft strength
-        updraft_enhancement = np.maximum(0, -max_updraft - 1.0) * 0.5
-        gust_convective = gust_empirical + updraft_enhancement
+        updraft_enhancement = (np.maximum(np.float32(0), -max_updraft - np.float32(1.0)) * np.float32(0.5)).astype(np.float32)
+        gust_convective = (gust_empirical + updraft_enhancement).astype(np.float32)
     else:
         gust_convective = gust_empirical
         updraft_enhancement = xr.zeros_like(wind_10m)
@@ -441,7 +496,14 @@ def compute_wind_gust(ds: xr.Dataset, gust_factor: float = 1.4) -> xr.Dataset:
     # Final gust estimate: maximum of empirical factor and column maximum
     # Add convective enhancement when applicable
     gust_estimate = np.maximum(gust_empirical, wind_max_column)
-    gust_final = np.maximum(gust_estimate, gust_convective)
+    gust_final = np.maximum(gust_estimate, gust_convective).astype(np.float32)
+
+    # Fill NaN values with 0 (no gust where data is missing)
+    gust_final = gust_final.fillna(0.0).astype(np.float32)
+    gust_empirical = gust_empirical.fillna(0.0).astype(np.float32)
+    gust_convective = gust_convective.fillna(0.0).astype(np.float32)
+    wind_10m = wind_10m.fillna(0.0).astype(np.float32)
+    wind_max_column = wind_max_column.fillna(0.0).astype(np.float32)
     
     # Add to dataset
     ds["GUST"] = gust_final
@@ -450,6 +512,157 @@ def compute_wind_gust(ds: xr.Dataset, gust_factor: float = 1.4) -> xr.Dataset:
     ds["WIND_10M"] = wind_10m
     ds["WIND_MAX"] = wind_max_column
     
+    return ds
+
+
+def compute_vvel(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Compute vertical velocity (VVEL) in pressure coordinates (omega, Pa/s) from continuity equation.
+
+    This function estimates vertical velocity using the continuity equation in pressure 
+    coordinates: ∂u/∂x + ∂v/∂y + ∂ω/∂p = 0. The vertical velocity is computed by:
+    1. Computing horizontal wind divergence accounting for Lambert Conformal Conic (LCC) projection
+    2. Removing domain-mean divergence at each level to correct for AI model mass conservation errors
+    3. Extrapolating divergence to 20 hPa and computing ω at the top data level (200 hPa)
+       using ω=0 at 20 hPa as the upper boundary condition
+    4. Integrating both upward from surface (ω=0) and downward from top (ω=omega_at_top)
+    5. Blending the two solutions with logarithmic pressure-based weights
+
+    The surface boundary condition is physically exact (air cannot flow through Earth's surface).
+    The upper boundary condition assumes ω=0 at 20 hPa (~99% of atmospheric mass below),
+    extrapolated from the top two data levels. Blending the two integrations ensures errors
+    accumulate only to the midpoint from either boundary rather than across the full column.
+
+    Args:
+        ds (xr.Dataset): Input dataset containing the following required fields:
+            - UGRD: U-component of wind at all pressure levels (m/s)
+            - VGRD: V-component of wind at all pressure levels (m/s)
+            - level: Pressure levels (hPa), must be sorted ascending (e.g. 200→1000 hPa)
+            - latitude/lat: Latitude coordinate
+            - longitude/lon: Longitude coordinate
+
+            Dataset must have dimensions: (time, lead_time, level, latitude, longitude)
+            Assumes Lambert Conformal Conic projection (e.g., HRRR grid)
+
+    Returns:
+        xr.Dataset: Input dataset augmented with the following variable:
+            - VVEL: Vertical velocity (Pa/s). Positive values indicate downward motion,
+                    negative values indicate upward motion.
+
+    Notes:
+        - Accounts for Lambert Conformal Conic projection distortion using map scale factor
+        - Wind components are rotated to align with model grid (x, y) coordinates
+        - Domain-mean divergence is removed at each level to suppress AI model mass conservation drift
+        - Upper BC: ω=0 at 20 hPa, extrapolated from top two data levels
+        - Lower BC: ω=0 at surface (exact physical constraint)
+        - Uses trapezoidal rule for vertical integration
+        - Blending weights are linear in pressure: near surface trusts bottom-up,
+          near top trusts top-down, equal blend at midpoint
+    """
+    u = ds["UGRD"]
+    v = ds["VGRD"]
+
+    # ================================================================================
+    # Get LCC projection parameters and compute divergence in model grid coordinates
+    # ================================================================================
+    m_lats, dx, dy, gamma, n = get_lcc_grid_params(ds)
+
+    ug = u * np.cos(gamma) + v * np.sin(gamma)
+    vg = -u * np.sin(gamma) + v * np.cos(gamma)
+
+    du_dx = (ug.shift(longitude=-1) - ug.shift(longitude=1)) / (2 * dx)
+    dv_dy = (vg.shift(latitude=-1)  - vg.shift(latitude=1))  / (2 * dy)
+    divergence = (du_dx + dv_dy)
+
+    # Fill boundary NaNs (from finite difference stencil edges) with 0
+    divergence = divergence.fillna(0.0).astype(np.float32)
+
+    # ==========================================================================
+    # Setup: pressure levels and integer coordinate replacement
+    # ==========================================================================
+    p_pa = ds.level.values * 100.0  # hPa → Pa, ascending order (low→high pressure)
+    nlev = len(p_pa)
+
+    assert (np.diff(p_pa) > 0).all(), "Pressure levels must be sorted ascending (e.g. 200→1000 hPa)"
+
+    # Replace pressure coords with plain integers to prevent xarray alignment conflicts
+    int_levels = np.arange(nlev)
+    divergence = divergence.assign_coords(level=int_levels)
+
+    # dp between adjacent data levels, positive (ascending pressure = downward)
+    dp = np.diff(p_pa).astype(np.float32)  # shape: (nlev-1,)
+    dp_da = xr.DataArray(dp, dims=["level"], coords={"level": int_levels[:-1]})
+
+    # Trapezoidal average divergence between adjacent levels
+    div_upper = divergence.isel(level=slice(None, -1))                              # coords 0..N-2
+    div_lower = divergence.isel(level=slice(1, None)).assign_coords(level=int_levels[:-1])  # coords 0..N-2
+    div_mid = 0.5 * (div_upper + div_lower)
+
+    # Layer increments for trapezoidal integration: D_avg * dp
+    increments = (div_mid * dp_da).assign_coords(level=int_levels[:-1])  # shape: (nlev-1, ...)
+
+    # ==========================================================================
+    # Upper boundary condition: extrapolate divergence to 20 hPa, compute
+    # ω at top data level (200 hPa) by integrating down from ω=0 at 20 hPa
+    # ==========================================================================
+    p_assumed_top = 20.0 * 100.0  # 20 hPa in Pa
+
+    div_lev0 = divergence.isel(level=0)                                    # divergence at 200 hPa
+    div_lev1 = divergence.isel(level=1).assign_coords(level=0)             # divergence at next level
+
+    # Linear extrapolation of divergence gradient to 50 hPa
+    dD_dp = (div_lev1 - div_lev0) / (p_pa[1] - p_pa[0])
+    div_ext = div_lev0 + dD_dp * (p_assumed_top - p_pa[0])                 # div at 50 hPa
+
+    # One trapezoidal step from 20 hPa down to first data level (200 hPa)
+    # ω=0 at 20 hPa, so: ω(200hPa) = 0 - 0.5*(D_20 + D_200) * (p_200 - p_20)
+    dp_ext = np.float32(p_pa[0] - p_assumed_top)                           # positive, ~18000 Pa  (200-20 hPa = 180 hPa
+    omega_at_top = -(0.5 * (div_ext + div_lev0) * dp_ext)                  # ω at 200 hPa
+
+    # ==========================================================================
+    # Bottom-up integration: ω=0 at surface, integrate upward
+    # Flip to surface-first order, cumsum, flip back
+    # ==========================================================================
+    inc_flipped = increments.isel(level=slice(None, None, -1)).assign_coords(level=int_levels[:-1])
+    omega_bot_flipped = inc_flipped.cumsum(dim="level")
+    omega_bot_interfaces = omega_bot_flipped.isel(level=slice(None, None, -1)).assign_coords(level=int_levels[:-1])
+
+    # Append surface BC: ω=0 at index nlev-1
+    zero_sfc = xr.zeros_like(divergence.isel(level=-1)).expand_dims(dim={"level": [nlev - 1]}, axis=-3)
+    omega_bot = xr.concat([omega_bot_interfaces, zero_sfc], dim="level").assign_coords(level=int_levels)
+
+    # ==========================================================================
+    # Top-down integration: ω=omega_at_top at level 0, integrate downward
+    # cumsum in natural order (index 0=top → index nlev-1=surface)
+    # ==========================================================================
+    # Top-down cumsum gives ω at interfaces between levels (nlev-1 values)
+    omega_top_interfaces = (omega_at_top - increments.cumsum(dim="level")).assign_coords(level=int_levels[1:])
+
+    # Prepend top BC: ω=omega_at_top at index 0
+    omega_at_top_expanded = omega_at_top.expand_dims(dim={"level": [0]}, axis=-3)
+    omega_top = xr.concat([omega_at_top_expanded, omega_top_interfaces], dim="level").assign_coords(level=int_levels)
+
+    # ==========================================================================
+    # Blend: logarithmic weights based on pressure distance from each boundary
+    # w_bot: 1 at surface, 0 at top  → trust bottom-up near surface
+    # w_top: 0 at surface, 1 at top  → trust top-down near top
+    # ==========================================================================
+    log_p = np.log(p_pa)
+    log_p_sfc = np.log(p_pa[-1])
+    log_p_top = np.log(p_pa[0])
+
+    w_bot = (log_p - log_p_top) / (log_p_sfc - log_p_top)  # 0 at top, 1 at surface
+    w_top = 1.0 - w_bot
+
+    w_bot_da = xr.DataArray(w_bot.astype(np.float32), dims=["level"], coords={"level": int_levels})
+    w_top_da = xr.DataArray(w_top.astype(np.float32), dims=["level"], coords={"level": int_levels})
+
+    vvel = w_bot_da * omega_bot + w_top_da * omega_top
+
+    # Restore original pressure level coordinates
+    vvel = vvel.assign_coords(level=ds.level)
+
+    ds["VVEL"] = vvel.astype(np.float32)
     return ds
 
 
@@ -523,7 +736,7 @@ def compute_convective(ds):
     mask1 = (z_agl>=0) & (z_agl<=1000)
     mask2 = (z_agl>=0) & (z_agl<=2000)
     mask6 = (z_agl>=0) & (z_agl<=6000)
-    dz = z_agl.diff("level")
+    dz = -z_agl.diff("level")
 
     # =====================================================
     # 2. Convert omega -> w
@@ -536,33 +749,8 @@ def compute_convective(ds):
     # =====================================================
     # 3. Horizontal derivatives and vorticity
     # =====================================================
-    # Lambert Conformal projection parameters
-    phi0 = np.deg2rad(38.5)      # Standard latitude (projection center)
-    lon0 = -97.5                  # Standard longitude (projection center)
-    n = np.sin(phi0)              # Map convergence factor (cone constant)
-
-    # Compute map scale factor for each latitude point using the correct LCC formula:
-    # m(phi) = cos(phi0)/cos(phi) * [tan(pi/4 + phi0/2) / tan(pi/4 + phi/2)]^n
-    phi = np.deg2rad(ds.latitude)
-    m_lats = (
-        (np.cos(phi0) / np.cos(phi)) *
-        (np.tan(np.pi/4 + phi0/2) / np.tan(np.pi/4 + phi/2)) ** n
-    )
-
-    # Grid spacing in x and y (model grid is 6 km)
-    dx_model = 3000.0
-    dy_model = 3000.0
-
-    # Physical (true Earth) distance = grid distance / map scale factor
-    # m > 1 near standard parallel, < 1 away from it
-    # so physical spacing increases away from the standard parallel
-    dx = dx_model / m_lats
-    dy = dy_model / m_lats
-    
-    # Rotation angle for coordinate transformation
-    # Convert longitude from 0-360 to -180-180 convention
-    lon_180 = ds.longitude.where(ds.longitude <= 180, ds.longitude - 360)
-    gamma = n * np.deg2rad(lon_180 - lon0)
+    # Get LCC projection parameters (handles map scale factor, grid spacing, rotation)
+    m_lats, dx, dy, gamma, n = get_lcc_grid_params(ds)
 
     ug = u*np.cos(gamma) + v*np.sin(gamma)
     vg = -u*np.sin(gamma) + v*np.cos(gamma)
@@ -645,8 +833,8 @@ def compute_convective(ds):
     mask3_mid = (z_agl_mid >= 0) & (z_agl_mid <= 3000)
 
     hlcy = ((u_mid - cu) * dv_dz - (v_mid - cv) * du_dz) * dz
-    ds["HLCY_0_1km"] = hlcy.where(mask1_mid).sum("level", skipna=True)
-    ds["HLCY_0_3km"] = hlcy.where(mask3_mid).sum("level", skipna=True)
+    ds["HLCY_0_1km"] = hlcy.where(mask1_mid).sum("level", skipna=True).astype(np.float32)
+    ds["HLCY_0_3km"] = hlcy.where(mask3_mid).sum("level", skipna=True).astype(np.float32)
 
     # =====================================================
     # 8. Updraft helicity 0-2 km, 0-3 km, 2–5 km
@@ -675,9 +863,9 @@ def compute_convective(ds):
     ds["MXUPHL_max_2_5km"] = uh_inst_2_5.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
     ds["MNUPHL_min_2_5km"] = uh_inst_2_5.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
 
-    # =====================================================
+    # =============================================================
     # 9. Maximum updraft velocity between 100-1000 mb
-    # =====================================================
+    # =============================================================
     level_hpa = w["level"]
     mask_v = (level_hpa >= 100) & (level_hpa <= 1000)
     w_layer = w.where(mask_v)
@@ -757,7 +945,7 @@ def compute_0C_isotherm(ds):
     
     # Get the height at the 0°C level
     h_0C = z_agl.isel(level=level_0C_idx)
-    ds["HGT_0C"] = h_0C
+    ds["HGT_0C"] = h_0C.astype(np.float32)
 
     # =====================================================
     # 3. Interpolate variables to 0°C level
@@ -809,7 +997,7 @@ def compute_0C_isotherm(ds):
     
     # Relative humidity at 0°C
     rh_0C = 100.0 * (e_0C / es_0C)
-    ds["RH_0C"] = rh_0C.clip(min=0.0, max=100.0)
+    ds["RH_0C"] = rh_0C.clip(min=0.0, max=100.0).astype(np.float32)
 
     return ds
 
@@ -888,6 +1076,7 @@ def compute_diagnostics(
         ('spfh2m', compute_spfh2m),
         ('pot2m', compute_pot2m),
         ('pwat', compute_pwat),
+        ('vvel', compute_vvel),
         ('conditional_rain', compute_conditional_rain),
         ('conditional_freezing_rain', compute_conditional_freezing_rain),
         ('wind_gust', compute_wind_gust),
