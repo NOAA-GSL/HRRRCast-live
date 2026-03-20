@@ -315,15 +315,27 @@ class Netcdf2Grib:
         msg.typeOfStatisticalProcessing = 0
         msg.numberOfTimeRanges = 0
 
-        # 6. Adjust decimal scale factor for specific humidity (SPFH) to improve precision
+        # 6. Adjust decimal scale factor to improve precision for select variables
         msg.binaryScaleFactor = 0
-        if var_name == "SPFH":
-            if surface_value >= 5000 and surface_value <= 10000:
+        if var_name == "SPFH" or var_name == "SPFH_0C":
+            if surface_value and surface_value >= 5000 and surface_value <= 10000:
                 msg.decScaleFactor = 12
-            elif surface_value >= 15000 and surface_value <= 40000:
+            elif surface_value and surface_value >= 15000 and surface_value <= 40000:
                 msg.decScaleFactor = 10
             else:
                 msg.decScaleFactor = 8
+        elif var_name in ["PWAT"]:
+            # Precipitable water: typically 0-80 mm, use higher precision
+            msg.decScaleFactor = 3
+        elif var_name in ["CRAIN", "CFRZR", "APCP"]:
+            # Precipitation: typically small values in mm/hr, use high precision
+            msg.decScaleFactor = 4
+        elif var_name in ["VUCSH_0_1km", "VVCSH_0_1km", "VUCSH_0_6km", "VVCSH_0_6km"]:
+            # Wind shear: typically small values (1/s), use high precision
+            msg.decScaleFactor = 5
+        elif var_name in ["RELV_max_0_1km", "RELV_max_0_2km"]:
+            # Relative vorticity: typically 1e-3 to 1e-2 s^-1, use high precision
+            msg.decScaleFactor = 5
         else:
             msg.decScaleFactor = 2
 
