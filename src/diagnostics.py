@@ -563,15 +563,13 @@ def compute_vvel(ds: xr.Dataset) -> xr.Dataset:
     v = ds["VGRD"]
 
     # ================================================================================
-    # Get LCC projection parameters and compute divergence in model grid coordinates
+    # Get LCC projection parameters and compute divergence in geographic coordinates
     # ================================================================================
     m_lats, dx, dy, gamma, n = get_lcc_grid_params(ds)
 
-    ug = u * np.cos(gamma) + v * np.sin(gamma)
-    vg = -u * np.sin(gamma) + v * np.cos(gamma)
-
-    du_dx = (ug.shift(longitude=-1) - ug.shift(longitude=1)) / (2 * dx)
-    dv_dy = (vg.shift(latitude=-1)  - vg.shift(latitude=1))  / (2 * dy)
+    # Compute divergence directly in geographic coordinates (u, v)
+    du_dx = (u.shift(longitude=-1) - u.shift(longitude=1)) / (2 * dx)
+    dv_dy = (v.shift(latitude=-1)  - v.shift(latitude=1))  / (2 * dy)
     divergence = (du_dx + dv_dy)
 
     # Fill boundary NaNs (from finite difference stencil edges) with 0
@@ -738,6 +736,10 @@ def compute_convective(ds):
     mask6 = (z_agl>=0) & (z_agl<=6000)
     dz = -z_agl.diff("level")
 
+    # fudge factor for maximum relative vorticity and max updraft helicity
+    # to account for max in a 1h window instead of instantaneous value at each lead time
+    FUDGE_FACTOR_VORTICITY = 6
+
     # =====================================================
     # 2. Convert omega -> w
     # =====================================================
@@ -752,13 +754,11 @@ def compute_convective(ds):
     # Get LCC projection parameters (handles map scale factor, grid spacing, rotation)
     m_lats, dx, dy, gamma, n = get_lcc_grid_params(ds)
 
-    ug = u*np.cos(gamma) + v*np.sin(gamma)
-    vg = -u*np.sin(gamma) + v*np.cos(gamma)
+    # Compute vorticity directly in geographic coordinates (u, v)
+    dv_dx = (v.shift(longitude=-1) - v.shift(longitude=1)) / (2*dx)
+    du_dy = (u.shift(latitude=-1) - u.shift(latitude=1)) / (2*dy)
 
-    dv_dx = (vg.shift(longitude=-1) - vg.shift(longitude=1)) / (2*dx)
-    du_dy = (ug.shift(latitude=-1) - ug.shift(latitude=1)) / (2*dy)
-
-    # Vorticity
+    # Vorticity in geographic frame: zeta = dv/dx - du/dy
     zeta = dv_dx - du_dy
 
     # =================================================
@@ -795,8 +795,9 @@ def compute_convective(ds):
     # =====================================================
     # 5. Relative vorticity maximum in lowest 1 km and 2 km AGL
     # =====================================================
-    ds["RELV_max_0_1km"] = zeta.where(mask1).max("level", skipna=True).fillna(0).astype(np.float32)
-    ds["RELV_max_0_2km"] = zeta.where(mask2).max("level", skipna=True).fillna(0).astype(np.float32)
+    RELV_max = zeta * FUDGE_FACTOR_VORTICITY
+    ds["RELV_max_0_1km"] = RELV_max.where(mask1).max("level", skipna=True).fillna(0).astype(np.float32)
+    ds["RELV_max_0_2km"] = RELV_max.where(mask2).max("level", skipna=True).fillna(0).astype(np.float32)
 
     # =====================================================
     # 6. Storm motion (Bunkers)
@@ -847,6 +848,7 @@ def compute_convective(ds):
     mask2_5_mid = (z_agl_mid >= 2000) & (z_agl_mid <= 5000)
 
     uh_inst = w_mid * zeta_mid * dz
+    uh_inst = uh_inst * FUDGE_FACTOR_VORTICITY
 
     # 0-2 km updraft helicity
     uh_inst_0_2 = uh_inst.where(mask2_mid)
