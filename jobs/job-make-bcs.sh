@@ -6,6 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=@[LEAD_HOUR]
 #SBATCH --time=@[MAKE_BCS_WALLTIME]
+#SBATCH --deadline=@[DEADLINE]
 #SBATCH --exclusive
 
 # set vars

@@ -7,6 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=@[GET_BCS_WALLTIME]
+#SBATCH --deadline=@[DEADLINE]
 
 # set vars
 INIT_TIME="@[INIT_TIME]"

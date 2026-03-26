@@ -7,6 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --time=@[PMM_WALLTIME]
+#SBATCH --deadline=@[DEADLINE]
 #SBATCH --mem=128G
 
 # load wgrib2 modules

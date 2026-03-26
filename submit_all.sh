@@ -15,8 +15,8 @@ ACCNR=${ACCNR:-gsd-hpcs}
 # set wall clock time limits
 hr=$(echo "$INIT_TIME" | grep -oP '\d{2}$')
 if [[ "$hr" =~ ^(00|06|12|18)$ ]]; then
-    FCST_WALLTIME="02:30:00"
-    PMM_WALLTIME="02:50:00"
+    FCST_WALLTIME="02:15:00"
+    PMM_WALLTIME="02:30:00"
     GET_BCS_WALLTIME="00:30:00"
     MAKE_BCS_WALLTIME="01:00:00"
 else
@@ -29,6 +29,15 @@ fi
 GET_ICS_WALLTIME="00:10:00"
 MAKE_ICS_WALLTIME="00:10:00"
 PLOT_WALLTIME="00:30:00"
+
+# set deadline only for near-realtime runs; disable it for retrospective runs
+INIT_EPOCH=$(date -u -d "${INIT_TIME}:00:00 UTC" +"%s")
+NOW_EPOCH=$(date -u +"%s")
+if (( NOW_EPOCH - INIT_EPOCH <= 6*3600 )); then
+    DEADLINE=$(date -u -d "${INIT_TIME}:00:00 UTC +10 hours" +"%Y-%m-%dT%H:%M:%S")
+else
+    DEADLINE=""
+fi
 
 # set environment variables
 PMM_POLL_SECONDS="60"
