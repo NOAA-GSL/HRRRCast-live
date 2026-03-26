@@ -317,7 +317,7 @@ class Netcdf2Grib:
 
         # 6. Adjust decimal scale factor to improve precision for select variables
         msg.binaryScaleFactor = 0
-        if var_name == "SPFH" or var_name == "SPFH_0C":
+        if var_name == "SPFH" or var_name == "SPFH_0C" or var_name == "SPFH2M":
             if surface_value and surface_value >= 5000 and surface_value <= 10000:
                 msg.decScaleFactor = 12
             elif surface_value and surface_value >= 15000 and surface_value <= 40000:
