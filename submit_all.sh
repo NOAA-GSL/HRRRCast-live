@@ -95,7 +95,7 @@ fi
 # ensemble PMM
 if [ $N_ENSEMBLES -ge 2 ]; then
     atparse < $PACKAGEROOT/jobs/job-compute-pmm.sh > $DATAROOT/logs/job-compute-pmm.sh
-    jobid7=$(submit_with_check sbatch --dependency=after:$jobid5 --parsable $DATAROOT/logs/job-compute-pmm.sh)
+    jobid7=$(submit_with_check sbatch --dependency=afterok:$jobid5 --parsable $DATAROOT/logs/job-compute-pmm.sh)
     echo "Submitted job: $jobid7"
 
     if [ "$RUNPLOT" == "YES" ]; then
