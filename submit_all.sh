@@ -11,6 +11,7 @@ DATAROOT=${6:-`pwd`}
 RUNPLOT=${7:-"YES"}
 ENVMODE=${8:-``}
 ACCNR=${ACCNR:-gsd-hpcs}
+FCST_QOS=${FCST_QOS:-gpuwf}
 
 # set wall clock time limits
 hr=$(echo "$INIT_TIME" | grep -oP '\d{2}$')
@@ -36,7 +37,7 @@ NOW_EPOCH=$(date -u +"%s")
 if (( NOW_EPOCH - INIT_EPOCH <= 6*3600 )); then
     DEADLINE=$(date -u -d "${INIT_TIME}:00:00 UTC +10 hours" +"%Y-%m-%dT%H:%M:%S")
 else
-    DEADLINE=""
+    DEADLINE="2100-01-01T00:00:00"
 fi
 
 # set environment variables

@@ -2,7 +2,7 @@
 #SBATCH --job-name=fcst
 #SBATCH --output=logs/fcst_%j.out
 #SBATCH --partition=u1-h100
-#SBATCH --qos=gpuwf
+#SBATCH --qos=@[FCST_QOS]
 #SBATCH --gres=gpu:h100:1
 #SBATCH --account=@[ACCNR]
 #SBATCH --nodes=1
