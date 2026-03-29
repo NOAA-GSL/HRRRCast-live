@@ -55,7 +55,7 @@ def get_lcc_grid_params(ds: xr.Dataset, lat_dim: str = "latitude", lon_dim: str 
     # m > 1 near standard parallel, < 1 away from it
     dx = dx_model / m_lats
     dy = dy_model / m_lats
-    
+
     # Rotation angle for coordinate transformation
     # Convert longitude from 0-360 to -180-180 convention
     lon_180 = ds[lon_dim].where(ds[lon_dim] <= 180, ds[lon_dim] - 360)
@@ -206,6 +206,59 @@ def compute_pot2m(ds: xr.Dataset) -> xr.Dataset:
     
     ds["POT2M"] = pot_temp
     
+    return ds
+
+
+def compute_mslma(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Compute mean sea level pressure (MSLMA) from surface pressure.
+
+    This function reduces station/surface pressure to mean sea level pressure
+    using a hydrostatic reduction with virtual temperature:
+
+        MSLP = Psfc * exp(g * z / (Rd * Tv))
+
+    where z is terrain height above mean sea level and Tv is near-surface
+    virtual temperature. This is a standard first-order pressure reduction used
+    for synoptic analysis.
+
+    Args:
+        ds (xr.Dataset): Input dataset containing:
+            - PRES: Surface pressure (Pa)
+            - OROG: Terrain height (m)
+            - T2M: 2-meter temperature (K)
+            - SPFH2M: 2-meter specific humidity (kg/kg) for virtual temperature
+
+    Returns:
+        xr.Dataset: Input dataset augmented with:
+            - MSLMA: Mean sea level pressure (Pa)
+
+    Notes:
+        - Tv = T * (1 + 0.61*q) is used.
+        - The output is clipped to a broad physical range [50,000, 120,000] Pa.
+    """
+    g = np.float32(9.81)
+    rd = np.float32(287.0)
+
+    p_sfc = ds["PRES"].astype(np.float32)
+    z = ds["OROG"].astype(np.float32)
+    t2m = ds["T2M"].astype(np.float32)
+
+    # Compute virtual temperature at 2m
+    q2m = ds["SPFH2M"].astype(np.float32)
+    tv = t2m * (np.float32(1.0) + np.float32(0.61) * q2m)
+
+    # lapse rate correction: Tv increases with height due to decreasing pressure,
+    gamma = 0.0065  # K/m
+    tv = tv + np.float32(0.5) * gamma * z
+
+    # Avoid division issues in very cold edge cases.
+    tv = tv.clip(min=np.float32(180.0))
+
+    # Hydrostatic reduction to mean sea level pressure
+    mslma = p_sfc * np.exp((g * z) / (rd * tv))
+    ds["MSLMA"] = mslma.clip(min=np.float32(50000.0), max=np.float32(120000.0)).astype(np.float32)
+
     return ds
 
 
@@ -1025,7 +1078,7 @@ def compute_diagnostics(
         
         include (list, optional): List of diagnostic function names to compute.
             If None (default), all diagnostics are computed.
-            Available: ['r2m', 'spfh2m', 'pot2m', 'pwat', 'conditional_rain',
+            Available: ['r2m', 'spfh2m', 'pot2m', 'mslma', 'pwat', 'conditional_rain',
                        'conditional_freezing_rain', 'wind_gust', 'convective',
                        '0C_isotherm']
         
@@ -1047,7 +1100,7 @@ def compute_diagnostics(
 
     Notes:
         - Diagnostics are computed in the following order to minimize dependencies:
-          1. Basic surface diagnostics: R2M, SPFH2M, POT2M
+          1. Basic surface diagnostics: R2M, SPFH2M, POT2M, MSLMA
           2. Column-integrated: PWAT
           3. Precipitation diagnostics: CRAIN, CFRZR
           4. Wind diagnostics: GUST
@@ -1077,6 +1130,7 @@ def compute_diagnostics(
         ('r2m', compute_r2m),
         ('spfh2m', compute_spfh2m),
         ('pot2m', compute_pot2m),
+        ('mslma', compute_mslma),
         ('pwat', compute_pwat),
         ('vvel', compute_vvel),
         ('conditional_rain', compute_conditional_rain),
