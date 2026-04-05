@@ -33,7 +33,7 @@ USE_VECTORIZED: bool = False
 # ==== Diffusion/CRPS step counts ====
 NUM_DIFFUSION_STEPS: int = 200
 NUM_INFERENCE_STEPS: int = 50
-USE_LOGSNR_SPACED: bool = True
+USE_LOGSNR_SPACED: bool = False
 NUM_CRPS_ENSEMBLES: int = 4
 
 
