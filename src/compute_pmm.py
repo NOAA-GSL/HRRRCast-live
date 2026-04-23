@@ -338,7 +338,9 @@ def compute_ensemble_pmm(datetime_str: str,
             # Save per-hour NetCDF
             out_nc = os.path.join(output_date_dir, f"hrrrcast_memavg_f{h:02d}.nc")
             logger.info(f"Saving per-hour processed ensemble to: {out_nc}")
-            processed_ds.to_netcdf(out_nc)
+            encoding = {v: {"_FillValue": np.float32(-9999.0)}
+                        for v in processed_ds.data_vars if v != "grid_mapping"}
+            processed_ds.to_netcdf(out_nc, encoding=encoding)
 
             # Save per-hour GRIB2 for avg
             converter.save_grib2(init_datetime, processed_ds, 'avg', output_date_dir)

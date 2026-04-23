@@ -47,7 +47,7 @@ from transform import (
 )
 import utils
 from utils import setup_logging
-from diagnostics import compute_diagnostics
+from diagnostics import compute_diagnostics, apply_cf_attributes
 from compute_pmm import compute_PMM
 
 logger = None
@@ -603,6 +603,9 @@ class WeatherForecaster:
         # compute diagnostics
         ds_hour = compute_diagnostics(ds_hour)
 
+        # Apply CF-compliant long_name and units to all variables
+        ds_hour = apply_cf_attributes(ds_hour)
+
         return ds_hour
 
     def write_single_hour_netcdf(
@@ -628,7 +631,9 @@ class WeatherForecaster:
         mem_str = f"avg" if str(member) == "avg" else f"mem{int(member)}"
         nc_path = outdir / f"hrrrcast_{mem_str}_f{hour:02d}.nc"
         logger.info(f"Saving single-hour NetCDF to {nc_path}")
-        ds_hour.to_netcdf(nc_path)
+        encoding = {v: {"_FillValue": np.float32(-9999.0)}
+                    for v in ds_hour.data_vars if v != "grid_mapping"}
+        ds_hour.to_netcdf(nc_path, encoding=encoding)
         return str(nc_path)
 
     def write_single_hour_grib2(
