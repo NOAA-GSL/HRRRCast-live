@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -51,6 +51,12 @@ from diagnostics import compute_diagnostics, apply_cf_attributes
 from compute_pmm import compute_PMM
 
 logger = None
+
+# Module-level reference to the forecast initialization datetime (f00).
+# This is preserved across the autoregressive rollout so downstream code can
+# always recover the original initialization time, even when individual
+# datasets carry per-hour valid times in their `time` coordinate.
+GLOBAL_INIT_DATETIME: Optional[datetime] = None
 
 
 class PreprocessedDataLoader:
@@ -568,7 +574,7 @@ class WeatherForecaster:
             forecast_norm: normalized model output for this hour, shape (1, Ny, Nx, C)
 
         Returns:
-            xr.Dataset with dims (time=1, lead_time=1, [level], latitude, longitude)
+            xr.Dataset with dims (time=1, [level], latitude, longitude)
         """
         # Denormalize to physical units
         denorm = self.denormalize(forecast_norm)
@@ -578,18 +584,16 @@ class WeatherForecaster:
         times = [hour]
         ds_hour = self.create_xarray_dataset(init_datetime, times, lats, lons, denorm)
 
-        # Inject constants if present in preprocessed NPZ (repeat across lead_time length 1)
+        # Inject constants if present in preprocessed NPZ (single time slice)
         for cname in ["LAND", "OROG"]:
             raw_key = f"{cname}_raw"
             if hasattr(self.data_loader_hrrr, "data") and raw_key in self.data_loader_hrrr.data.files and cname not in ds_hour:
                 cvals = self.data_loader_hrrr.data[raw_key].astype(np.float32)
-                const_4d = np.tile(cvals[None, None, :, :], (1, len(times), 1, 1))
                 ds_hour[cname] = xr.DataArray(
-                    const_4d,
-                    dims=("time", "lead_time", "latitude", "longitude"),
+                    cvals[None, :, :],
+                    dims=("time", "latitude", "longitude"),
                     coords={
-                        "time": [init_datetime],
-                        "lead_time": ("lead_time", times, {"units": "hours"}),
+                        "time": [init_datetime + timedelta(hours=hour)],
                         "latitude": (("latitude", "longitude"), lats),
                         "longitude": (("latitude", "longitude"), lons),
                     },
@@ -633,6 +637,8 @@ class WeatherForecaster:
         logger.info(f"Saving single-hour NetCDF to {nc_path}")
         encoding = {v: {"_FillValue": np.float32(-9999.0)}
                     for v in ds_hour.data_vars if v != "grid_mapping"}
+        encoding["latitude"] = {"_FillValue": np.float32(-9999.0)}
+        encoding["longitude"] = {"_FillValue": np.float32(-9999.0)}
         ds_hour.to_netcdf(nc_path, encoding=encoding)
         return str(nc_path)
 
@@ -659,14 +665,7 @@ class WeatherForecaster:
         outdir.mkdir(parents=True, exist_ok=True)
 
         converter = Netcdf2Grib()
-        # Ensure ds_hour has exactly one lead_time equal to 'hour'
-        if 'lead_time' in ds_hour.coords:
-            try:
-                # If needed, overwrite lead_time coord to match the requested hour
-                ds_hour = ds_hour.assign_coords(lead_time=("lead_time", [hour]))
-            except Exception:
-                pass
-        converter.save_grib2(init_datetime, ds_hour, member, outdir)
+        converter.save_grib2(init_datetime, hour, ds_hour, member, outdir)
 
     def get_variable_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -1004,25 +1003,27 @@ class WeatherForecaster:
 
         logger.info("Autoregressive rollout completed")
 
-    def create_xarray_dataset(self, init_datetime: datetime, times: List[int], 
+    def create_xarray_dataset(self, init_datetime: datetime, times: List[int],
                             lats: np.ndarray, lons: np.ndarray, data: np.ndarray) -> xr.Dataset:
         """Convert numpy array to xarray.Dataset."""
         data_vars = {}
         var_index = 0
-        
+
         pl_vars = self.metadata['pl_vars']
         sfc_vars = self.metadata['sfc_vars']
         levels = self.metadata['levels']
-        
+
+        # Compute valid time for this forecast step
+        valid_time = init_datetime + timedelta(hours=int(times[0]))
+
         # Pressure-level variables: (time, level, y, x)
         for pl_var in pl_vars:
             pl_data = np.transpose(data[..., var_index:var_index+len(levels)], (0, 3, 1, 2))
             data_vars[pl_var] = xr.DataArray(
-                np.expand_dims(pl_data, 0),
-                dims=("time", "lead_time", "level", "latitude", "longitude"),
+                pl_data,
+                dims=("time", "level", "latitude", "longitude"),
                 coords={
-                    "time": [init_datetime],
-                    "lead_time": ("lead_time", times, {"units": "hours"}),
+                    "time": [valid_time],
                     "level": ("level", levels, {"units": "hPa"}),
                     "latitude": (("latitude", "longitude"), lats),
                     "longitude": (("latitude", "longitude"), lons),
@@ -1030,23 +1031,22 @@ class WeatherForecaster:
                 name=pl_var
             )
             var_index += len(levels)
-        
+
         # Surface variables: (time, y, x)
         for sfc_var in sfc_vars:
             sfc_data = data[..., var_index]
             data_vars[sfc_var] = xr.DataArray(
-                np.expand_dims(sfc_data, 0),
-                dims=("time", "lead_time", "latitude", "longitude"),
+                sfc_data,
+                dims=("time", "latitude", "longitude"),
                 coords={
-                    "time": [init_datetime],
-                    "lead_time": ("lead_time", times, {"units": "hours"}),
+                    "time": [valid_time],
                     "latitude": (("latitude", "longitude"), lats),
                     "longitude": (("latitude", "longitude"), lons),
                 },
                 name=sfc_var
             )
             var_index += 1
-        
+
         ds = xr.Dataset(data_vars)
 
         return ds
@@ -1059,6 +1059,10 @@ class WeatherForecaster:
         """
         try:
             init_datetime = self.data_loader_hrrr.get_init_datetime()
+            # Preserve the initialization (f00) datetime at module scope so it can
+            # be referenced after per-hour datasets switch to valid-time coords.
+            global GLOBAL_INIT_DATETIME
+            GLOBAL_INIT_DATETIME = init_datetime
 
             logger.info(f"Running forecast for {init_datetime} with {lead_hours} hour lead time")
             logger.info(f"Model input shape: {model_input.shape}")

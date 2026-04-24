@@ -71,9 +71,6 @@ def compute_PMM(fields: xr.DataArray, method=2) -> xr.DataArray:
         raise ValueError(f"Could not identify spatial dimensions. Available dims: {fields.dims}")
     
     # print info for debugging
-    if 'lead_time' in fields.coords:
-        lt = fields.lead_time.values / np.timedelta64(1, "h")
-        logger.debug(f"Lead time {lt}h")
     if 'level' in fields.coords:
         lv = fields.level.values
         logger.debug(f"Level {lv}")
@@ -126,50 +123,41 @@ def compute_PMM(fields: xr.DataArray, method=2) -> xr.DataArray:
 def process_variable_pmm(var_data: xr.DataArray, method: int = 2) -> xr.DataArray:
     """
     Process a variable using Probability-Matched Mean method.
-    
+
     Handles datasets with dimensions:
-    - 3D variables: (time, lead_time, level, lat, lon, member)
-    - 2D variables: (time, lead_time, lat, lon, member)
+    - 3D variables: (time, level, lat, lon, member)
+    - 2D variables: (time, lat, lon, member)
     """
-    
+
     # Initialize list to collect results across all dimensions
     time_results = []
-    
+
     # Loop over time dimension
     for t in range(var_data.sizes['time']):
         logger.debug(f"Processing time step {t+1}/{var_data.sizes['time']}")
         time_slice = var_data.isel(time=t)
-        
-        # Loop over lead_time dimension
-        lead_time_results = []
-        for lt in range(time_slice.sizes['lead_time']):
-            lead_time_slice = time_slice.isel(lead_time=lt)
-            
-            # Check if level dimension exists (3D vs 2D variable)
-            if 'level' in lead_time_slice.dims:
-                # 3D variable: process each level separately
-                level_results = []
-                for lev in range(lead_time_slice.sizes['level']):
-                    level_slice = lead_time_slice.isel(level=lev)
-                    # Now we have (lat, lon, member) - ready for PMM
-                    pmm_result = compute_PMM(level_slice, method=method)
-                    level_results.append(pmm_result)
-                
-                # Concatenate results back along level dimension
-                lead_time_pmm = xr.concat(level_results, dim='level')
-            else:
-                # 2D variable: direct PMM computation on (lat, lon, member)
-                lead_time_pmm = compute_PMM(lead_time_slice, method=method)
-            
-            lead_time_results.append(lead_time_pmm)
-        
-        # Concatenate results back along lead_time dimension
-        time_pmm = xr.concat(lead_time_results, dim='lead_time')
+
+        # Check if level dimension exists (3D vs 2D variable)
+        if 'level' in time_slice.dims:
+            # 3D variable: process each level separately
+            level_results = []
+            for lev in range(time_slice.sizes['level']):
+                level_slice = time_slice.isel(level=lev)
+                # Now we have (lat, lon, member) - ready for PMM
+                pmm_result = compute_PMM(level_slice, method=method)
+                level_results.append(pmm_result)
+
+            # Concatenate results back along level dimension
+            time_pmm = xr.concat(level_results, dim='level')
+        else:
+            # 2D variable: direct PMM computation on (lat, lon, member)
+            time_pmm = compute_PMM(time_slice, method=method)
+
         time_results.append(time_pmm)
-    
+
     # Concatenate results back along time dimension
     var_processed = xr.concat(time_results, dim='time')
-    
+
     return var_processed
 
 def process_variable_mean(var_data: xr.DataArray) -> xr.DataArray:
@@ -177,8 +165,8 @@ def process_variable_mean(var_data: xr.DataArray) -> xr.DataArray:
     Process a variable using standard ensemble mean.
     
     Simply computes the mean across the member dimension, preserving all other dimensions:
-    - 3D variables: (time, lead_time, level, lat, lon, member) -> (time, lead_time, level, lat, lon)
-    - 2D variables: (time, lead_time, lat, lon, member) -> (time, lead_time, lat, lon)
+    - 3D variables: (time, level, lat, lon, member) -> (time, level, lat, lon)
+    - 2D variables: (time, lat, lon, member) -> (time, lat, lon)
     """
     processed_var = var_data.mean(dim='member')
     return processed_var
@@ -315,16 +303,13 @@ def compute_ensemble_pmm(datetime_str: str,
                         da = process_variable_mean(var_data)
                         da.attrs['processing_method'] = 'ensemble_mean'
 
-                # Ensure time and lead_time coords/dims exist for downstream writer
-                # If dims already exist, just set their coordinate values; else expand dims
-                if 'time' in da.dims and 'lead_time' in da.dims:
-                    da = da.assign_coords(time=[np.datetime64(init_datetime)],
-                                          lead_time=[int(h)])
+                # Ensure time coord/dim exists for downstream writer
+                # Time coordinate is the valid time (init + lead hour)
+                valid_time = np.datetime64(init_datetime) + np.timedelta64(int(h), 'h')
+                if 'time' in da.dims:
+                    da = da.assign_coords(time=[valid_time])
                 else:
-                    da = da.expand_dims({
-                        'time': [np.datetime64(init_datetime)],
-                        'lead_time': [int(h)]
-                    })
+                    da = da.expand_dims({'time': [valid_time]})
                 processed_datasets[var_name] = da
 
             processed_ds = xr.Dataset(processed_datasets)
@@ -343,7 +328,7 @@ def compute_ensemble_pmm(datetime_str: str,
             processed_ds.to_netcdf(out_nc, encoding=encoding)
 
             # Save per-hour GRIB2 for avg
-            converter.save_grib2(init_datetime, processed_ds, 'avg', output_date_dir)
+            converter.save_grib2(init_datetime, h, processed_ds, 'avg', output_date_dir)
 
             # Close datasets to free memory
             ensemble_ds.close()

@@ -324,9 +324,8 @@ class ForecastPlotter:
             for level_idx, level in enumerate(levels_in_ds):
                 try:
                     # Extract data for this variable and level
-                    # Use lead_time dimension and select first time step (time=0)
-                    # Per-hour file has a single lead_time slot; index 0
-                    data = ds[var_name].isel(time=0, lead_time=0, level=level_idx).values
+                    # Per-hour file has a single time slot; index 0
+                    data = ds[var_name].isel(time=0, level=level_idx).values
                     logger.info(f"{var_name} stats - mean: {np.nanmean(data):.2f}, std: {np.nanstd(data):.2f}, min: {np.nanmin(data):.2f}, max: {np.nanmax(data):.2f}")
                     
                     # Create plot
@@ -365,9 +364,8 @@ class ForecastPlotter:
             
             try:
                 # Extract data for this variable
-                # Use lead_time dimension and select first time step (time=0)
-                # Per-hour file has a single lead_time slot; index 0
-                data = ds[var_name].isel(time=0, lead_time=0).values
+                # Per-hour file has a single time slot; index 0
+                data = ds[var_name].isel(time=0).values
                 # log mean, std, min, max of data
                 logger.info(f"{var_name} stats - mean: {np.nanmean(data):.2f}, std: {np.nanstd(data):.2f}, min: {np.nanmin(data):.2f}, max: {np.nanmax(data):.2f}")
                 
@@ -428,9 +426,9 @@ class ForecastPlotter:
                 if level is not None:
                     # Find level index
                     level_idx = self.config.levels.index(level) if level in self.config.levels else 0
-                    data = ds[var_name].isel(time=0, lead_time=0, level=level_idx).values
+                    data = ds[var_name].isel(time=0, level=level_idx).values
                 else:
-                    data = ds[var_name].isel(time=0, lead_time=0).values
+                    data = ds[var_name].isel(time=0).values
                 
                 # Get colormap
                 var_config = self.config.var_configs.get(var_display, {})
