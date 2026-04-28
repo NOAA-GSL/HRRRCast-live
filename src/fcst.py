@@ -646,10 +646,12 @@ class WeatherForecaster:
         encoding["longitude"] = {"_FillValue": np.float32(-9999.0)}
         # CF-1.6: store time as float64 hours since the initialization time
         # (xarray would otherwise emit int64 nanoseconds, which is not a CF type).
+        # CF \u00a72.5.1 forbids _FillValue on coordinate variables.
         encoding["time"] = {
             "units": f"hours since {init_datetime.strftime('%Y-%m-%d %H:%M:%S')}",
             "calendar": "standard",
             "dtype": "float64",
+            "_FillValue": None,
         }
         if "level" in ds_hour.coords:
             encoding["level"] = {"dtype": "int32"}

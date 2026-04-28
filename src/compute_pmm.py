@@ -330,10 +330,12 @@ def compute_ensemble_pmm(datetime_str: str,
             if "longitude" in processed_ds.coords:
                 encoding["longitude"] = {"_FillValue": np.float32(-9999.0)}
             # CF-1.6: time as float64 hours since init; level as int32.
+            # CF \u00a72.5.1 forbids _FillValue on coordinate variables.
             encoding["time"] = {
                 "units": f"hours since {init_datetime.strftime('%Y-%m-%d %H:%M:%S')}",
                 "calendar": "standard",
                 "dtype": "float64",
+                "_FillValue": None,
             }
             if "level" in processed_ds.coords:
                 encoding["level"] = {"dtype": "int32"}

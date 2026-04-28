@@ -1159,6 +1159,19 @@ def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
         Forecast initialization time (UTC). When provided it is written as the
         ``initialization_time`` global attribute in ISO 8601 form.
     """
+    # CF best practice (and an IOOS compliance-checker requirement): a 2D
+    # auxiliary coordinate variable must not share its name with a dimension.
+    # Internally the dataset uses dim names "latitude"/"longitude"; rename
+    # those dims to y/x at write time so the 2D ``latitude(y, x)`` and
+    # ``longitude(y, x)`` arrays no longer collide with their dimensions.
+    rename_map = {}
+    if "latitude" in ds.dims:
+        rename_map["latitude"] = "y"
+    if "longitude" in ds.dims:
+        rename_map["longitude"] = "x"
+    if rename_map:
+        ds = ds.rename_dims(rename_map)
+
     # Variable-level: long_name, units, grid_mapping, and coordinates reference.
     for var in ds.data_vars:
         if var == "grid_mapping":
@@ -1166,9 +1179,12 @@ def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
         if var in CF_ATTRS:
             ds[var].attrs.update(CF_ATTRS[var])
         ds[var].attrs["grid_mapping"] = "grid_mapping"
-        # CF \u00a75.5: data vars on a projected grid must point at their 2D
-        # auxiliary lat/lon coordinates so they are not mistaken for dim coords.
-        ds[var].attrs["coordinates"] = "latitude longitude"
+        # CF \u00a75.5: only declare the 2D lat/lon auxiliary coordinates on
+        # variables whose dims actually contain the spatial axes. Domain-
+        # aggregated diagnostics like RAIN_FRACTION/FRZR_FRACTION are reduced
+        # to (time,) and would otherwise fail the auxiliary-coord-subset rule.
+        if "y" in ds[var].dims and "x" in ds[var].dims:
+            ds[var].attrs["coordinates"] = "latitude longitude"
 
     # Grid mapping variable (scalar int, CF convention)
     ds["grid_mapping"] = xr.DataArray(
@@ -1188,26 +1204,25 @@ def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
 
     # CF \u00a75.6 requires variables with standard_name=projection_x_coordinate /
     # projection_y_coordinate when a Lambert Conformal grid_mapping is declared.
-    # HRRR is a 3-km grid; the dimensions used in the dataset are named
-    # "longitude" (x) and "latitude" (y). We expose 1D x/y arrays in metres
-    # relative to the grid centre as auxiliary coordinates along those dims.
+    # HRRR is a 3-km grid; the renamed x/y dimensions carry these as 1D dim
+    # coordinates expressed in metres relative to the grid centre.
     HRRR_DX_M = 3000.0
-    if "longitude" in ds.dims and "x" not in ds.coords:
-        nx = ds.sizes["longitude"]
+    if "x" in ds.dims and "x" not in ds.coords:
+        nx = ds.sizes["x"]
         x_vals = ((np.arange(nx, dtype=np.float64) - (nx - 1) / 2.0) * HRRR_DX_M)
         ds = ds.assign_coords(
-            x=("longitude", x_vals, {
+            x=("x", x_vals, {
                 "standard_name": "projection_x_coordinate",
                 "long_name": "x coordinate of projection",
                 "units": "m",
                 "axis": "X",
             }),
         )
-    if "latitude" in ds.dims and "y" not in ds.coords:
-        ny = ds.sizes["latitude"]
+    if "y" in ds.dims and "y" not in ds.coords:
+        ny = ds.sizes["y"]
         y_vals = ((np.arange(ny, dtype=np.float64) - (ny - 1) / 2.0) * HRRR_DX_M)
         ds = ds.assign_coords(
-            y=("latitude", y_vals, {
+            y=("y", y_vals, {
                 "standard_name": "projection_y_coordinate",
                 "long_name": "y coordinate of projection",
                 "units": "m",
