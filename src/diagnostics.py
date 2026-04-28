@@ -1134,9 +1134,18 @@ CF_ATTRS = {
 }
 
 
-def apply_cf_attributes(ds: xr.Dataset) -> xr.Dataset:
+def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
     """Apply CF-compliant long_name and units attributes to all known variables in the dataset,
-    add the Lambert Conformal Conic grid_mapping variable, and set required CF global attributes."""
+    add the Lambert Conformal Conic grid_mapping variable, and set required CF global attributes.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Dataset to annotate with CF metadata.
+    init_datetime : datetime.datetime, optional
+        Forecast initialization time (UTC). When provided it is written as the
+        ``initialization_time`` global attribute in ISO 8601 form.
+    """
     # Variable-level: long_name, units, and grid_mapping reference
     for var in ds.data_vars:
         if var in CF_ATTRS:
@@ -1148,7 +1157,7 @@ def apply_cf_attributes(ds: xr.Dataset) -> xr.Dataset:
         np.int32(0),
         attrs={
             "grid_mapping_name":             "lambert_conformal_conic",
-            "standard_parallel":             [38.5, 38.5],
+            "standard_parallel":             38.5,
             "longitude_of_central_meridian": -97.5,
             "latitude_of_projection_origin": 38.5,
             "false_easting":                 0.0,
@@ -1160,8 +1169,10 @@ def apply_cf_attributes(ds: xr.Dataset) -> xr.Dataset:
     )
 
     # Global attributes
-    ds.attrs["Conventions"] = "CF-1.4"
+    ds.attrs["Conventions"] = "CF-1.6"
     ds.attrs["Originating_center"] = "NOAA/GSL"
+    if init_datetime is not None:
+        ds.attrs["initialization_time"] = init_datetime.strftime("%Y-%m-%dT%H:%M:%SZ")
     return ds
 
 

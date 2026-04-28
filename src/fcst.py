@@ -608,7 +608,7 @@ class WeatherForecaster:
         ds_hour = compute_diagnostics(ds_hour)
 
         # Apply CF-compliant long_name and units to all variables
-        ds_hour = apply_cf_attributes(ds_hour)
+        ds_hour = apply_cf_attributes(ds_hour, init_datetime=init_datetime)
 
         return ds_hour
 
