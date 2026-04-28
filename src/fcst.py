@@ -52,13 +52,6 @@ from compute_pmm import compute_PMM
 
 logger = None
 
-# Module-level reference to the forecast initialization datetime (f00).
-# This is preserved across the autoregressive rollout so downstream code can
-# always recover the original initialization time, even when individual
-# datasets carry per-hour valid times in their `time` coordinate.
-GLOBAL_INIT_DATETIME: Optional[datetime] = None
-
-
 class PreprocessedDataLoader:
     """Handles loading and validation of preprocessed data."""
     
@@ -1103,10 +1096,6 @@ class WeatherForecaster:
         """
         try:
             init_datetime = self.data_loader_hrrr.get_init_datetime()
-            # Preserve the initialization (f00) datetime at module scope so it can
-            # be referenced after per-hour datasets switch to valid-time coords.
-            global GLOBAL_INIT_DATETIME
-            GLOBAL_INIT_DATETIME = init_datetime
 
             logger.info(f"Running forecast for {init_datetime} with {lead_hours} hour lead time")
             logger.info(f"Model input shape: {model_input.shape}")
