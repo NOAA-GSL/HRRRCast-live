@@ -168,9 +168,7 @@ class TimeCondLayer(Layer):
         self.use_noise = use_noise
 
     def call(self, inputs):
-        n = inputs.shape[-1] or tf.shape(inputs)[-1]
-        pos_mask = [idx % n for idx in self.time_mask]
-        time_feats = tf.gather(inputs, pos_mask, axis=-1)  # (B, H, W, 2)
+        time_feats = tf.gather(inputs, self.time_mask, axis=-1)  # (B, H, W, 2)
         d = time_feats[:, 0, 0, :]  # (B, 2)
 
         if not self.use_crps:
