@@ -338,7 +338,12 @@ def compute_ensemble_pmm(datetime_str: str,
                 "_FillValue": None,
             }
             if "level" in processed_ds.coords:
-                encoding["level"] = {"dtype": "int32"}
+                encoding["level"] = {"dtype": "int32", "_FillValue": None}
+            # CF \u00a72.5.1: projection coordinate variables x, y must not have _FillValue.
+            if "x" in processed_ds.coords:
+                encoding["x"] = {"_FillValue": None}
+            if "y" in processed_ds.coords:
+                encoding["y"] = {"_FillValue": None}
             processed_ds.to_netcdf(out_nc, encoding=encoding)
 
             # Save per-hour GRIB2 for avg

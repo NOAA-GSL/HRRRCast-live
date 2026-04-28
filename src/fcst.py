@@ -654,7 +654,12 @@ class WeatherForecaster:
             "_FillValue": None,
         }
         if "level" in ds_hour.coords:
-            encoding["level"] = {"dtype": "int32"}
+            encoding["level"] = {"dtype": "int32", "_FillValue": None}
+        # CF \u00a72.5.1: projection coordinate variables x, y must not have _FillValue.
+        if "x" in ds_hour.coords:
+            encoding["x"] = {"_FillValue": None}
+        if "y" in ds_hour.coords:
+            encoding["y"] = {"_FillValue": None}
         ds_hour.to_netcdf(nc_path, encoding=encoding)
         return str(nc_path)
 

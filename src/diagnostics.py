@@ -1234,7 +1234,7 @@ def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
     ds.attrs["Conventions"] = "CF-1.6"
     ds.attrs["title"] = "HRRRCast forecast output"
     ds.attrs["institution"] = "NOAA Global Systems Laboratory"
-    ds.attrs["source"] = "HRRRCast (deep-learning emulator of HRRR)"
+    ds.attrs["source"] = "HRRRCast"
     ds.attrs["history"] = (
         f"{datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}: "
         f"created by HRRRCast forecast pipeline"
