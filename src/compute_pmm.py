@@ -325,6 +325,18 @@ def compute_ensemble_pmm(datetime_str: str,
             logger.info(f"Saving per-hour processed ensemble to: {out_nc}")
             encoding = {v: {"_FillValue": np.float32(-9999.0)}
                         for v in processed_ds.data_vars if v != "grid_mapping"}
+            if "latitude" in processed_ds.coords:
+                encoding["latitude"] = {"_FillValue": np.float32(-9999.0)}
+            if "longitude" in processed_ds.coords:
+                encoding["longitude"] = {"_FillValue": np.float32(-9999.0)}
+            # CF-1.6: time as float64 hours since init; level as int32.
+            encoding["time"] = {
+                "units": f"hours since {init_datetime.strftime('%Y-%m-%d %H:%M:%S')}",
+                "calendar": "standard",
+                "dtype": "float64",
+            }
+            if "level" in processed_ds.coords:
+                encoding["level"] = {"dtype": "int32"}
             processed_ds.to_netcdf(out_nc, encoding=encoding)
 
             # Save per-hour GRIB2 for avg

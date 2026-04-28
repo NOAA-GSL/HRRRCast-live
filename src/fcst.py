@@ -593,9 +593,14 @@ class WeatherForecaster:
                     cvals[None, :, :],
                     dims=("time", "latitude", "longitude"),
                     coords={
-                        "time": [init_datetime + timedelta(hours=hour)],
-                        "latitude": (("latitude", "longitude"), lats),
-                        "longitude": (("latitude", "longitude"), lons),
+                        "time": ("time", [init_datetime + timedelta(hours=hour)],
+                                 {"standard_name": "time", "long_name": "time", "axis": "T"}),
+                        "latitude": (("latitude", "longitude"), lats,
+                                     {"standard_name": "latitude", "long_name": "latitude",
+                                      "units": "degrees_north"}),
+                        "longitude": (("latitude", "longitude"), lons,
+                                      {"standard_name": "longitude", "long_name": "longitude",
+                                       "units": "degrees_east"}),
                     },
                     name=cname,
                 )
@@ -639,6 +644,15 @@ class WeatherForecaster:
                     for v in ds_hour.data_vars if v != "grid_mapping"}
         encoding["latitude"] = {"_FillValue": np.float32(-9999.0)}
         encoding["longitude"] = {"_FillValue": np.float32(-9999.0)}
+        # CF-1.6: store time as float64 hours since the initialization time
+        # (xarray would otherwise emit int64 nanoseconds, which is not a CF type).
+        encoding["time"] = {
+            "units": f"hours since {init_datetime.strftime('%Y-%m-%d %H:%M:%S')}",
+            "calendar": "standard",
+            "dtype": "float64",
+        }
+        if "level" in ds_hour.coords:
+            encoding["level"] = {"dtype": "int32"}
         ds_hour.to_netcdf(nc_path, encoding=encoding)
         return str(nc_path)
 
@@ -1011,10 +1025,33 @@ class WeatherForecaster:
 
         pl_vars = self.metadata['pl_vars']
         sfc_vars = self.metadata['sfc_vars']
-        levels = self.metadata['levels']
+        # Cast pressure levels to int32 (CF-1.6 disallows int64 for coordinates).
+        levels = np.asarray(self.metadata['levels'], dtype=np.int32)
 
         # Compute valid time for this forecast step
         valid_time = init_datetime + timedelta(hours=int(times[0]))
+
+        # CF-1.6 attributes for the coordinate variables. The 2D latitude/longitude
+        # arrays are auxiliary coordinates on a Lambert Conformal grid; the 1D
+        # dimensions of the same name carry the projection x/y axes.
+        time_attrs = {"standard_name": "time", "long_name": "time", "axis": "T"}
+        level_attrs = {
+            "standard_name": "air_pressure",
+            "long_name": "pressure level",
+            "units": "hPa",
+            "positive": "down",
+            "axis": "Z",
+        }
+        lat_attrs = {
+            "standard_name": "latitude",
+            "long_name": "latitude",
+            "units": "degrees_north",
+        }
+        lon_attrs = {
+            "standard_name": "longitude",
+            "long_name": "longitude",
+            "units": "degrees_east",
+        }
 
         # Pressure-level variables: (time, level, y, x)
         for pl_var in pl_vars:
@@ -1023,10 +1060,10 @@ class WeatherForecaster:
                 pl_data,
                 dims=("time", "level", "latitude", "longitude"),
                 coords={
-                    "time": [valid_time],
-                    "level": ("level", levels, {"units": "hPa"}),
-                    "latitude": (("latitude", "longitude"), lats),
-                    "longitude": (("latitude", "longitude"), lons),
+                    "time": ("time", [valid_time], time_attrs),
+                    "level": ("level", levels, level_attrs),
+                    "latitude": (("latitude", "longitude"), lats, lat_attrs),
+                    "longitude": (("latitude", "longitude"), lons, lon_attrs),
                 },
                 name=pl_var
             )
@@ -1039,9 +1076,9 @@ class WeatherForecaster:
                 sfc_data,
                 dims=("time", "latitude", "longitude"),
                 coords={
-                    "time": [valid_time],
-                    "latitude": (("latitude", "longitude"), lats),
-                    "longitude": (("latitude", "longitude"), lons),
+                    "time": ("time", [valid_time], time_attrs),
+                    "latitude": (("latitude", "longitude"), lats, lat_attrs),
+                    "longitude": (("latitude", "longitude"), lons, lon_attrs),
                 },
                 name=sfc_var
             )

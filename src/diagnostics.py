@@ -5,6 +5,8 @@ This module contains functions to compute various weather diagnostics
 from model output or observational data.
 """
 
+from datetime import datetime
+
 import numpy as np
 import xarray as xr
 
@@ -713,6 +715,12 @@ def compute_vvel(ds: xr.Dataset) -> xr.Dataset:
     # Restore original pressure level coordinates
     vvel = vvel.assign_coords(level=ds.level)
 
+    # CF \u00a72.4: data vars should follow (T, Z, Y, X). Broadcasting placed
+    # the level axis first; reorder to match other pressure-level fields.
+    desired = [d for d in ("time", "level", "latitude", "longitude") if d in vvel.dims]
+    extra = [d for d in vvel.dims if d not in desired]
+    vvel = vvel.transpose(*extra, *desired)
+
     ds["VVEL"] = vvel.astype(np.float32)
     return ds
 
@@ -1135,8 +1143,13 @@ CF_ATTRS = {
 
 
 def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
-    """Apply CF-compliant long_name and units attributes to all known variables in the dataset,
-    add the Lambert Conformal Conic grid_mapping variable, and set required CF global attributes.
+    """Apply CF-1.6 metadata to a HRRRCast dataset.
+
+    Sets variable-level ``long_name``/``units`` from :data:`CF_ATTRS`, attaches the
+    Lambert Conformal Conic ``grid_mapping`` variable, adds 1D projection x/y
+    auxiliary coordinates required by CF \u00a75.6, marks data variables with
+    ``coordinates="latitude longitude"`` so the 2D auxiliary lat/lon arrays are
+    discoverable, and writes the required global attributes.
 
     Parameters
     ----------
@@ -1146,11 +1159,16 @@ def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
         Forecast initialization time (UTC). When provided it is written as the
         ``initialization_time`` global attribute in ISO 8601 form.
     """
-    # Variable-level: long_name, units, and grid_mapping reference
+    # Variable-level: long_name, units, grid_mapping, and coordinates reference.
     for var in ds.data_vars:
+        if var == "grid_mapping":
+            continue
         if var in CF_ATTRS:
             ds[var].attrs.update(CF_ATTRS[var])
         ds[var].attrs["grid_mapping"] = "grid_mapping"
+        # CF \u00a75.5: data vars on a projected grid must point at their 2D
+        # auxiliary lat/lon coordinates so they are not mistaken for dim coords.
+        ds[var].attrs["coordinates"] = "latitude longitude"
 
     # Grid mapping variable (scalar int, CF convention)
     ds["grid_mapping"] = xr.DataArray(
@@ -1168,8 +1186,45 @@ def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
         },
     )
 
+    # CF \u00a75.6 requires variables with standard_name=projection_x_coordinate /
+    # projection_y_coordinate when a Lambert Conformal grid_mapping is declared.
+    # HRRR is a 3-km grid; the dimensions used in the dataset are named
+    # "longitude" (x) and "latitude" (y). We expose 1D x/y arrays in metres
+    # relative to the grid centre as auxiliary coordinates along those dims.
+    HRRR_DX_M = 3000.0
+    if "longitude" in ds.dims and "x" not in ds.coords:
+        nx = ds.sizes["longitude"]
+        x_vals = ((np.arange(nx, dtype=np.float64) - (nx - 1) / 2.0) * HRRR_DX_M)
+        ds = ds.assign_coords(
+            x=("longitude", x_vals, {
+                "standard_name": "projection_x_coordinate",
+                "long_name": "x coordinate of projection",
+                "units": "m",
+                "axis": "X",
+            }),
+        )
+    if "latitude" in ds.dims and "y" not in ds.coords:
+        ny = ds.sizes["latitude"]
+        y_vals = ((np.arange(ny, dtype=np.float64) - (ny - 1) / 2.0) * HRRR_DX_M)
+        ds = ds.assign_coords(
+            y=("latitude", y_vals, {
+                "standard_name": "projection_y_coordinate",
+                "long_name": "y coordinate of projection",
+                "units": "m",
+                "axis": "Y",
+            }),
+        )
+
     # Global attributes
     ds.attrs["Conventions"] = "CF-1.6"
+    ds.attrs["title"] = "HRRRCast forecast output"
+    ds.attrs["institution"] = "NOAA Global Systems Laboratory"
+    ds.attrs["source"] = "HRRRCast (deep-learning emulator of HRRR)"
+    ds.attrs["history"] = (
+        f"{datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}: "
+        f"created by HRRRCast forecast pipeline"
+    )
+    ds.attrs["references"] = "https://github.com/NOAA-GSL/HRRRCast"
     ds.attrs["Originating_center"] = "NOAA/GSL"
     if init_datetime is not None:
         ds.attrs["initialization_time"] = init_datetime.strftime("%Y-%m-%dT%H:%M:%SZ")
