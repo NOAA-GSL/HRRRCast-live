@@ -1240,7 +1240,6 @@ def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
         f"created by HRRRCast forecast pipeline"
     )
     ds.attrs["references"] = "https://github.com/NOAA-GSL/HRRRCast"
-    ds.attrs["Originating_center"] = "NOAA/GSL"
     if init_datetime is not None:
         ds.attrs["initialization_time"] = init_datetime.strftime("%Y-%m-%dT%H:%M:%SZ")
     return ds
