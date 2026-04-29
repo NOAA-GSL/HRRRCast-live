@@ -4,7 +4,7 @@
 #SBATCH --partition=u1-h100
 #SBATCH --qos=@[FCST_QOS]
 #SBATCH --gres=gpu:h100:1
-#SBATCH --account=@[ACCNR]
+#SBATCH --account=@[FCST_ACCNR]
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96

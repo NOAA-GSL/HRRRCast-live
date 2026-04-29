@@ -10,8 +10,15 @@ PACKAGEROOT=${5:-`pwd`}
 DATAROOT=${6:-`pwd`}
 RUNPLOT=${7:-"YES"}
 ENVMODE=${8:-``}
+
 ACCNR=${ACCNR:-gsd-hpcs}
+FCST_ACCNR=${FCST_ACCNR:-$ACCNR}
 FCST_QOS=${FCST_QOS:-gpuwf}
+FCST_RESERVATION=${FCST_RESERVATION:-}
+
+if [ -n "$FCST_RESERVATION" ]; then
+    FCST_RESERVATION="--reservation=${FCST_RESERVATION}"
+fi
 
 # set wall clock time limits
 hr=$(echo "$INIT_TIME" | grep -oP '\d{2}$')
@@ -31,10 +38,12 @@ GET_ICS_WALLTIME="00:10:00"
 MAKE_ICS_WALLTIME="00:10:00"
 PLOT_WALLTIME="00:30:00"
 
-# set deadline only for near-realtime runs; disable it for retrospective runs
+# set deadline only for near-realtime non-synoptic runs
 INIT_EPOCH=$(date -u -d "${INIT_TIME}:00:00 UTC" +"%s")
 NOW_EPOCH=$(date -u +"%s")
-if (( NOW_EPOCH - INIT_EPOCH <= 6*3600 )); then
+if [[ "$hr" =~ ^(00|06|12|18)$ ]]; then
+    DEADLINE="2100-01-01T00:00:00"
+elif (( NOW_EPOCH - INIT_EPOCH <= 6*3600 )); then
     DEADLINE=$(date -u -d "${INIT_TIME}:00:00 UTC +10 hours" +"%Y-%m-%dT%H:%M:%S")
 else
     DEADLINE="2100-01-01T00:00:00"
@@ -83,7 +92,7 @@ echo "Submitted job: $jobid4"
 
 # submit forecasts as a job array over GPU slots; member range computed in job-fcst.sh
 atparse < $PACKAGEROOT/jobs/job-fcst.sh > $DATAROOT/logs/job-fcst.sh
-jobid5=$(submit_with_check sbatch --dependency=afterok:$jobid3:$jobid4 --array=0-$((N_GPUS-1)) --wait-all-nodes=1 --parsable $DATAROOT/logs/job-fcst.sh)
+jobid5=$(submit_with_check sbatch --dependency=afterok:$jobid3:$jobid4 --array=0-$((N_GPUS-1)) --wait-all-nodes=1 ${FCST_RESERVATION} --parsable $DATAROOT/logs/job-fcst.sh)
 echo "Submitted forecast job array: $jobid5"
 
 # submit plots as job array
