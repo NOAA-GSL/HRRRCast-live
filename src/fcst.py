@@ -47,7 +47,8 @@ from transform import (
 )
 import utils
 from utils import setup_logging
-from diagnostics import compute_diagnostics, apply_cf_attributes
+from diagnostics import compute_diagnostics
+from cf_attributes import apply_cf_attributes
 from compute_pmm import compute_PMM
 
 logger = None
