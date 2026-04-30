@@ -654,6 +654,16 @@ class WeatherForecaster:
             encoding["x"] = {"_FillValue": None}
         if "y" in ds_hour.coords:
             encoding["y"] = {"_FillValue": None}
+        # CF §2.5.1: coordinate variables must not have _FillValue.
+        if "forecast_reference_time" in ds_hour.coords:
+            encoding["forecast_reference_time"] = {
+                "units": "hours since 1970-01-01 00:00:00",
+                "calendar": "standard",
+                "dtype": "float64",
+                "_FillValue": None,
+            }
+        if "forecast_period" in ds_hour.coords:
+            encoding["forecast_period"] = {"dtype": "float32", "_FillValue": None}
         ds_hour.to_netcdf(nc_path, encoding=encoding)
         return str(nc_path)
 
@@ -1086,6 +1096,28 @@ class WeatherForecaster:
             var_index += 1
 
         ds = xr.Dataset(data_vars)
+
+        # CF-1.6 §4.4.1: scalar forecast coordinates.
+        # forecast_reference_time is the model initialization (analysis) time;
+        # forecast_period is the interval from that time to the valid time.
+        lead_hours = int(times[0])
+        ds = ds.assign_coords(
+            forecast_reference_time=xr.DataArray(
+                np.datetime64(init_datetime, "ns"),
+                attrs={
+                    "standard_name": "forecast_reference_time",
+                    "long_name": "model initialization time",
+                },
+            ),
+            forecast_period=xr.DataArray(
+                np.float32(lead_hours),
+                attrs={
+                    "standard_name": "forecast_period",
+                    "long_name": "forecast period",
+                    "units": "hours",
+                },
+            ),
+        )
 
         return ds
     

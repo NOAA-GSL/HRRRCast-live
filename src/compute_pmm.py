@@ -310,6 +310,24 @@ def compute_ensemble_pmm(datetime_str: str,
                     da = da.assign_coords(time=[valid_time])
                 else:
                     da = da.expand_dims({'time': [valid_time]})
+                # CF-1.6 §4.4.1 scalar forecast coordinates
+                da = da.assign_coords(
+                    forecast_reference_time=xr.DataArray(
+                        np.datetime64(init_datetime, "ns"),
+                        attrs={
+                            "standard_name": "forecast_reference_time",
+                            "long_name": "model initialization time",
+                        },
+                    ),
+                    forecast_period=xr.DataArray(
+                        np.float32(int(h)),
+                        attrs={
+                            "standard_name": "forecast_period",
+                            "long_name": "forecast period",
+                            "units": "hours",
+                        },
+                    ),
+                )
                 processed_datasets[var_name] = da
 
             processed_ds = xr.Dataset(processed_datasets)
@@ -344,6 +362,16 @@ def compute_ensemble_pmm(datetime_str: str,
                 encoding["x"] = {"_FillValue": None}
             if "y" in processed_ds.coords:
                 encoding["y"] = {"_FillValue": None}
+            # CF §2.5.1: coordinate variables must not have _FillValue.
+            if "forecast_reference_time" in processed_ds.coords:
+                encoding["forecast_reference_time"] = {
+                    "units": "hours since 1970-01-01 00:00:00",
+                    "calendar": "standard",
+                    "dtype": "float64",
+                    "_FillValue": None,
+                }
+            if "forecast_period" in processed_ds.coords:
+                encoding["forecast_period"] = {"dtype": "float32", "_FillValue": None}
             processed_ds.to_netcdf(out_nc, encoding=encoding)
 
             # Save per-hour GRIB2 for avg
