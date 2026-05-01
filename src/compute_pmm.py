@@ -125,8 +125,8 @@ def process_variable_pmm(var_data: xr.DataArray, method: int = 2) -> xr.DataArra
     Process a variable using Probability-Matched Mean method.
 
     Handles datasets with dimensions:
-    - 3D variables: (time, level, lat, lon, member)
-    - 2D variables: (time, lat, lon, member)
+    - 3D variables: (time, lead_time, level, lat, lon, member)
+    - 2D variables: (time, lead_time, lat, lon, member)
     """
 
     # Initialize list to collect results across all dimensions
@@ -165,8 +165,8 @@ def process_variable_mean(var_data: xr.DataArray) -> xr.DataArray:
     Process a variable using standard ensemble mean.
     
     Simply computes the mean across the member dimension, preserving all other dimensions:
-    - 3D variables: (time, level, lat, lon, member) -> (time, level, lat, lon)
-    - 2D variables: (time, lat, lon, member) -> (time, lat, lon)
+    - 3D variables: (time, lead_time, level, lat, lon, member) -> (time, lead_time, level, lat, lon)
+    - 2D variables: (time, lead_time, lat, lon, member) -> (time, lead_time, lat, lon)
     """
     processed_var = var_data.mean(dim='member')
     return processed_var
@@ -310,21 +310,24 @@ def compute_ensemble_pmm(datetime_str: str,
                     da = da.assign_coords(time=[valid_time])
                 else:
                     da = da.expand_dims({'time': [valid_time]})
-                # CF-1.6 §4.4.1 scalar forecast coordinates
+                # CF-1.6 §4.4.1: lead_time dimension coordinate (forecast_period)
+                # and scalar forecast_reference_time.
+                lead_time_attrs = {
+                    "standard_name": "forecast_period",
+                    "long_name": "forecast period",
+                    "units": "hours",
+                }
+                if 'lead_time' in da.dims:
+                    da = da.assign_coords(lead_time=("lead_time", [int(h)], lead_time_attrs))
+                else:
+                    da = da.expand_dims({"lead_time": [int(h)]})
+                    da = da.assign_coords(lead_time=("lead_time", [int(h)], lead_time_attrs))
                 da = da.assign_coords(
                     forecast_reference_time=xr.DataArray(
                         np.datetime64(init_datetime, "ns"),
                         attrs={
                             "standard_name": "forecast_reference_time",
                             "long_name": "model initialization time",
-                        },
-                    ),
-                    forecast_period=xr.DataArray(
-                        np.float32(int(h)),
-                        attrs={
-                            "standard_name": "forecast_period",
-                            "long_name": "forecast period",
-                            "units": "hours",
                         },
                     ),
                 )
@@ -370,8 +373,8 @@ def compute_ensemble_pmm(datetime_str: str,
                     "dtype": "float64",
                     "_FillValue": None,
                 }
-            if "forecast_period" in processed_ds.coords:
-                encoding["forecast_period"] = {"dtype": "float32", "_FillValue": None}
+            if "lead_time" in processed_ds.coords:
+                encoding["lead_time"] = {"dtype": "float32", "_FillValue": None}
             processed_ds.to_netcdf(out_nc, encoding=encoding)
 
             # Save per-hour GRIB2 for avg

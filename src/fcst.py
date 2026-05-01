@@ -568,7 +568,7 @@ class WeatherForecaster:
             forecast_norm: normalized model output for this hour, shape (1, Ny, Nx, C)
 
         Returns:
-            xr.Dataset with dims (time=1, [level], latitude, longitude)
+            xr.Dataset with dims (time=1, lead_time=1, [level], latitude, longitude)
         """
         # Denormalize to physical units
         denorm = self.denormalize(forecast_norm)
@@ -578,17 +578,21 @@ class WeatherForecaster:
         times = [hour]
         ds_hour = self.create_xarray_dataset(init_datetime, times, lats, lons, denorm)
 
-        # Inject constants if present in preprocessed NPZ (single time slice)
+        # Inject constants if present in preprocessed NPZ
         for cname in ["LAND", "OROG"]:
             raw_key = f"{cname}_raw"
             if hasattr(self.data_loader_hrrr, "data") and raw_key in self.data_loader_hrrr.data.files and cname not in ds_hour:
                 cvals = self.data_loader_hrrr.data[raw_key].astype(np.float32)
                 ds_hour[cname] = xr.DataArray(
-                    cvals[None, :, :],
-                    dims=("time", "latitude", "longitude"),
+                    cvals[None, None, :, :],
+                    dims=("time", "lead_time", "latitude", "longitude"),
                     coords={
                         "time": ("time", [init_datetime + timedelta(hours=hour)],
                                  {"standard_name": "time", "long_name": "time", "axis": "T"}),
+                        "lead_time": ("lead_time", [hour],
+                                      {"standard_name": "forecast_period",
+                                       "long_name": "forecast period",
+                                       "units": "hours"}),
                         "latitude": (("latitude", "longitude"), lats,
                                      {"standard_name": "latitude", "long_name": "latitude",
                                       "units": "degrees_north"}),
@@ -662,8 +666,8 @@ class WeatherForecaster:
                 "dtype": "float64",
                 "_FillValue": None,
             }
-        if "forecast_period" in ds_hour.coords:
-            encoding["forecast_period"] = {"dtype": "float32", "_FillValue": None}
+        if "lead_time" in ds_hour.coords:
+            encoding["lead_time"] = {"dtype": "float32", "_FillValue": None}
         ds_hour.to_netcdf(nc_path, encoding=encoding)
         return str(nc_path)
 
@@ -1046,6 +1050,13 @@ class WeatherForecaster:
         # arrays are auxiliary coordinates on a Lambert Conformal grid; the 1D
         # dimensions of the same name carry the projection x/y axes.
         time_attrs = {"standard_name": "time", "long_name": "time", "axis": "T"}
+        # CF-1.6 §4.4.1: lead_time is the forecast_period dimension coordinate.
+        lead_hours = int(times[0])
+        lead_time_attrs = {
+            "standard_name": "forecast_period",
+            "long_name": "forecast period",
+            "units": "hours",
+        }
         level_attrs = {
             "standard_name": "air_pressure",
             "long_name": "pressure level",
@@ -1064,14 +1075,15 @@ class WeatherForecaster:
             "units": "degrees_east",
         }
 
-        # Pressure-level variables: (time, level, y, x)
+        # Pressure-level variables: (time, lead_time, level, y, x)
         for pl_var in pl_vars:
             pl_data = np.transpose(data[..., var_index:var_index+len(levels)], (0, 3, 1, 2))
             data_vars[pl_var] = xr.DataArray(
-                pl_data,
-                dims=("time", "level", "latitude", "longitude"),
+                np.expand_dims(pl_data, 1),
+                dims=("time", "lead_time", "level", "latitude", "longitude"),
                 coords={
                     "time": ("time", [valid_time], time_attrs),
+                    "lead_time": ("lead_time", [lead_hours], lead_time_attrs),
                     "level": ("level", levels, level_attrs),
                     "latitude": (("latitude", "longitude"), lats, lat_attrs),
                     "longitude": (("latitude", "longitude"), lons, lon_attrs),
@@ -1080,14 +1092,15 @@ class WeatherForecaster:
             )
             var_index += len(levels)
 
-        # Surface variables: (time, y, x)
+        # Surface variables: (time, lead_time, y, x)
         for sfc_var in sfc_vars:
             sfc_data = data[..., var_index]
             data_vars[sfc_var] = xr.DataArray(
-                sfc_data,
-                dims=("time", "latitude", "longitude"),
+                np.expand_dims(sfc_data, 1),
+                dims=("time", "lead_time", "latitude", "longitude"),
                 coords={
                     "time": ("time", [valid_time], time_attrs),
+                    "lead_time": ("lead_time", [lead_hours], lead_time_attrs),
                     "latitude": (("latitude", "longitude"), lats, lat_attrs),
                     "longitude": (("latitude", "longitude"), lons, lon_attrs),
                 },
@@ -1097,24 +1110,13 @@ class WeatherForecaster:
 
         ds = xr.Dataset(data_vars)
 
-        # CF-1.6 §4.4.1: scalar forecast coordinates.
-        # forecast_reference_time is the model initialization (analysis) time;
-        # forecast_period is the interval from that time to the valid time.
-        lead_hours = int(times[0])
+        # CF-1.6 §4.4.1: scalar forecast_reference_time (model initialization time).
         ds = ds.assign_coords(
             forecast_reference_time=xr.DataArray(
                 np.datetime64(init_datetime, "ns"),
                 attrs={
                     "standard_name": "forecast_reference_time",
                     "long_name": "model initialization time",
-                },
-            ),
-            forecast_period=xr.DataArray(
-                np.float32(lead_hours),
-                attrs={
-                    "standard_name": "forecast_period",
-                    "long_name": "forecast period",
-                    "units": "hours",
                 },
             ),
         )
