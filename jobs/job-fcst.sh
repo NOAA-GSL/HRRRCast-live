@@ -10,7 +10,7 @@
 #SBATCH --cpus-per-task=96
 #SBATCH --time=@[FCST_WALLTIME]
 #SBATCH --deadline=@[DEADLINE]
-#SBATCH --mem=192G
+#SBATCH --mem=160G
 
 # load wgrib2 modules
 module use /contrib/spack-stack/spack-stack-1.9.1/envs/ue-oneapi-2024.2.1/install/modulefiles/Core/
