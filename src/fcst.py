@@ -40,6 +40,8 @@ from diffusion_params import (
     compute_epsilon,
     ddpm,
     ddim,
+    ddim_heun,
+    dpmpp_2m,
 )
 from transform import (
     inverse_log_transform_array,
@@ -185,6 +187,7 @@ class WeatherForecaster:
         static_channels: Optional[int] = None,
         pmm_alpha: float = 0.65,
         use_nudging: bool = True,
+        diffusion_sampler: str = "dpmpp-2m",
     ):
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
@@ -195,6 +198,7 @@ class WeatherForecaster:
         self.use_diffusion = use_diffusion
         self.pmm_alpha = pmm_alpha
         self.use_nudging = use_nudging and len(members) > 1
+        self.diffusion_sampler = diffusion_sampler
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
@@ -775,31 +779,61 @@ class WeatherForecaster:
             Xn_list = [self.member_noise[m] for m in members]
             Xn = tf.concat(Xn_list, axis=0)  # (batch_size, H, W, C)
 
+            def build_diffusion_input(
+                X_in: tf.Tensor,
+                X_noisy: tf.Tensor,
+                step_t: tf.Tensor,
+            ) -> tf.Tensor:
+                step_encoding = tf.fill(
+                    tf.concat([tf.shape(X_in)[:-1], [1]], axis=0),
+                    tf.cast(step_t / NUM_DIFFUSION_STEPS, X_in.dtype),
+                )
+                X_out = tf.concat(
+                    [
+                        X_in[:, :, :, :start],
+                        X_noisy,
+                        X_in[:, :, :, start + num_output_channels :-2],
+                        step_encoding,
+                        X_in[:, :, :, -1:],
+                    ],
+                    axis=-1,
+                )
+                return X_out
+
+            def predict_x0_and_epsilon(
+                X_in: tf.Tensor,
+                X_noisy: tf.Tensor,
+                step_t: tf.Tensor,
+            ) -> tuple[tf.Tensor, tf.Tensor]:
+                X_model = build_diffusion_input(X_in, X_noisy, step_t)
+                x_0_pred = model.predict(X_model)
+                eps = compute_epsilon(X_noisy, x_0_pred, step_t)
+                return x_0_pred, eps
+
             # iterate over diffusion steps
+            prev_x0 = None
+            prev_h = None
             for t_ in range(NUM_INFERENCE_STEPS - 1):
                 ti = NUM_INFERENCE_STEPS - 1 - t_
                 t = INFERENCE_STEPS[ti]
 
-                # set the correct time embedding
-                step_encoding = tf.fill(
-                    tf.concat([tf.shape(X)[:-1], [1]], axis=0),
-                    tf.cast(t / NUM_DIFFUSION_STEPS, tf.float32),
-                )
-                X = tf.concat(
-                    [
-                        X[:, :, :, :start],
-                        Xn,
-                        X[:, :, :, start + num_output_channels :-2],
-                        step_encoding,
-                        X[:, :, :, -1:],
-                    ],
-                    axis=-1,
-                )
+                # compute predicted noise epsilon at this step
+                x0_t, epsilon_t = predict_x0_and_epsilon(X, Xn, t)
 
-                # predict total noise
-                x_0 = model.predict(X)
-                epsilon_t = compute_epsilon(Xn, x_0, t)
-                Xn = ddim(Xn, epsilon_t, ti, seed=members)
+                # Choose diffusion sampler
+                if self.diffusion_sampler == "ddim-heun":
+                    x_tm1_pred = ddim(Xn, epsilon_t, ti, seed=members, eta=0.0)
+
+                    tm1 = tf.gather(list(INFERENCE_STEPS), ti - 1)
+                    _, epsilon_tm1 = predict_x0_and_epsilon(X, x_tm1_pred, tm1)
+
+                    Xn = ddim_heun(Xn, epsilon_t, epsilon_tm1, ti, seed=members, eta=0.0)
+                elif self.diffusion_sampler == "dpmpp-2m":
+                    Xn, prev_x0, prev_h = dpmpp_2m(Xn, x0_t, ti, prev_x0=prev_x0, prev_h=prev_h)
+                elif self.diffusion_sampler == "ddim":
+                    Xn = ddim(Xn, epsilon_t, ti, seed=members, eta=0.0)
+                else:
+                    Xn = ddpm(Xn, epsilon_t, ti, seed=members)
 
             return Xn
         else:
