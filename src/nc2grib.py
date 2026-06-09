@@ -368,6 +368,8 @@ class Netcdf2Grib:
         cycle = forecast_starttime.hour
         if member == "avg":
             outfile = os.path.join(outdir, f"hrrrcast.avg.t{cycle:02d}z.pgrb2.f{lead:02d}")
+        elif member == "spr":
+            outfile = os.path.join(outdir, f"hrrrcast.spr.t{cycle:02d}z.pgrb2.f{lead:02d}")
         else:
             outfile = os.path.join(outdir, f"hrrrcast.m{int(member):02d}.t{cycle:02d}z.pgrb2.f{lead:02d}")
 

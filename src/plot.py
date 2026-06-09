@@ -516,10 +516,7 @@ def plot_forecast_data(datetime_str: str,
         args_list = []
         for h in range(1, lead_hour_int + 1):
             # Build per-hour file path
-            if str(member_norm).lower() == 'avg':
-                ds_path = f"{forecast_dir}/{date_str}/hrrrcast_memavg_f{h:02d}.nc"
-            else:
-                ds_path = f"{forecast_dir}/{date_str}/hrrrcast_mem{member_norm}_f{h:02d}.nc"
+            ds_path = f"{forecast_dir}/{date_str}/hrrrcast_mem{member_norm}_f{h:02d}.nc"
             if not os.path.exists(ds_path):
                 logger.warning(f"Skipping hour f{h:02d}: file not found {ds_path}")
                 continue

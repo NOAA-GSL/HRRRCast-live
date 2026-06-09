@@ -183,6 +183,15 @@ def process_variable_mean(var_data: xr.DataArray) -> xr.DataArray:
     processed_var = var_data.mean(dim='member')
     return processed_var
 
+def process_variable_spread(var_data: xr.DataArray) -> xr.DataArray:
+    """
+    Process a variable using ensemble spread (standard deviation).
+
+    Computes spread across the member dimension while preserving all other dimensions.
+    """
+    processed_var = var_data.std(dim='member')
+    return processed_var
+
 def build_member_file_list(date_str: str, forecast_dir: str, hour: int, n_ensembles: int) -> List[str]:
     """Construct expected per-member file paths for a given hour and validate existence.
 
@@ -299,12 +308,14 @@ def compute_ensemble_pmm(datetime_str: str,
             ensemble_ds = load_hour_ensemble_data(files)
 
             processed_datasets: Dict[str, xr.DataArray] = {}
+            spread_datasets: Dict[str, xr.DataArray] = {}
 
             for var_name in ensemble_ds.data_vars:
                 var_data = ensemble_ds[var_name]
                 if 'member' not in var_data.dims:
                     logger.warning(f"Variable {var_name} missing 'member' dim at f{lead_hour:02d}, copying as-is")
                     da = var_data
+                    spread_da = var_data
                 else:
                     if var_name in ['REFC', 'APCP']:
                         logger.info(f"PMM for {var_name} at f{h:02d}")
@@ -314,6 +325,10 @@ def compute_ensemble_pmm(datetime_str: str,
                         logger.info(f"Mean for {var_name} at f{h:02d}")
                         da = process_variable_mean(var_data)
                         da.attrs['processing_method'] = 'ensemble_mean'
+
+                    logger.info(f"Spread for {var_name} at f{h:02d}")
+                    spread_da = process_variable_spread(var_data)
+                    spread_da.attrs['processing_method'] = 'ensemble_spread_stddev'
 
                 # Ensure time and lead_time coords/dims exist for downstream writer
                 # If dims already exist, just set their coordinate values; else expand dims
@@ -325,9 +340,21 @@ def compute_ensemble_pmm(datetime_str: str,
                         'time': [np.datetime64(init_datetime)],
                         'lead_time': [int(h)]
                     })
+
+                if 'time' in spread_da.dims and 'lead_time' in spread_da.dims:
+                    spread_da = spread_da.assign_coords(time=[np.datetime64(init_datetime)],
+                                                        lead_time=[int(h)])
+                else:
+                    spread_da = spread_da.expand_dims({
+                        'time': [np.datetime64(init_datetime)],
+                        'lead_time': [int(h)]
+                    })
+
                 processed_datasets[var_name] = da
+                spread_datasets[var_name] = spread_da
 
             processed_ds = xr.Dataset(processed_datasets)
+            spread_ds = xr.Dataset(spread_datasets)
             # Copy attributes and annotate
             processed_ds.attrs = ensemble_ds.attrs.copy()
             processed_ds.attrs['postprocessing_method'] = 'PMM for REFC/APCP, mean for others'
@@ -335,17 +362,29 @@ def compute_ensemble_pmm(datetime_str: str,
             processed_ds.attrs['processed_timestamp'] = str(datetime.now())
             processed_ds.attrs['source_files'] = [os.path.basename(f) for f in files]
 
+            spread_ds.attrs = ensemble_ds.attrs.copy()
+            spread_ds.attrs['postprocessing_method'] = 'ensemble spread (standard deviation)'
+            spread_ds.attrs['processed_timestamp'] = str(datetime.now())
+            spread_ds.attrs['source_files'] = [os.path.basename(f) for f in files]
+
             # Save per-hour NetCDF
             out_nc = os.path.join(output_date_dir, f"hrrrcast_memavg_f{h:02d}.nc")
             logger.info(f"Saving per-hour processed ensemble to: {out_nc}")
             processed_ds.to_netcdf(out_nc)
 
+            out_nc_spread = os.path.join(output_date_dir, f"hrrrcast_memspr_f{h:02d}.nc")
+            logger.info(f"Saving per-hour ensemble spread to: {out_nc_spread}")
+            spread_ds.to_netcdf(out_nc_spread)
+
             # Save per-hour GRIB2 for avg
             converter.save_grib2(init_datetime, processed_ds, 'avg', output_date_dir)
+            # Save per-hour GRIB2 for spread
+            converter.save_grib2(init_datetime, spread_ds, 'spr', output_date_dir)
 
             # Close datasets to free memory
             ensemble_ds.close()
             processed_ds.close()
+            spread_ds.close()
 
         logger.info("Ensemble per-hour post-processing completed successfully")
 
