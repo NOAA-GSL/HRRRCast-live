@@ -854,12 +854,11 @@ class WeatherForecaster:
     def autoregressive_rollout(self, initial_input: np.ndarray, forcing_input: np.ndarray, model: ForecastModel, 
                              target_hour: int,
                              output_dir: Optional[str] = None,
-                             init_datetime: Optional[datetime] = None,
-                             write_per_hour: bool = False) -> Dict[int, Dict]:
+                             init_datetime: Optional[datetime] = None) -> Dict[int, Dict]:
         """Perform greedy autoregressive rollout with overlapped I/O.
 
-        When write_per_hour=True, persist single-hour NetCDF and GRIB2 files for each lead hour,
-        including f00 representing the initial state. I/O is done in background threads to overlap
+        Persist single-hour NetCDF and GRIB2 files for each lead hour, including f00
+        representing the initial state. I/O is done in background threads to overlap
         with forecasting.
         """
         logger.info(f"Starting autoregressive rollout for {target_hour} hours")
@@ -874,28 +873,40 @@ class WeatherForecaster:
 
         start_pred_noise = self.predicted_channels + self.gfs_channels
 
-        # Lazily fetch coordinates if writing outputs per hour
-        lats = lons = None
-        if write_per_hour:
-            lats, lons = self.data_loader_hrrr.get_coordinates()
+        lats, lons = self.data_loader_hrrr.get_coordinates()
 
-        # Local helper to write outputs for any hour using shared context
-        def write_hour_outputs(hour: int, data: np.ndarray, member: int) -> None:
-            """Build dataset and write NetCDF/GRIB2 for a given hour if output context is available."""
-            if not (write_per_hour and output_dir is not None and init_datetime is not None and lats is not None and lons is not None):
-                return
+        # Local helpers to build hourly datasets and fan them out to file writers.
+        def write_hour_nc(hour: int, ds_hour: xr.Dataset, member: int) -> None:
+            """Write NetCDF for a given hour."""
+            try:
+                _ = self.write_single_hour_netcdf(init_datetime, hour, ds_hour, output_dir, member)
+                logger.debug(f"Completed writing NetCDF hour {hour} for member {member}")
+            except Exception as e:
+                logger.error(f"Failed writing NetCDF hour {hour} for member {member}: {e}")
+
+        def write_hour_grib2(hour: int, ds_hour: xr.Dataset, member: int) -> None:
+            """Write GRIB2 for a given hour."""
+            try:
+                self.write_single_hour_grib2(init_datetime, hour, ds_hour, output_dir, member)
+                logger.debug(f"Completed writing GRIB2 hour {hour} for member {member}")
+            except Exception as e:
+                logger.error(f"Failed writing GRIB2 hour {hour} for member {member}: {e}")
+
+        def build_and_submit_hour_outputs(hour: int, data: np.ndarray, member: int) -> None:
+            """Build the dataset in a worker, then submit both file writes."""
             try:
                 ds_hour = self.build_single_hour_dataset(init_datetime, hour, lats, lons, data)
-                _ = self.write_single_hour_netcdf(init_datetime, hour, ds_hour, output_dir, member)
-                self.write_single_hour_grib2(init_datetime, hour, ds_hour, output_dir, member)
-                logger.debug(f"Completed writing hour {hour} for member {member}")
             except Exception as e:
-                logger.error(f"Failed writing hour {hour} outputs for member {member}: {e}")
+                logger.error(f"Failed building dataset for hour {hour} member {member}: {e}")
+                return
 
-        # ThreadPoolExecutor for non-blocking I/O submission
-        # Note: Only 1 worker since the _io_write_lock serializes all writes anyway
-        io_executor = ThreadPoolExecutor(max_workers=1) if write_per_hour else None
-        io_futures = []
+            nc_executor.submit(write_hour_nc, hour, ds_hour, member)
+            grib2_executor.submit(write_hour_grib2, hour, ds_hour, member)
+
+        build_executor = ThreadPoolExecutor(max_workers=self.batch_size)
+        nc_executor = ThreadPoolExecutor(max_workers=1)
+        grib2_executor = ThreadPoolExecutor(max_workers=1)
+        build_futures = []
 
         # Write out hour 0 (f00) products representing the initial state for each member
         hour0_outputs: Dict[int, np.ndarray] = {
@@ -907,11 +918,9 @@ class WeatherForecaster:
         else:
             nudged_hour0 = hour0_outputs
         for member in self.members:
-            if io_executor:
-                future = io_executor.submit(write_hour_outputs, 0, nudged_hour0[member], member)
-                io_futures.append(future)
-            else:
-                write_hour_outputs(0, nudged_hour0[member], member)
+            build_futures.append(
+                build_executor.submit(build_and_submit_hour_outputs, 0, nudged_hour0[member], member)
+            )
 
         # phase shift of GFS forcing input
         num_members = self.num_members
@@ -1012,24 +1021,24 @@ class WeatherForecaster:
             else:
                 nudged_outputs = hour_member_outputs
 
-            # Write out per-hour products asynchronously after all members computed
+            # Build hourly datasets asynchronously after all members for this hour are computed.
             for member in self.members:
-                if io_executor:
-                    future = io_executor.submit(write_hour_outputs, hour, nudged_outputs[member], member)
-                    io_futures.append(future)
-                else:
-                    write_hour_outputs(hour, nudged_outputs[member], member)
+                build_futures.append(
+                    build_executor.submit(build_and_submit_hour_outputs, hour, nudged_outputs[member], member)
+                )
 
-        # Wait for all I/O operations to complete
-        if io_executor:
-            logger.info(f"Waiting for {len(io_futures)} I/O operations to complete...")
-            for future in as_completed(io_futures):
-                try:
-                    future.result()  # Raise any exceptions that occurred
-                except Exception as e:
-                    logger.error(f"I/O operation failed: {e}")
-            io_executor.shutdown(wait=True)
-            logger.info("All I/O operations completed")
+        # Wait for all background work to complete. Build tasks must drain first so
+        # they cannot submit into executors that are already shutting down.
+        logger.info(f"Waiting for {len(build_futures)} background build operations to complete...")
+        for future in as_completed(build_futures):
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Background build operation failed: {e}")
+        build_executor.shutdown(wait=True)
+        nc_executor.shutdown(wait=True)
+        grib2_executor.shutdown(wait=True)
+        logger.info("All background output operations completed")
 
         logger.info("Autoregressive rollout completed")
 
@@ -1101,7 +1110,6 @@ class WeatherForecaster:
                 lead_hours,
                 output_dir=output_dir,
                 init_datetime=init_datetime,
-                write_per_hour=True,
             )
             logger.info("Forecast completed successfully (per-hour outputs written during rollout)")
         except Exception as e:
