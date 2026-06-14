@@ -24,6 +24,7 @@ Notes/assumptions:
 
 import os
 import subprocess
+import time
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
@@ -353,7 +354,7 @@ class Netcdf2Grib:
         _, _, _, surface_type, surface_value = GRIB_PARAM_MAP[var_name]
         return surface_type, surface_value
 
-    def save_grib2(self, forecast_starttime: datetime, ds_hour: xr.Dataset, member, outdir: str) -> None:
+    def save_grib2(self, forecast_starttime: datetime, ds_hour: xr.Dataset, output_path: str) -> None:
         """Write a single-hour GRIB2 file from an xarray.Dataset using grib2io.
 
         ds_hour is expected to have dims (time=1, lead_time=1, [level], y, x) and contain
@@ -365,13 +366,7 @@ class Netcdf2Grib:
         except Exception:
             lead = 0
 
-        cycle = forecast_starttime.hour
-        if member == "avg":
-            outfile = os.path.join(outdir, f"hrrrcast.avg.t{cycle:02d}z.pgrb2.f{lead:02d}")
-        elif member == "spr":
-            outfile = os.path.join(outdir, f"hrrrcast.spr.t{cycle:02d}z.pgrb2.f{lead:02d}")
-        else:
-            outfile = os.path.join(outdir, f"hrrrcast.m{int(member):02d}.t{cycle:02d}z.pgrb2.f{lead:02d}")
+        outfile = output_path
 
         # Remove existing file if present
         if os.path.isfile(outfile):
@@ -379,7 +374,6 @@ class Netcdf2Grib:
 
         # Open GRIB2 file for writing
         g2 = grib2io.open(outfile, mode="w")
-        logger.info(f"Writing GRIB2: {outfile}")
 
         try:
             # Ensure y,x dims exist (rename from latitude/longitude if needed)
@@ -440,8 +434,10 @@ class Netcdf2Grib:
         try:
             wgrib2 = os.environ.get("WGRIB2", "wgrib2")
             idxfile = f"{outfile}.idx"
+            t0 = time.time()
             with open(idxfile, "w") as f_out:
                 subprocess.run([wgrib2, "-s", outfile], stdout=f_out, check=True)
-            logger.info(f"Index created: {idxfile}")
+            t1 = time.time()
+            logger.info(f"Index created in {t1 - t0:.2f}s: {idxfile}")
         except Exception as e:
             logger.warning(f"Skipping index creation with wgrib2: {e}")

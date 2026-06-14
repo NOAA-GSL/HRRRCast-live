@@ -1132,7 +1132,6 @@ def compute_diagnostics(
         ('pot2m', compute_pot2m),
         ('mslma', compute_mslma),
         ('pwat', compute_pwat),
-        ('vvel', compute_vvel),
         ('conditional_rain', compute_conditional_rain),
         ('conditional_freezing_rain', compute_conditional_freezing_rain),
         ('wind_gust', compute_wind_gust),

@@ -541,16 +541,14 @@ class WeatherForecaster:
             applied = []
             for var in self.LOG_TRANSFORM_VARS:
                 if var in ds.variables:
-                    data_arr = ds[var].values
-                    ds[var].values[:] = inverse_log_transform_array(data_arr)
+                    ds[var] = inverse_log_transform_array(ds[var])
                     applied.append(var)
             for var in self.NEG_LOG_TRANSFORM_VARS:
                 if var in ds.variables:
-                    data_arr = ds[var].values
-                    ds[var].values[:] = inverse_neg_log_transform_array(data_arr)
+                    ds[var] = inverse_neg_log_transform_array(ds[var])
                     applied.append(var)
             if applied:
-                logger.info(f"Applied inverse transforms to: {', '.join(applied)}")
+                logger.debug(f"Applied inverse transforms to: {', '.join(applied)}")
         except Exception as e:
             logger.error(f"Failed applying inverse transforms: {e}")
         return ds
@@ -574,6 +572,8 @@ class WeatherForecaster:
         Returns:
             xr.Dataset with dims (time=1, lead_time=1, [level], latitude, longitude)
         """
+        t0 = time.time()
+
         # Denormalize to physical units
         denorm = self.denormalize(forecast_norm)
         # Ensure shape (time=1, Ny, Nx, C)
@@ -607,6 +607,9 @@ class WeatherForecaster:
         # compute diagnostics
         ds_hour = compute_diagnostics(ds_hour)
 
+        build_time = time.time() - t0
+        logger.info(f"Build output dataset in {build_time:.3f}s")
+
         return ds_hour
 
     def write_single_hour_netcdf(
@@ -616,11 +619,13 @@ class WeatherForecaster:
         ds_hour: xr.Dataset,
         output_dir: str,
         member: Union[int, str],
-    ) -> str:
+    ) -> None:
         """Write a NetCDF file for a single lead time.
 
         Returns the output file path.
         """
+        t0 = time.time()
+
         init_year = self.metadata['init_year']
         init_month = self.metadata['init_month']
         init_day = self.metadata['init_day']
@@ -629,11 +634,14 @@ class WeatherForecaster:
         utils.make_directory(f"{output_dir}/{date_str}")
         outdir = Path(f"{output_dir}/{date_str}")
         outdir.mkdir(parents=True, exist_ok=True)
-        mem_str = f"avg" if str(member) == "avg" else f"mem{int(member)}"
+        mem_str = str(member)
+        if mem_str not in {"avg", "spr"}:
+            mem_str = f"m{int(member)}"
         nc_path = outdir / f"hrrrcast_{mem_str}_f{hour:02d}.nc"
-        logger.info(f"Saving single-hour NetCDF to {nc_path}")
         ds_hour.to_netcdf(nc_path)
-        return str(nc_path)
+
+        write_time = time.time() - t0
+        logger.info(f"Wrote NetCDF in {write_time:.3f}s : {nc_path}")
 
     def write_single_hour_grib2(
         self,
@@ -648,6 +656,8 @@ class WeatherForecaster:
         Netcdf2Grib iterates over available time points; with a single-hour dataset,
         it will produce only the requested f{hour:02d} product.
         """
+        t0 = time.time()
+
         init_year = self.metadata['init_year']
         init_month = self.metadata['init_month']
         init_day = self.metadata['init_day']
@@ -656,6 +666,10 @@ class WeatherForecaster:
         utils.make_directory(f"{output_dir}/{date_str}")
         outdir = Path(f"{output_dir}/{date_str}")
         outdir.mkdir(parents=True, exist_ok=True)
+        mem_str = str(member)
+        if mem_str not in {"avg", "spr"}:
+            mem_str = f"m{int(member):02d}"
+        grib2_path = outdir / f"hrrrcast.{mem_str}.t{init_datetime.hour:02d}z.pgrb2.f{hour:02d}"
 
         converter = Netcdf2Grib()
         # Ensure ds_hour has exactly one lead_time equal to 'hour'
@@ -665,7 +679,10 @@ class WeatherForecaster:
                 ds_hour = ds_hour.assign_coords(lead_time=("lead_time", [hour]))
             except Exception:
                 pass
-        converter.save_grib2(init_datetime, ds_hour, member, outdir)
+        converter.save_grib2(init_datetime, ds_hour, str(grib2_path))
+
+        write_time = time.time() - t0
+        logger.info(f"Wrote GRIB2 in {write_time:.3f}s : {grib2_path}")
 
     def get_variable_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -879,7 +896,7 @@ class WeatherForecaster:
         def write_hour_nc(hour: int, ds_hour: xr.Dataset, member: int) -> None:
             """Write NetCDF for a given hour."""
             try:
-                _ = self.write_single_hour_netcdf(init_datetime, hour, ds_hour, output_dir, member)
+                self.write_single_hour_netcdf(init_datetime, hour, ds_hour, output_dir, member)
                 logger.debug(f"Completed writing NetCDF hour {hour} for member {member}")
             except Exception as e:
                 logger.error(f"Failed writing NetCDF hour {hour} for member {member}: {e}")

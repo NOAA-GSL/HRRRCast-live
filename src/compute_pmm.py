@@ -367,19 +367,25 @@ def compute_ensemble_pmm(datetime_str: str,
             spread_ds.attrs['processed_timestamp'] = str(datetime.now())
             spread_ds.attrs['source_files'] = [os.path.basename(f) for f in files]
 
+            cycle = init_datetime.hour
+
             # Save per-hour NetCDF
             out_nc = os.path.join(output_date_dir, f"hrrrcast_memavg_f{h:02d}.nc")
-            logger.info(f"Saving per-hour processed ensemble to: {out_nc}")
             processed_ds.to_netcdf(out_nc)
+            logger.info(f"Wrote NetCDF : {out_nc}")
 
             out_nc_spread = os.path.join(output_date_dir, f"hrrrcast_memspr_f{h:02d}.nc")
-            logger.info(f"Saving per-hour ensemble spread to: {out_nc_spread}")
             spread_ds.to_netcdf(out_nc_spread)
+            logger.info(f"Wrote NetCDF : {out_nc_spread}")
 
-            # Save per-hour GRIB2 for avg
-            converter.save_grib2(init_datetime, processed_ds, 'avg', output_date_dir)
-            # Save per-hour GRIB2 for spread
-            converter.save_grib2(init_datetime, spread_ds, 'spr', output_date_dir)
+            # Save per-hour GRIB2
+            avg_grib2 = os.path.join(output_date_dir, f"hrrrcast.avg.t{cycle:02d}z.pgrb2.f{h:02d}")
+            converter.save_grib2(init_datetime, processed_ds, avg_grib2)
+            logger.info(f"Wrote GRIB2 : {avg_grib2}")
+
+            spr_grib2 = os.path.join(output_date_dir, f"hrrrcast.spr.t{cycle:02d}z.pgrb2.f{h:02d}")
+            converter.save_grib2(init_datetime, spread_ds, spr_grib2)
+            logger.info(f"Wrote GRIB2 : {spr_grib2}")
 
             # Close datasets to free memory
             ensemble_ds.close()
