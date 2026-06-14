@@ -925,10 +925,11 @@ class WeatherForecaster:
         # phase shift of GFS forcing input
         num_members = self.num_members
         members_sorted = list(range(num_members))
-        half_count = num_members // 2  # Half count for symmetry
-        step = 1.0 / (half_count + (num_members % 2))  # Adjust step for odd/even
+        half_count = (num_members // 2 - ((num_members + 1) % 2)) # Half count for symmetry
+        step = 1.0 / half_count if half_count > 0 else 0.0
         seq = []
-        if num_members % 2 == 1:  # Add zero phase shift for odd
+        seq.append(0.0)  # Always include zero phase shift for the first member
+        if num_members % 2 == 0:
             seq.append(0.0)
         for i in range(half_count):
             seq.append(step * (i + 1))  # Positive phase shifts
