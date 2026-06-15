@@ -9,8 +9,8 @@ Usage:
         python plot_forecast.py <init_time> <lead_hour> <member> [--forecast_dir DIR] [--output_dir DIR]
     
         Expects per-hour NetCDF files:
-            - Member average (PMM/mean): hrrrcast_memavg_fXX.nc
-            - Individual members:        hrrrcast_memN_fXX.nc
+            - Member average (PMM/mean): hrrrcast_avg_fXX.nc
+            - Individual members:        hrrrcast_mN_fXX.nc
 """
 
 import argparse
@@ -504,7 +504,10 @@ def plot_forecast_data(datetime_str: str,
         lead_hour_int = int(lead_hour)
         
         # Normalize 'pmm' alias to 'avg'
-        member_norm = 'avg' if str(member).lower() in ('avg', 'pmm') else member
+
+        mem_str = str(member)
+        if mem_str not in {"avg", "spr"}:
+            mem_str = f"m{int(member):02d}"
 
         # Initialize plotter config (for passing to subprocesses)
         config = ForecastPlotterConfig()
@@ -516,7 +519,7 @@ def plot_forecast_data(datetime_str: str,
         args_list = []
         for h in range(1, lead_hour_int + 1):
             # Build per-hour file path
-            ds_path = f"{forecast_dir}/{date_str}/hrrrcast_mem{member_norm}_f{h:02d}.nc"
+            ds_path = f"{forecast_dir}/{date_str}/hrrrcast_{mem_str}_f{h:02d}.nc"
             if not os.path.exists(ds_path):
                 logger.warning(f"Skipping hour f{h:02d}: file not found {ds_path}")
                 continue

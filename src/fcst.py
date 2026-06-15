@@ -538,17 +538,12 @@ class WeatherForecaster:
         variables. Safe to call when variables are absent.
         """
         try:
-            applied = []
             for var in self.LOG_TRANSFORM_VARS:
                 if var in ds.variables:
                     ds[var] = inverse_log_transform_array(ds[var])
-                    applied.append(var)
             for var in self.NEG_LOG_TRANSFORM_VARS:
                 if var in ds.variables:
                     ds[var] = inverse_neg_log_transform_array(ds[var])
-                    applied.append(var)
-            if applied:
-                logger.debug(f"Applied inverse transforms to: {', '.join(applied)}")
         except Exception as e:
             logger.error(f"Failed applying inverse transforms: {e}")
         return ds
@@ -636,7 +631,7 @@ class WeatherForecaster:
         outdir.mkdir(parents=True, exist_ok=True)
         mem_str = str(member)
         if mem_str not in {"avg", "spr"}:
-            mem_str = f"m{int(member)}"
+            mem_str = f"m{int(member):02d}"
         nc_path = outdir / f"hrrrcast_{mem_str}_f{hour:02d}.nc"
         ds_hour.to_netcdf(nc_path)
 

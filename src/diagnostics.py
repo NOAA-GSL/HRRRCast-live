@@ -8,7 +8,6 @@ from model output or observational data.
 import numpy as np
 import xarray as xr
 
-
 def get_lcc_grid_params(ds: xr.Dataset, lat_dim: str = "latitude", lon_dim: str = "longitude"):
     """
     Compute Lambert Conformal Conic (LCC) projection grid parameters.
@@ -509,7 +508,7 @@ def compute_wind_gust(ds: xr.Dataset, gust_factor: float = 1.4) -> xr.Dataset:
     v10 = ds["VGRD10M"]
     
     # Compute 10-meter wind speed
-    wind_10m = np.sqrt(u10**2 + v10**2).astype(np.float32)
+    wind_10m = np.hypot(u10, v10).astype(np.float32)
     
     # Method 1: Gust factor method (empirical)
     gust_empirical = (np.float32(gust_factor) * wind_10m).astype(np.float32)
@@ -519,7 +518,7 @@ def compute_wind_gust(ds: xr.Dataset, gust_factor: float = 1.4) -> xr.Dataset:
     if "level" in ds["UGRD"].dims:
         u3d = ds["UGRD"]
         v3d = ds["VGRD"]
-        wind_3d = np.sqrt(u3d**2 + v3d**2).astype(np.float32)
+        wind_3d = np.hypot(u3d, v3d).astype(np.float32)
         
         # Find maximum wind in the column (typically in lowest 3-4 km)
         # Focus on lower atmosphere (pressure > 700 hPa) where gusts are most relevant
@@ -796,10 +795,10 @@ def compute_convective(ds):
     # =====================================================
     # 2. Convert omega -> w
     # =====================================================
-    p = xr.DataArray(ds.level.values * 100.0, dims=["level"])
+    # p = xr.DataArray(ds.level.values * 100.0, dims=["level"])
 
-    Tv = T * (1 + 0.61*q)
-    w = -omega * (Rd*Tv)/(g*p)
+    # Tv = T * (1 + 0.61*q)
+    # w = -omega * (Rd*Tv)/(g*p)
 
     # =====================================================
     # 3. Horizontal derivatives and vorticity
@@ -817,26 +816,21 @@ def compute_convective(ds):
     # =================================================
     # Shear rate (1/s)
     # =================================================
-    def shear_rate(top):
+    u_bot = u.isel(level=-1)
+    v_bot = v.isel(level=-1)
 
-        u_bot = u.isel(level=-1)
-        v_bot = v.isel(level=-1)
+    # Select the highest model level at or below each target AGL depth.
+    # Compute indices to avoid chunked array indexing issues.
+    level_top_idx_1km = mask1.argmax(dim="level").compute()
+    level_top_idx_6km = mask6.argmax(dim="level").compute()
 
-        # Select the level closest to (but not exceeding) the top height
-        z_agl_above = z_agl.where(z_agl <= top)
-        level_top_idx = z_agl_above.argmax(dim="level").compute()
+    def shear_rate(level_top_idx, depth):
         u_top = u.isel(level=level_top_idx)
         v_top = v.isel(level=level_top_idx)
+        return (u_top - u_bot) / depth, (v_top - v_bot) / depth
 
-        du = u_top - u_bot
-        dv = v_top - v_bot
-
-        depth = top  # meters
-
-        return du / depth, dv / depth
-
-    du1, dv1 = shear_rate(1000)
-    du6, dv6 = shear_rate(6000)
+    du1, dv1 = shear_rate(level_top_idx_1km, 1000.0)
+    du6, dv6 = shear_rate(level_top_idx_6km, 6000.0)
 
     # HRRR variable names
     ds["VUCSH_0_1km"] = du1      # U shear rate
@@ -857,7 +851,7 @@ def compute_convective(ds):
     # =====================================================
     u06, v06 = du6 * 6000, dv6 * 6000
 
-    shear_mag = np.sqrt(u06**2 + v06**2) + 1e-6
+    shear_mag = np.hypot(u06, v06) + 1e-6
 
     right_u =  v06 / shear_mag
     right_v = -u06 / shear_mag
@@ -1003,22 +997,16 @@ def compute_0C_isotherm(ds):
     ds["HGT_0C"] = h_0C.astype(np.float32)
 
     # =====================================================
-    # 3. Interpolate variables to 0°C level
+    # 3. Interpolate variables to 0°C level (precompute, reuse index)
     # =====================================================
-    
-    # Get values at the 0°C level
+    # Get all variables at 0°C level using precomputed index
     u_0C = u.isel(level=level_0C_idx)
     v_0C = v.isel(level=level_0C_idx)
+    
     ds["UGRD_0C"] = u_0C
     ds["VGRD_0C"] = v_0C
-
-    # Wind speed at 0°C level
-    wind_speed_0C = np.sqrt(u_0C**2 + v_0C**2)
-    ds["WIND_0C"] = wind_speed_0C
-
-    # Specific humidity at 0°C level
-    q_0C = q.isel(level=level_0C_idx)
-    ds["SPFH_0C"] = q_0C
+    ds["WIND_0C"] = np.hypot(u_0C, v_0C).astype(np.float32)  # Use hypot instead of sqrt
+    ds["SPFH_0C"] = q.isel(level=level_0C_idx)
 
     # =====================================================
     # 4. Wind shear relative to surface
@@ -1029,25 +1017,24 @@ def compute_0C_isotherm(ds):
 
     du_0C = u_0C - u_sfc
     dv_0C = v_0C - v_sfc
+    
     ds["DU_SFC_0C"] = du_0C
     ds["DV_SFC_0C"] = dv_0C
-
-    shear_mag_0C = np.sqrt(du_0C**2 + dv_0C**2)
-    ds["SHEAR_SFC_0C"] = shear_mag_0C
+    ds["SHEAR_SFC_0C"] = np.hypot(du_0C, dv_0C).astype(np.float32)  # Use hypot instead of sqrt
 
     # =====================================================
     # 5. Relative humidity at 0°C level
     # =====================================================
-    # Saturation vapor pressure at 0°C (hPa)
-    es_0C = 6.112 * np.exp((17.67 * 0) / (0 + 243.5))
+    # Saturation vapor pressure at 0°C (hPa) - constant
+    es_0C = 6.112  # exp(0) = 1, so es_0C = 6.112
     
-    # Pressure at 0°C level from level values
-    p_levels = xr.DataArray(ds.level.values, dims=["level"])  # In hPa
-    p_0C = p_levels.isel(level=level_0C_idx)
+    # Pressure at 0°C level from level coordinate
+    p_0C = ds.level.isel(level=level_0C_idx).astype(np.float32)
     
     # Vapor pressure at 0°C from specific humidity
     # q = (epsilon * e) / (p - (1-epsilon)*e), solve for e
     epsilon = 0.622
+    q_0C = q.isel(level=level_0C_idx)
     e_0C = (q_0C * p_0C) / (epsilon + (1.0 - epsilon) * q_0C)
     
     # Relative humidity at 0°C
@@ -1130,7 +1117,6 @@ def compute_diagnostics(
         ('r2m', compute_r2m),
         ('spfh2m', compute_spfh2m),
         ('pot2m', compute_pot2m),
-        ('mslma', compute_mslma),
         ('pwat', compute_pwat),
         ('conditional_rain', compute_conditional_rain),
         ('conditional_freezing_rain', compute_conditional_freezing_rain),

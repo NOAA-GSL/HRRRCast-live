@@ -17,10 +17,10 @@ underestimated extremes. PMM preserves the distribution of the ensemble mean whi
 maintaining the spatial structure of individual ensemble members.
 
 Input files should follow the naming convention (per-member, per-hour):
-    YYYYMMDD/HH/hrrrcast_memN_fXX.nc
+    YYYYMMDD/HH/hrrrcast_mNN_fXX.nc
 
 Output files are saved per hour:
-    YYYYMMDD/HH/hrrrcast_memavg_fXX.nc
+    YYYYMMDD/HH/hrrrcast_avg_fXX.nc
 
 Usage:
     python compute_pmm.py "2024-05-06T23" 18 --forecast_dir /path/to/data --n_ensembles 4
@@ -195,7 +195,7 @@ def process_variable_spread(var_data: xr.DataArray) -> xr.DataArray:
 def build_member_file_list(date_str: str, forecast_dir: str, hour: int, n_ensembles: int) -> List[str]:
     """Construct expected per-member file paths for a given hour and validate existence.
 
-    Uses naming convention hrrrcast_memN_fXX.nc for N in [0..n_ensembles-1].
+    Uses naming convention hrrrcast_mN_fXX.nc for N in [0..n_ensembles-1].
     """
     date_dir = os.path.join(forecast_dir, date_str)
     if not os.path.isdir(date_dir):
@@ -203,7 +203,7 @@ def build_member_file_list(date_str: str, forecast_dir: str, hour: int, n_ensemb
 
     files: List[str] = []
     for m in range(n_ensembles):
-        fname = os.path.join(date_dir, f"hrrrcast_mem{m}_f{hour:02d}.nc")
+        fname = os.path.join(date_dir, f"hrrrcast_m{m:02d}_f{hour:02d}.nc")
         if not os.path.exists(fname):
             raise FileNotFoundError(f"Missing expected file: {fname}")
         files.append(fname)
@@ -225,7 +225,7 @@ def wait_for_hour_files(date_str: str,
         raise FileNotFoundError(f"Directory not found: {date_dir}")
 
     def file_path(m: int) -> str:
-        return os.path.join(date_dir, f"hrrrcast_mem{m}_f{hour:02d}.nc")
+        return os.path.join(date_dir, f"hrrrcast_m{m:02d}_f{hour:02d}.nc")
 
     while True:
         files: List[str] = []
@@ -370,11 +370,11 @@ def compute_ensemble_pmm(datetime_str: str,
             cycle = init_datetime.hour
 
             # Save per-hour NetCDF
-            out_nc = os.path.join(output_date_dir, f"hrrrcast_memavg_f{h:02d}.nc")
+            out_nc = os.path.join(output_date_dir, f"hrrrcast_avg_f{h:02d}.nc")
             processed_ds.to_netcdf(out_nc)
             logger.info(f"Wrote NetCDF : {out_nc}")
 
-            out_nc_spread = os.path.join(output_date_dir, f"hrrrcast_memspr_f{h:02d}.nc")
+            out_nc_spread = os.path.join(output_date_dir, f"hrrrcast_spr_f{h:02d}.nc")
             spread_ds.to_netcdf(out_nc_spread)
             logger.info(f"Wrote NetCDF : {out_nc_spread}")
 
