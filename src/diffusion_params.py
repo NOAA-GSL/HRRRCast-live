@@ -32,7 +32,7 @@ USE_VECTORIZED: bool = False
 
 # ==== Diffusion/CRPS step counts ====
 NUM_DIFFUSION_STEPS: int = 200
-NUM_INFERENCE_STEPS: int = 50
+NUM_INFERENCE_STEPS: int = 25
 INFERENCE_STEP_SPACING: str = "uniform"  # "uniform", "logsnr", "powerlaw"
 POWERLAW_GAMMA: float = 0.45
 NUM_CRPS_ENSEMBLES: int = 4
