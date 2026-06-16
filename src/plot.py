@@ -523,7 +523,7 @@ def plot_forecast_data(datetime_str: str,
             if not os.path.exists(ds_path):
                 logger.warning(f"Skipping hour f{h:02d}: file not found {ds_path}")
                 continue
-            args_list.append((h, ds_path, init_datetime, init_year, init_month, init_day, init_hh, output_dir, date_str, member_norm, config_dict))
+            args_list.append((h, ds_path, init_datetime, init_year, init_month, init_day, init_hh, output_dir, date_str, mem_str, config_dict))
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
             futures = [executor.submit(plot_lead_hour, *args) for args in args_list]
             for future in as_completed(futures):
