@@ -55,6 +55,29 @@ from compute_pmm import compute_PMM
 logger = None
 
 
+def make_noise(
+    anchor_noise: tf.Tensor, hour: int, member_seed: int, rho: float = 0.9
+) -> tf.Tensor:
+    """Generate blended previous-state + hourly innovation noise.
+    
+    Args:
+        anchor_noise: Previous member noise state, shape (1, H, W, C)
+        hour: Lead time hour (used for seed)
+        member_seed: Member ID (used for seed)
+        rho: Blend factor (1.0 = pure anchor, 0.0 = pure innovation)
+    
+    Returns:
+        Tensor same shape as anchor_noise, blended with innovation
+    """
+    sigma = tf.sqrt(tf.constant(1.0 - rho**2, dtype=tf.float32))
+    eps = tf.random.stateless_normal(
+        shape=tf.shape(anchor_noise),
+        dtype=tf.float32,
+        seed=[member_seed, hour],
+    )
+    return rho * anchor_noise + sigma * eps
+
+
 class PreprocessedDataLoader:
     """Handles loading and validation of preprocessed data."""
     
@@ -182,12 +205,14 @@ class WeatherForecaster:
         members: List[int],
         batch_size: int,
         use_diffusion: bool,
+        lead_hours: int,
         predicted_channels: Optional[int] = None,
         gfs_channels: Optional[int] = None,
         static_channels: Optional[int] = None,
         pmm_alpha: float = 0.65,
         use_nudging: bool = True,
         diffusion_sampler: str = "dpmpp-2m",
+        noise_rho: float = 0.9,
     ):
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
@@ -196,9 +221,11 @@ class WeatherForecaster:
         self.members = members
         self.batch_size = batch_size
         self.use_diffusion = use_diffusion
+        self.lead_hours = lead_hours
         self.pmm_alpha = pmm_alpha
         self.use_nudging = use_nudging and len(members) > 1
         self.diffusion_sampler = diffusion_sampler
+        self.noise_rho = noise_rho
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
@@ -244,29 +271,34 @@ class WeatherForecaster:
             logger.error(f"Error loading/processing normalization file: {e}")
             raise
 
-        # set member noise for all members
-        self.member_noise = {}
+        # Initialize per-member base noise anchors (on-the-fly generation in predict)
+        logger.info(f"Initializing member anchors for {len(self.members)} members")
+        self.member_anchors: Dict[int, tf.Tensor] = {}
+
+        # Generate the base anchor for each member
         for member in self.members:
             if self.use_diffusion:
-                noise = tf.random.stateless_normal(
+                anchor = tf.random.stateless_normal(
                     shape=(nlat, nlon, self.predicted_channels),
                     dtype=tf.float32,
                     seed=[member, 0]
                 )
-                noise = tf.expand_dims(noise, axis=0)
+                anchor = tf.expand_dims(anchor, axis=0)
             else:
-                noise = tf.random.stateless_uniform(
+                anchor = tf.random.stateless_uniform(
                     shape=(),
                     minval=0.0,
                     maxval=1.0,
                     dtype=tf.float32,
                     seed=[member, 0]
                 )
-                noise = tf.tile(
-                    tf.reshape(noise, (1, 1, 1, 1)),
+                anchor = tf.tile(
+                    tf.reshape(anchor, (1, 1, 1, 1)),
                     [1, nlat, nlon, 1]
                 )
-            self.member_noise[member] = noise
+            self.member_anchors[member] = anchor
+
+        logger.info("Member anchors initialized; noise will be generated on-the-fly during inference")
 
     def _compute_pmm_mean(self, member_outputs: Dict[int, np.ndarray], method: int = 2) -> Tuple[np.ndarray, List[int]]:
         """Compute PMM mean for REFC and APCP channels only.
@@ -771,7 +803,13 @@ class WeatherForecaster:
         enc = get_encoding_tensor(enc)
         return enc
 
-    def predict(self, model: ForecastModel, X: tf.Tensor, members: Union[int, List[int]]) -> tf.Tensor:
+    def _next_member_noise(self, member: int, hour: int) -> tf.Tensor:
+        """Advance a member's noise state by one hour and return it."""
+        next_noise = make_noise(self.member_anchors[member], hour, member, self.noise_rho)
+        self.member_anchors[member] = next_noise
+        return next_noise
+
+    def predict(self, model: ForecastModel, X: tf.Tensor, members: Union[int, List[int]], hour: int) -> tf.Tensor:
         """Predict using diffusion or CRPS model.
         
         Args:
@@ -779,6 +817,7 @@ class WeatherForecaster:
             X: Input tensor, shape (batch_size, H, W, C)
             members: Single member ID (int) for batch_size=1, or list of member IDs for batch_size>1
                     Length must match batch_size of X.
+            hour: Lead time hour to retrieve noise for
         
         Returns:
             Predicted tensor of shape (batch_size, H, W, predicted_channels)
@@ -787,8 +826,8 @@ class WeatherForecaster:
             num_output_channels = self.predicted_channels
             start = self.predicted_channels + self.gfs_channels
 
-            # Start from complete gaussian noise (per member)
-            Xn_list = [self.member_noise[m] for m in members]
+            # Advance each member's noise state in-order (hour-to-hour correlation)
+            Xn_list = [self._next_member_noise(m, hour) for m in members]
             Xn = tf.concat(Xn_list, axis=0)  # (batch_size, H, W, C)
 
             def build_diffusion_input(
@@ -849,8 +888,8 @@ class WeatherForecaster:
 
             return Xn
         else:
-            # set CRPS member (per-member noise)
-            Xn_list = [self.member_noise[m] for m in members]
+            # CRPS branch also advances per-member noise state in-order
+            Xn_list = [self._next_member_noise(m, hour) for m in members]
             Xn = tf.concat(Xn_list, axis=0)  # (batch_size, H, W, C)
             X = tf.concat(
                 [
@@ -872,6 +911,10 @@ class WeatherForecaster:
         Persist single-hour NetCDF and GRIB2 files for each lead hour, including f00
         representing the initial state. I/O is done in background threads to overlap
         with forecasting.
+        
+        Uses correlated noise for each lead time: different noise vectors per lead hour
+        but with temporal correlation (rho=0.9 by default) to maintain coherence
+        across the forecast period.
         """
         logger.info(f"Starting autoregressive rollout for {target_hour} hours")
         
@@ -948,9 +991,12 @@ class WeatherForecaster:
             seq.append(-step * (i + 1))  # Negative phase shifts
         phase_angle = {member: seq[i] for i, member in enumerate(members_sorted)}
 
+        # rollout hour
+        rollout_hour = 6
+
         # Process all hourly steps
         for hour in range(1, target_hour + 1):
-            from_hour = ((hour - 1) // 6) * 6
+            from_hour = ((hour - 1) // rollout_hour) * rollout_hour
             step = hour - from_hour
             logger.info(f"Forecasting hour {hour:2d}: from hour {from_hour:2d} using step {step}h")
 
@@ -1003,9 +1049,9 @@ class WeatherForecaster:
                 # Stack batch inputs
                 X_batch = tf.concat(batch_X_members, axis=0)
                 
-                # Predict next-hour fields for entire batch
+                # Predict next-hour fields for entire batch using hour-specific noise
                 t0 = time.time()
-                y_batch = self.predict(model, X_batch, batch_members_list)
+                y_batch = self.predict(model, X_batch, batch_members_list, hour=hour)
                 predict_time = time.time() - t0
                 logger.info(f"Hour {hour}, batch {batch_start//batch_size + 1}: predict took {predict_time:.3f}s")
                 
@@ -1021,7 +1067,7 @@ class WeatherForecaster:
                     
                     # When we reach a 6-hour boundary, update the reference 
                     # state for this member
-                    if hour % 6 == 0:
+                    if hour % rollout_hour == 0:
                         state_from_hour[member] = y
                     hour_member_outputs[member] = y.numpy().copy()
 
@@ -1158,6 +1204,8 @@ def parse_arguments():
                        help="Logging level")
     parser.add_argument("--pmm_alpha", type=float, default=0.7,
                         help="Nudge factor toward PMM mean for member outputs (0..1)")
+    parser.add_argument("--noise_rho", type=float, default=0.9,
+                        help="Noise blend/correlation parameter (0..1)")
     parser.add_argument("--no_nudging", default=False, action="store_true",
                         help="Disable nudging (member perturbation toward consensus)")
     
@@ -1244,11 +1292,13 @@ def main():
         forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs,
                                         args.num_members, members,
                                         args.batch_size, not args.no_diffusion,
+                                        args.lead_hours,
                                         predicted_channels=predicted_channels,
                                         gfs_channels=gfs_channels,
                                         static_channels=static_channels,
                                         pmm_alpha=args.pmm_alpha,
-                                        use_nudging=not args.no_nudging)
+                                        use_nudging=not args.no_nudging,
+                                        noise_rho=args.noise_rho)
         run_weather_forecast(
             forecaster, model, args.lead_hours, model_input, args.output_dir
         )
