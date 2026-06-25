@@ -15,7 +15,7 @@ ARTIFACTS_ROOT = Path(os.environ.get("HRRRCAST_ARTIFACTS", REPO_ROOT / "artifact
 
 DEFAULT_MODEL_EXPORT = ARTIFACTS_ROOT / "model_export"
 DEFAULT_MODULE_STATE = Path(os.environ.get("HRRRCAST_MODULE_STATE", DEFAULT_MODEL_EXPORT / "hrrrcast_module_state_dict.pt"))
-DEFAULT_TENSOR_DUMP = ARTIFACTS_ROOT / "tf_ref" / "tensor_dump_ea1b4ed_mem0.npz"
+DEFAULT_TENSOR_DUMP = ARTIFACTS_ROOT / "tf_ref" / "tensor_dump_ref_mem0.npz"
 
 
 def add_src_to_path() -> Path:

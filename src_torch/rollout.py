@@ -189,7 +189,7 @@ def autoregressive_rollout(
     Args:
         init_input: (1, C, H, W) NCHW initial model input (from `build_initial_input`).
         gfs_forcing: (N_fcst, C_gfs, H, W) NCHW GFS forcing block.
-        members: list of integer member ids to forecast (sorted, deduplicated upstream).
+        members: list of integer member ids to forecast (sorted and deduplicated by the caller).
         num_members: total ensemble size (used for symmetric phase shift weighting).
         lead_hours: max forecast lead time in hours (inclusive).
         on_hour: callback invoked once per (hour, member) with a normalized NHWC tensor.

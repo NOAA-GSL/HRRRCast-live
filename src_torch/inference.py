@@ -24,7 +24,7 @@ from .model import GFS_CHANNELS, HRRR_CHANNELS, HRRRCast
 # 138 diffusion-predicted channels (the HRRR analysis state).
 PREDICTED_CHANNELS = HRRR_CHANNELS
 
-# Upstream ea1b4ed samples with DPM-Solver++(2M); "ddim" is kept for reference.
+# The TensorFlow inference path samples with DPM-Solver++(2M); "ddim" is kept for reference.
 DEFAULT_SAMPLER = "dpmpp"
 
 
@@ -71,7 +71,7 @@ def diffusion_loop(
 
     `sampler` selects the per-step update (all ops are elementwise, so the loop
     stays in NCHW):
-      * ``"dpmpp"`` - DPM-Solver++(2M) in x0 space (upstream ea1b4ed default).
+      * ``"dpmpp"`` - DPM-Solver++(2M) in x0 space (TensorFlow inference default).
       * ``"ddim"``  - first-order DDIM in epsilon space.
 
     The noised channels of the model input are replaced by the running iterate

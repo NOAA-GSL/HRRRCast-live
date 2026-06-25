@@ -149,7 +149,7 @@ def add_forecast_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--members", nargs="+", default=["0"], help="Member ids, e.g. '0 1 2' or '0-3' or '0,1,2'")
     parser.add_argument("--num-members", "--num_members", dest="num_members", type=int, default=None, help="Ensemble size (defaults to len(--members))")
     parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=1, help="How many members to predict together each hour")
-    parser.add_argument("--sampler", default=DEFAULT_SAMPLER, choices=["dpmpp", "ddim"], help="Reverse-diffusion sampler (dpmpp = upstream ea1b4ed)")
+    parser.add_argument("--sampler", default=DEFAULT_SAMPLER, choices=["dpmpp", "ddim"], help="Reverse-diffusion sampler (dpmpp matches the current TensorFlow inference default)")
     parser.add_argument("--base-dir", "--base_dir", dest="base_dir", default=str(_DEFAULT_DATA))
     parser.add_argument("--output-dir", "--output_dir", dest="output_dir", default=str(_DEFAULT_OUTPUT))
     parser.add_argument("--state-path", "--state_path", dest="state_path", default=None, help="Override module state dict path")

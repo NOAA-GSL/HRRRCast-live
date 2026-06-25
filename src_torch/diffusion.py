@@ -6,8 +6,8 @@ import numpy as np
 import torch
 
 NUM_DIFFUSION_STEPS = 200
-# Upstream ea1b4ed: 25 uniformly-spaced inference steps with the dpmpp-2m sampler
-# (down from 50-step DDIM), allowing ~2x members at similar wall time.
+# Current TensorFlow inference path: 25 uniformly-spaced inference steps with
+# the DPM-Solver++(2M) sampler.
 NUM_INFERENCE_STEPS = 25
 
 
@@ -60,9 +60,9 @@ def dpmpp_2m(
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
     """DPM-Solver++(2M) multistep update in x0-prediction space.
 
-    Faithful port of `src/diffusion_params.dpmpp_2m` (upstream ea1b4ed). First
-    step is first-order DPM-Solver++; subsequent steps add the 2nd-order
-    multistep correction using the previous step's x0 and lambda-step `prev_h`.
+    Faithful port of `src/diffusion_params.dpmpp_2m`. First step is first-order
+    DPM-Solver++; subsequent steps add the 2nd-order multistep correction using
+    the previous step's x0 and lambda-step `prev_h`.
     Returns `(x_{t-1}, x0_t, h)`; carry `x0_t`/`h` into the next call.
     """
     t = int(INFERENCE_STEPS[t_index])
