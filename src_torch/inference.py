@@ -20,6 +20,7 @@ from .diffusion import (
     dpmpp_2m,
 )
 from .model import GFS_CHANNELS, HRRR_CHANNELS, HRRRCast
+from .profiling import profile_region
 
 # 138 diffusion-predicted channels (the HRRR analysis state).
 PREDICTED_CHANNELS = HRRR_CHANNELS
@@ -82,7 +83,7 @@ def diffusion_loop(
         raise ValueError(f"unknown sampler {sampler!r}; expected 'dpmpp' or 'ddim'")
     start = predicted_channels + gfs_channels
     prev_x0 = prev_h = None
-    with torch.no_grad():
+    with profile_region("torch.diffusion_loop", detail=True), torch.no_grad():
         for t_i in range(num_inference_steps - 1):
             ti = num_inference_steps - 1 - t_i
             t = int(INFERENCE_STEPS[ti])
@@ -132,15 +133,18 @@ def forecast_hour(
         xn: initial Gaussian noise for the predicted channels, NCHW `(B, C_pred, H, W)`.
         channel_mins/channel_maxs: per-channel normalized clip bounds.
     """
-    y = diffusion_loop(
-        model,
-        x_batch,
-        xn,
-        sampler=sampler,
-        predicted_channels=predicted_channels,
-        gfs_channels=gfs_channels,
-    )
-    mins = channel_mins[:predicted_channels].to(device=y.device, dtype=y.dtype)[None, :, None, None]
-    maxs = channel_maxs[:predicted_channels].to(device=y.device, dtype=y.dtype)[None, :, None, None]
-    y = torch.clip(y, mins, maxs)
-    return y.permute(0, 2, 3, 1).contiguous()
+    with profile_region("torch.forecast_hour", detail=True):
+        y = diffusion_loop(
+            model,
+            x_batch,
+            xn,
+            sampler=sampler,
+            predicted_channels=predicted_channels,
+            gfs_channels=gfs_channels,
+        )
+        with profile_region("torch.clip_output", detail=True):
+            mins = channel_mins[:predicted_channels].to(device=y.device, dtype=y.dtype)[None, :, None, None]
+            maxs = channel_maxs[:predicted_channels].to(device=y.device, dtype=y.dtype)[None, :, None, None]
+            y = torch.clip(y, mins, maxs)
+        with profile_region("torch.output_to_nhwc", detail=True):
+            return y.permute(0, 2, 3, 1).contiguous()

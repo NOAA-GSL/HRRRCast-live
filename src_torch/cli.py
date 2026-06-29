@@ -35,6 +35,7 @@ import torch
 from .config import ARTIFACTS_ROOT
 from .inference import DEFAULT_SAMPLER, load_hrrrcast
 from .output import convert_netcdf_hours_to_grib2, static_fields_from_npz, write_hour
+from .profiling import profile_region
 from .variables import LEVELS, PL_VARS, SFC_VARS, channel_bounds
 from .rollout import (
     autoregressive_rollout,
@@ -197,14 +198,15 @@ def run_forecast(args: argparse.Namespace) -> None:
     if not gfs_path.exists():
         raise SystemExit(f"GFS npz missing: {gfs_path}")
 
-    hrrr_npz = np.load(hrrr_path)
-    gfs_npz = np.load(gfs_path)
-    init_datetime = datetime.fromisoformat(str(hrrr_npz["init_datetime"]))
-    lats = np.asarray(hrrr_npz["lats"])
-    lons = np.asarray(hrrr_npz["lons"])
-    # np.load's NpzFile re-reads/decompresses on every __getitem__, so pull the
-    # large GFS forcing block out once and reuse it (shape, initial input, forcing).
-    gfs_model_input = np.asarray(gfs_npz["model_input"])
+    with profile_region("torch.data_load", logger=logger):
+        hrrr_npz = np.load(hrrr_path)
+        gfs_npz = np.load(gfs_path)
+        init_datetime = datetime.fromisoformat(str(hrrr_npz["init_datetime"]))
+        lats = np.asarray(hrrr_npz["lats"])
+        lons = np.asarray(hrrr_npz["lons"])
+        # np.load's NpzFile re-reads/decompresses on every __getitem__, so pull the
+        # large GFS forcing block out once and reuse it (shape, initial input, forcing).
+        gfs_model_input = np.asarray(gfs_npz["model_input"])
 
     forcing_hours_available = int(gfs_model_input.shape[0])
     if lead_hours > forcing_hours_available:
@@ -216,14 +218,16 @@ def run_forecast(args: argparse.Namespace) -> None:
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     logger.info("Loading HRRRCast model on %s%s", device, " (torch.compile)" if args.compile else "")
-    model = load_hrrrcast(state_path, device=device, compile_model=args.compile, compile_mode=args.compile_mode)
+    with profile_region("torch.model_load", logger=logger):
+        model = load_hrrrcast(state_path, device=device, compile_model=args.compile, compile_mode=args.compile_mode)
 
-    initial_input = build_initial_input(hrrr_npz, gfs_model_input, device=device)
-    gfs_forcing = gfs_forcing_to_nchw(gfs_model_input, device=device)
-    mins, maxs = channel_bounds(device=device)
-    cycle_out = Path(args.output_dir) / cycle_dir_from_init(init_time)
-    cycle_out.mkdir(parents=True, exist_ok=True)
-    static_fields = static_fields_from_npz(hrrr_npz)
+    with profile_region("torch.tensor_prep", logger=logger):
+        initial_input = build_initial_input(hrrr_npz, gfs_model_input, device=device)
+        gfs_forcing = gfs_forcing_to_nchw(gfs_model_input, device=device)
+        mins, maxs = channel_bounds(device=device)
+        cycle_out = Path(args.output_dir) / cycle_dir_from_init(init_time)
+        cycle_out.mkdir(parents=True, exist_ok=True)
+        static_fields = static_fields_from_npz(hrrr_npz)
 
     # Buffer one hour's worth of member outputs so PMM can run on the full
     # ensemble before we hand off to the writer. Writes happen in a background
@@ -232,11 +236,11 @@ def run_forecast(args: argparse.Namespace) -> None:
     io_futures: list = []
     nudging_enabled = (not args.no_nudging) and len(members) >= 2 and args.pmm_alpha < 1.0
     hour_buffer: dict[int, dict[int, torch.Tensor]] = {}
+    bench_skip_output = os.environ.get("HRRRCAST_BENCH_SKIP_OUTPUT", "") in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
 
-    def schedule_write(hour: int, member: int, normalized_nhwc: torch.Tensor) -> None:
-        io_futures.append(
-            io_executor.submit(
-                write_hour,
+    def timed_write_hour(hour: int, member: int, normalized_nhwc: torch.Tensor) -> Path:
+        with profile_region("torch.output_write", logger=logger, extra=f" hour={hour} member={member}"):
+            return write_hour(
                 normalized=normalized_nhwc,
                 hour=hour,
                 static_fields=static_fields,
@@ -245,6 +249,18 @@ def run_forecast(args: argparse.Namespace) -> None:
                 lons=lons,
                 output_dir=cycle_out,
                 member=member,
+            )
+
+    def schedule_write(hour: int, member: int, normalized_nhwc: torch.Tensor) -> None:
+        if bench_skip_output:
+            logger.debug("Skipping output write for benchmark: hour=%s member=%s", hour, member)
+            return
+        io_futures.append(
+            io_executor.submit(
+                timed_write_hour,
+                hour,
+                member,
+                normalized_nhwc,
             )
         )
 
@@ -257,25 +273,27 @@ def run_forecast(args: argparse.Namespace) -> None:
             schedule_write(hour, member, tensor)
 
     def on_hour(hour: int, member: int, normalized_nhwc: torch.Tensor) -> None:
-        hour_buffer.setdefault(hour, {})[member] = normalized_nhwc.detach().cpu()
+        with profile_region("torch.output_stage", logger=logger, extra=f" hour={hour} member={member}"):
+            hour_buffer.setdefault(hour, {})[member] = normalized_nhwc.detach().cpu()
         if len(hour_buffer[hour]) == len(members):
             flush_hour(hour)
 
-    autoregressive_rollout(
-        model,
-        init_input=initial_input,
-        gfs_forcing=gfs_forcing,
-        members=members,
-        num_members=num_members,
-        lead_hours=lead_hours,
-        init_datetime=init_datetime,
-        channel_mins=mins,
-        channel_maxs=maxs,
-        batch_size=args.batch_size,
-        on_hour=on_hour,
-        sampler=args.sampler,
-        noise_rho=args.noise_rho,
-    )
+    with profile_region("torch.rollout_total", logger=logger):
+        autoregressive_rollout(
+            model,
+            init_input=initial_input,
+            gfs_forcing=gfs_forcing,
+            members=members,
+            num_members=num_members,
+            lead_hours=lead_hours,
+            init_datetime=init_datetime,
+            channel_mins=mins,
+            channel_maxs=maxs,
+            batch_size=args.batch_size,
+            on_hour=on_hour,
+            sampler=args.sampler,
+            noise_rho=args.noise_rho,
+        )
 
     # Flush any partially filled hour buckets (shouldn't happen with correct
     # member tracking but is a safety net).
@@ -283,22 +301,24 @@ def run_forecast(args: argparse.Namespace) -> None:
         flush_hour(hour)
 
     written_nc: list[Path] = []
-    for future in as_completed(io_futures):
-        written_nc.append(future.result())
-    io_executor.shutdown(wait=True)
+    with profile_region("torch.output_wait", logger=logger):
+        for future in as_completed(io_futures):
+            written_nc.append(future.result())
+        io_executor.shutdown(wait=True)
     logger.info("Wrote %d NetCDF files under %s", len(written_nc), cycle_out)
 
-    if not args.no_grib2:
+    if (not args.no_grib2) and (not bench_skip_output):
         try:
             hours = list(range(0, lead_hours + 1))
-            for member in members:
-                convert_netcdf_hours_to_grib2(
-                    init_time=init_time,
-                    member=member,
-                    hours=hours,
-                    in_dir=cycle_out,
-                    out_dir=cycle_out,
-                )
+            with profile_region("torch.grib2_write", logger=logger):
+                for member in members:
+                    convert_netcdf_hours_to_grib2(
+                        init_time=init_time,
+                        member=member,
+                        hours=hours,
+                        in_dir=cycle_out,
+                        out_dir=cycle_out,
+                    )
             logger.info("Wrote GRIB2 for members %s hours %s", members, hours)
         except ModuleNotFoundError as exc:
             if exc.name in {"grib2io", "eccodes"}:

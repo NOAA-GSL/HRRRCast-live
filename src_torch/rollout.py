@@ -19,6 +19,7 @@ import torch
 
 from .inference import DEFAULT_SAMPLER, GFS_CHANNELS, PREDICTED_CHANNELS, forecast_hour
 from .model import HRRRCast
+from .profiling import profile_region
 
 
 logger = logging.getLogger(__name__)
@@ -260,17 +261,22 @@ def autoregressive_rollout(
             xn = torch.cat(xn_members, dim=0)
 
             t0 = time.time()
-            y_nhwc = forecast_hour(
-                model,
-                x_batch,
-                xn,
-                channel_mins,
-                channel_maxs,
-                sampler=sampler,
-                predicted_channels=predicted_channels,
-                gfs_channels=gfs_channels,
-            )
-            elapsed = time.time() - t0
+            with profile_region(
+                "torch.predict",
+                logger=logger,
+                extra=f" hour={hour} batch={batch_start // batch_size + 1} members={batch_members}",
+            ) as profile:
+                y_nhwc = forecast_hour(
+                    model,
+                    x_batch,
+                    xn,
+                    channel_mins,
+                    channel_maxs,
+                    sampler=sampler,
+                    predicted_channels=predicted_channels,
+                    gfs_channels=gfs_channels,
+                )
+            elapsed = profile.elapsed or (time.time() - t0)
             logger.info(
                 "hour=%d batch=%s/%s (members %s) predict %.3fs",
                 hour,
