@@ -114,8 +114,9 @@ SQRT_ONE_MINUS_ALPHA_BAR: np.ndarray = np.sqrt(1.0 - ALPHA_BAR).astype(np.float3
 
 # ==== Inference timestep clustering utilities ====
 def _powerlaw_deltas_to_0(gamma: float) -> np.ndarray:
+    """Compute power-law deltas that sum to T"""
     T = NUM_DIFFUSION_STEPS - 1
-    n = NUM_INFERENCE_STEPS - 1
+    n = NUM_INFERENCE_STEPS
 
     i = np.arange(1, n + 1)
 
@@ -154,11 +155,11 @@ def _powerlaw_deltas_to_0(gamma: float) -> np.ndarray:
     return d
 
 def _build_timesteps(deltas: np.ndarray) -> np.ndarray:
-    t = np.zeros(len(deltas) + 1, dtype=int)
-    t[1:] = np.cumsum(deltas)
-    return t
+    """Build timesteps from deltas via cumsum"""
+    return np.cumsum(deltas).astype(int)
 
 def cluster_to_T(gamma: float = POWERLAW_GAMMA) -> np.ndarray:
+    """Generate power-law clustered timesteps"""
     d0 = _powerlaw_deltas_to_0(gamma)
     dT = d0[::-1]
     return _build_timesteps(dT)
@@ -184,7 +185,8 @@ def _compute_log_snr_spaced_steps() -> np.ndarray:
     timesteps = []
     for target in target_log_snr:
         idx = np.argmin(np.abs(LOG_SNR - target))
-        timesteps.append(idx)
+        if idx > 0:  # Exclude t=0
+            timesteps.append(idx)
 
     # Remove duplicates while preserving order
     seen = set()
@@ -199,7 +201,7 @@ def _compute_log_snr_spaced_steps() -> np.ndarray:
     # If we still don't have enough (shouldn't happen with 2x candidates)
     # fall back to selecting evenly from remaining pool
     if len(unique_timesteps) < NUM_INFERENCE_STEPS:
-        remaining = [t for t in range(NUM_DIFFUSION_STEPS) if t not in seen]
+        remaining = [t for t in range(1, NUM_DIFFUSION_STEPS) if t not in seen]  # Exclude t=0
         # Select from remaining based on their log-SNR values
         remaining_log_snr = [(t, LOG_SNR[t]) for t in remaining]
         remaining_log_snr.sort(key=lambda x: x[1], reverse=True)
@@ -227,7 +229,11 @@ def _compute_log_snr_spaced_steps() -> np.ndarray:
 # ==== Uniform steps ====
 def _compute_uniform_spaced_steps() -> np.ndarray:
     """Compute approximately uniform inference timesteps in ascending order."""
-    return np.linspace(0, NUM_DIFFUSION_STEPS - 1, NUM_INFERENCE_STEPS, dtype=np.int32)
+    return np.linspace(
+        NUM_DIFFUSION_STEPS // NUM_INFERENCE_STEPS - 1,
+        NUM_DIFFUSION_STEPS - 1,
+        NUM_INFERENCE_STEPS,
+        dtype=np.int32)
 
 # ==== Power-law steps ====
 def _compute_powerlaw_spaced_steps(gamma: float = POWERLAW_GAMMA) -> np.ndarray:

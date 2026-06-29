@@ -864,7 +864,7 @@ class WeatherForecaster:
             # iterate over diffusion steps
             prev_x0 = None
             prev_h = None
-            for t_ in range(NUM_INFERENCE_STEPS - 1):
+            for t_ in range(NUM_INFERENCE_STEPS):
                 ti = NUM_INFERENCE_STEPS - 1 - t_
                 t = INFERENCE_STEPS[ti]
 
@@ -872,19 +872,22 @@ class WeatherForecaster:
                 x0_t, epsilon_t = predict_x0_and_epsilon(X, Xn, t)
 
                 # Choose diffusion sampler
-                if self.diffusion_sampler == "ddim-heun":
-                    x_tm1_pred = ddim(Xn, epsilon_t, ti, seed=members, eta=0.0)
-
-                    tm1 = tf.gather(list(INFERENCE_STEPS), ti - 1)
-                    _, epsilon_tm1 = predict_x0_and_epsilon(X, x_tm1_pred, tm1)
-
-                    Xn = ddim_heun(Xn, epsilon_t, epsilon_tm1, ti, seed=members, eta=0.0)
-                elif self.diffusion_sampler == "dpmpp-2m":
-                    Xn, prev_x0, prev_h = dpmpp_2m(Xn, x0_t, ti, prev_x0=prev_x0, prev_h=prev_h)
-                elif self.diffusion_sampler == "ddim":
-                    Xn = ddim(Xn, epsilon_t, ti, seed=members, eta=0.0)
+                if ti == 0:
+                    Xn = x0_t
                 else:
-                    Xn = ddpm(Xn, epsilon_t, ti, seed=members)
+                    if self.diffusion_sampler == "ddim-heun":
+                        x_tm1_pred = ddim(Xn, epsilon_t, ti, seed=members, eta=0.0)
+
+                        tm1 = tf.gather(list(INFERENCE_STEPS), ti - 1)
+                        _, epsilon_tm1 = predict_x0_and_epsilon(X, x_tm1_pred, tm1)
+
+                        Xn = ddim_heun(Xn, epsilon_t, epsilon_tm1, ti, seed=members, eta=0.0)
+                    elif self.diffusion_sampler == "dpmpp-2m":
+                        Xn, prev_x0, prev_h = dpmpp_2m(Xn, x0_t, ti, prev_x0=prev_x0, prev_h=prev_h)
+                    elif self.diffusion_sampler == "ddim":
+                        Xn = ddim(Xn, epsilon_t, ti, seed=members, eta=0.0)
+                    else:
+                        Xn = ddpm(Xn, epsilon_t, ti, seed=members)
 
             return Xn
         else:
