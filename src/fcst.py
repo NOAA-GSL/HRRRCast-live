@@ -14,7 +14,6 @@ import logging
 import os
 import sys
 import time
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -22,62 +21,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import tensorflow as tf
+import xarray as xr
 import pandas as pd
+from skimage.exposure import match_histograms
 
-_PROFILE_TRUE = {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
-_BENCH_SKIP_OUTPUT = os.environ.get("HRRRCAST_BENCH_SKIP_OUTPUT", "") in _PROFILE_TRUE
-
-try:
-    import xarray as xr
-except ImportError:
-    if not _BENCH_SKIP_OUTPUT:
-        raise
-
-    class _ArrayWithValues:
-        def __init__(self, values):
-            self.values = values
-
-    class _H5NormDataset:
-        def __init__(self, path):
-            import h5py
-
-            self._h5 = h5py.File(path, "r")
-            self.variables = set(self._h5.keys())
-
-        def __getitem__(self, key):
-            return _ArrayWithValues(np.asarray(self._h5[key]))
-
-        def close(self):
-            self._h5.close()
-
-    class _XarrayShim:
-        Dataset = object
-        DataArray = object
-
-        @staticmethod
-        def open_dataset(path, *args, **kwargs):
-            return _H5NormDataset(path)
-
-    xr = _XarrayShim()
-
-try:
-    from skimage.exposure import match_histograms
-except ImportError:
-    if not _BENCH_SKIP_OUTPUT:
-        raise
-
-    def match_histograms(image, reference, channel_axis=None):
-        return image
-
-try:
-    from nc2grib import Netcdf2Grib
-except ImportError:
-    if not _BENCH_SKIP_OUTPUT:
-        raise
-
-    class Netcdf2Grib:
-        def save_grib2(self, *args, **kwargs):
-            raise RuntimeError("Netcdf2Grib is unavailable in HRRRCAST_BENCH_SKIP_OUTPUT mode")
+from nc2grib import Netcdf2Grib
 
 # Import custom modules (assuming they exist)
 try:
@@ -102,100 +50,9 @@ from transform import (
 import utils
 from utils import setup_logging
 from diagnostics import compute_diagnostics
-try:
-    from compute_pmm import compute_PMM
-except ImportError:
-    if not _BENCH_SKIP_OUTPUT:
-        raise
-
-    def compute_PMM(*args, **kwargs):
-        raise RuntimeError("compute_PMM is unavailable in HRRRCAST_BENCH_SKIP_OUTPUT mode")
+from compute_pmm import compute_PMM
 
 logger = None
-
-
-def _profile_env(name: str) -> bool:
-    return os.environ.get(name, "") in _PROFILE_TRUE
-
-
-def _profile_timing_enabled() -> bool:
-    return _profile_env("HRRRCAST_PROFILE") or _profile_env("HRRRCAST_PROFILE_TIMING")
-
-
-def _profile_nvtx_enabled() -> bool:
-    return _profile_env("HRRRCAST_PROFILE") or _profile_env("HRRRCAST_NVTX")
-
-
-def _profile_sync_enabled() -> bool:
-    return _profile_env("HRRRCAST_PROFILE") or _profile_env("HRRRCAST_SYNC_TIMING")
-
-
-def _profile_log(message: str, *args) -> None:
-    if logger is not None:
-        logger.info(message, *args)
-    else:
-        logging.info(message, *args)
-
-
-def _tf_sync_if_enabled() -> None:
-    if not _profile_sync_enabled():
-        return
-    async_wait = getattr(getattr(tf, "experimental", None), "async_wait", None)
-    if async_wait is not None:
-        async_wait()
-
-
-def _nvtx_push(name: str) -> bool:
-    if not _profile_nvtx_enabled():
-        return False
-    try:
-        import nvtx  # type: ignore
-    except Exception:
-        return False
-    if hasattr(nvtx, "push_range"):
-        nvtx.push_range(name)
-        return True
-    if hasattr(nvtx, "range_push"):
-        nvtx.range_push(name)
-        return True
-    return False
-
-
-def _nvtx_pop() -> None:
-    try:
-        import nvtx  # type: ignore
-    except Exception:
-        return
-    if hasattr(nvtx, "pop_range"):
-        nvtx.pop_range()
-    elif hasattr(nvtx, "range_pop"):
-        nvtx.range_pop()
-
-
-@contextmanager
-def profile_region(name: str, extra: str = "", detail: bool = False):
-    """Optional source-level timing/NVTX instrumentation."""
-    if detail and not _profile_env("HRRRCAST_PROFILE_DETAIL"):
-        yield
-        return
-
-    do_timing = _profile_timing_enabled()
-    if not (do_timing or _profile_nvtx_enabled() or _profile_sync_enabled()):
-        yield
-        return
-
-    _tf_sync_if_enabled()
-    pushed = _nvtx_push(name)
-    t0 = time.perf_counter()
-    try:
-        yield
-    finally:
-        _tf_sync_if_enabled()
-        elapsed = time.perf_counter() - t0
-        if pushed:
-            _nvtx_pop()
-        if do_timing:
-            _profile_log("BENCH phase=%s%s seconds=%.6f", name, extra, elapsed)
 
 
 def make_noise(
@@ -234,35 +91,34 @@ class PreprocessedDataLoader:
         """Load preprocessed data from file."""
         if not os.path.exists(self.preprocessed_file):
             raise FileNotFoundError(f"Preprocessed data file not found: {self.preprocessed_file}")
-
-        with profile_region("tf.data_load", extra=f" file={Path(self.preprocessed_file).name}"):
-            try:
-                logger.info(f"Loading preprocessed data from {self.preprocessed_file}")
-                self.data = np.load(self.preprocessed_file)
-                
-                # Extract metadata
-                self.metadata = {
-                    'init_year': str(self.data['init_year']),
-                    'init_month': str(self.data['init_month']),
-                    'init_day': str(self.data['init_day']),
-                    'init_hh': str(self.data['init_hh']),
-                    'init_datetime': str(self.data['init_datetime']),
-                    'pl_vars': self.data['pl_vars'].tolist(),
-                    'sfc_vars': self.data['sfc_vars'].tolist(),
-                    'levels': self.data['levels'].tolist(),
-                    'grid_height': int(self.data['grid_height']),
-                    'grid_width': int(self.data['grid_width']),
-                    'downsample_factor': int(self.data['downsample_factor']),
-                    'norm_file': str(self.data['norm_file'])
-                }
-                
-                logger.info("Preprocessed data loaded successfully")
-                logger.info(f"Model input shape: {self.data['model_input'].shape}")
-                logger.info(f"Initialization time: {self.metadata['init_datetime']}")
-                
-            except Exception as e:
-                logger.error(f"Error loading preprocessed data: {e}")
-                raise
+        
+        try:
+            logger.info(f"Loading preprocessed data from {self.preprocessed_file}")
+            self.data = np.load(self.preprocessed_file)
+            
+            # Extract metadata
+            self.metadata = {
+                'init_year': str(self.data['init_year']),
+                'init_month': str(self.data['init_month']),
+                'init_day': str(self.data['init_day']),
+                'init_hh': str(self.data['init_hh']),
+                'init_datetime': str(self.data['init_datetime']),
+                'pl_vars': self.data['pl_vars'].tolist(),
+                'sfc_vars': self.data['sfc_vars'].tolist(),
+                'levels': self.data['levels'].tolist(),
+                'grid_height': int(self.data['grid_height']),
+                'grid_width': int(self.data['grid_width']),
+                'downsample_factor': int(self.data['downsample_factor']),
+                'norm_file': str(self.data['norm_file'])
+            }
+            
+            logger.info("Preprocessed data loaded successfully")
+            logger.info(f"Model input shape: {self.data['model_input'].shape}")
+            logger.info(f"Initialization time: {self.metadata['init_datetime']}")
+            
+        except Exception as e:
+            logger.error(f"Error loading preprocessed data: {e}")
+            raise
     
     def get_model_input(self) -> np.ndarray:
         """Get the model input array."""
@@ -283,10 +139,8 @@ class ForecastModel:
     def __init__(self, model_path: str):
         self.model_path = model_path
         self.model = None
-        with profile_region("tf.tf_setup"):
-            self._setup_tf_environment()
-        with profile_region("tf.model_load"):
-            self._load_model()
+        self._setup_tf_environment()
+        self._load_model()
 
     def _setup_tf_environment(self) -> None:
         """ 
@@ -334,8 +188,7 @@ class ForecastModel:
             raise RuntimeError("Model not loaded")
         
         try:
-            with profile_region("tf.model_forward", detail=True):
-                return self.model(input_data, training=False)
+            return self.model(input_data, training=False)
         except Exception as e:
             logger.error(f"Error during model prediction: {e}")
             raise
@@ -407,17 +260,16 @@ class WeatherForecaster:
 
         # Load normalization file and construct per-channel mean/std vectors consistent with preprocessing
         norm_file = self.metadata["norm_file"]
-        with profile_region("tf.norm_stats_load"):
-            try:
-                ds_norm = xr.open_dataset(norm_file)
-                self._init_channel_stats(ds_norm)
-                ds_norm.close()
-                logger.info(
-                    f"Normalization file loaded and channel stats constructed: {norm_file}"
-                )
-            except Exception as e:
-                logger.error(f"Error loading/processing normalization file: {e}")
-                raise
+        try:
+            ds_norm = xr.open_dataset(norm_file)
+            self._init_channel_stats(ds_norm)
+            ds_norm.close()
+            logger.info(
+                f"Normalization file loaded and channel stats constructed: {norm_file}"
+            )
+        except Exception as e:
+            logger.error(f"Error loading/processing normalization file: {e}")
+            raise
 
         # Initialize per-member base noise anchors (on-the-fly generation in predict)
         logger.info(f"Initializing member anchors for {len(self.members)} members")
@@ -749,14 +601,13 @@ class WeatherForecaster:
         """
         t0 = time.time()
 
-        with profile_region("tf.output_build", extra=f" hour={hour}"):
-            # Denormalize to physical units
-            denorm = self.denormalize(forecast_norm)
-            # Ensure shape (time=1, Ny, Nx, C)
-            if denorm.ndim == 3:
-                denorm = denorm[None, ...]
-            times = [hour]
-            ds_hour = self.create_xarray_dataset(init_datetime, times, lats, lons, denorm)
+        # Denormalize to physical units
+        denorm = self.denormalize(forecast_norm)
+        # Ensure shape (time=1, Ny, Nx, C)
+        if denorm.ndim == 3:
+            denorm = denorm[None, ...]
+        times = [hour]
+        ds_hour = self.create_xarray_dataset(init_datetime, times, lats, lons, denorm)
 
         # Inject constants if present in preprocessed NPZ (repeat across lead_time length 1)
         for cname in ["LAND", "OROG"]:
@@ -814,8 +665,7 @@ class WeatherForecaster:
         if mem_str not in {"avg", "spr"}:
             mem_str = f"m{int(member):02d}"
         nc_path = outdir / f"hrrrcast_{mem_str}_f{hour:02d}.nc"
-        with profile_region("tf.netcdf_write", extra=f" hour={hour} member={member}"):
-            ds_hour.to_netcdf(nc_path)
+        ds_hour.to_netcdf(nc_path)
 
         write_time = time.time() - t0
         logger.info(f"Wrote NetCDF in {write_time:.3f}s : {nc_path}")
@@ -856,8 +706,7 @@ class WeatherForecaster:
                 ds_hour = ds_hour.assign_coords(lead_time=("lead_time", [hour]))
             except Exception:
                 pass
-        with profile_region("tf.grib2_write", extra=f" hour={hour} member={member}"):
-            converter.save_grib2(init_datetime, ds_hour, str(grib2_path))
+        converter.save_grib2(init_datetime, ds_hour, str(grib2_path))
 
         write_time = time.time() - t0
         logger.info(f"Wrote GRIB2 in {write_time:.3f}s : {grib2_path}")
@@ -1100,9 +949,6 @@ class WeatherForecaster:
 
         def build_and_submit_hour_outputs(hour: int, data: np.ndarray, member: int) -> None:
             """Build the dataset in a worker, then submit both file writes."""
-            if _BENCH_SKIP_OUTPUT:
-                logger.debug(f"Skipping output build/write for hour {hour} member {member}")
-                return
             try:
                 ds_hour = self.build_single_hour_dataset(init_datetime, hour, lats, lons, data)
             except Exception as e:
@@ -1205,11 +1051,7 @@ class WeatherForecaster:
                 
                 # Predict next-hour fields for entire batch using hour-specific noise
                 t0 = time.time()
-                with profile_region(
-                    "tf.predict",
-                    extra=f" hour={hour} batch={batch_start//batch_size + 1} members={batch_members_list}",
-                ):
-                    y_batch = self.predict(model, X_batch, batch_members_list, hour=hour)
+                y_batch = self.predict(model, X_batch, batch_members_list, hour=hour)
                 predict_time = time.time() - t0
                 logger.info(f"Hour {hour}, batch {batch_start//batch_size + 1}: predict took {predict_time:.3f}s")
                 
@@ -1227,8 +1069,7 @@ class WeatherForecaster:
                     # state for this member
                     if hour % rollout_hour == 0:
                         state_from_hour[member] = y
-                    with profile_region("tf.output_stage", extra=f" hour={hour} member={member}"):
-                        hour_member_outputs[member] = y.numpy().copy()
+                    hour_member_outputs[member] = y.numpy().copy()
 
             # Compute PMM mean for this hour and nudge members before writing (if enabled)
             if self.use_nudging:
@@ -1248,15 +1089,14 @@ class WeatherForecaster:
         # Wait for all background work to complete. Build tasks must drain first so
         # they cannot submit into executors that are already shutting down.
         logger.info(f"Waiting for {len(build_futures)} background build operations to complete...")
-        with profile_region("tf.output_wait"):
-            for future in as_completed(build_futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Background build operation failed: {e}")
-            build_executor.shutdown(wait=True)
-            nc_executor.shutdown(wait=True)
-            grib2_executor.shutdown(wait=True)
+        for future in as_completed(build_futures):
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Background build operation failed: {e}")
+        build_executor.shutdown(wait=True)
+        nc_executor.shutdown(wait=True)
+        grib2_executor.shutdown(wait=True)
         logger.info("All background output operations completed")
 
         logger.info("Autoregressive rollout completed")
@@ -1322,15 +1162,14 @@ class WeatherForecaster:
             logger.info(self.metadata)
 
             # Run autoregressive forecast and write per-hour outputs to disk
-            with profile_region("tf.rollout_total"):
-                self.autoregressive_rollout(
-                    model_input,
-                    self.data_loader_gfs.get_model_input(),
-                    model,
-                    lead_hours,
-                    output_dir=output_dir,
-                    init_datetime=init_datetime,
-                )
+            self.autoregressive_rollout(
+                model_input,
+                self.data_loader_gfs.get_model_input(),
+                model,
+                lead_hours,
+                output_dir=output_dir,
+                init_datetime=init_datetime,
+            )
             logger.info("Forecast completed successfully (per-hour outputs written during rollout)")
         except Exception as e:
             logger.error(f"Forecast failed: {e}")
@@ -1396,76 +1235,73 @@ def main():
             members.extend(expand_member_arg(m))
         members = sorted(set(members))  # Remove duplicates and sort
 
-        with profile_region("tf.total_process"):
-            # Load preprocessed data and model ONCE
-            init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(args.inittime)
-            date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
-            filedate_str = f"{init_year}{init_month}{init_day}_{init_hh}"
-            hrrr_preprocessed_file = f"{args.base_dir}/{date_str}/hrrr_{filedate_str}.npz"
-            gfs_preprocessed_file = f"{args.base_dir}/{date_str}/gfs_{filedate_str}.npz"
-            data_loader_hrrr = PreprocessedDataLoader(hrrr_preprocessed_file)
-            data_loader_gfs = PreprocessedDataLoader(gfs_preprocessed_file)
-            model = ForecastModel(args.model_path)
+        # Load preprocessed data and model ONCE
+        init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(args.inittime)
+        date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
+        filedate_str = f"{init_year}{init_month}{init_day}_{init_hh}"
+        hrrr_preprocessed_file = f"{args.base_dir}/{date_str}/hrrr_{filedate_str}.npz"
+        gfs_preprocessed_file = f"{args.base_dir}/{date_str}/gfs_{filedate_str}.npz"
+        data_loader_hrrr = PreprocessedDataLoader(hrrr_preprocessed_file)
+        data_loader_gfs = PreprocessedDataLoader(gfs_preprocessed_file)
+        model = ForecastModel(args.model_path)
 
-            # Precompute model_input ONCE
-            with profile_region("tf.tensor_prep"):
-                model_input_hrrr = data_loader_hrrr.get_model_input()
-                model_input_gfs = data_loader_gfs.get_model_input()
+        # Precompute model_input ONCE
+        model_input_hrrr = data_loader_hrrr.get_model_input()
+        model_input_gfs = data_loader_gfs.get_model_input()
 
-                pl_vars = data_loader_hrrr.metadata["pl_vars"]
-                sfc_vars = data_loader_hrrr.metadata["sfc_vars"]
-                levels = data_loader_hrrr.metadata["levels"]
-                predicted_channels = len(pl_vars) * len(levels) + len(sfc_vars)
-                gfs_channels = model_input_gfs.shape[-1]
-                static_channels = max(model_input_hrrr.shape[-1] - predicted_channels, 0)
+        pl_vars = data_loader_hrrr.metadata["pl_vars"]
+        sfc_vars = data_loader_hrrr.metadata["sfc_vars"]
+        levels = data_loader_hrrr.metadata["levels"]
+        predicted_channels = len(pl_vars) * len(levels) + len(sfc_vars)
+        gfs_channels = model_input_gfs.shape[-1]
+        static_channels = max(model_input_hrrr.shape[-1] - predicted_channels, 0)
 
-                nlat = model_input_hrrr.shape[1]
-                nlon = model_input_hrrr.shape[2]
-                date_channel = np.ones((1, nlat, nlon, 6), dtype=model_input_hrrr.dtype)
-                lead_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
-                step_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
+        nlat = model_input_hrrr.shape[1]
+        nlon = model_input_hrrr.shape[2]
+        date_channel = np.ones((1, nlat, nlon, 6), dtype=model_input_hrrr.dtype)
+        lead_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
+        step_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
 
-                if not args.no_diffusion:
-                    rand_channel = np.ones((1, nlat, nlon, predicted_channels), dtype=model_input_hrrr.dtype)
-                    model_input = np.concatenate(
-                        [
-                            model_input_hrrr[:, :, :, :predicted_channels],
-                            model_input_gfs[0:1, :, :, :],
-                            rand_channel,
-                            model_input_hrrr[:, :, :, predicted_channels:],
-                            date_channel,
-                            step_channel,
-                            lead_channel
-                        ],
-                        axis=-1
-                    )
-                else:
-                    model_input = np.concatenate(
-                        [
-                            model_input_hrrr[:, :, :, :predicted_channels],
-                            model_input_gfs[0:1, :, :, :],
-                            model_input_hrrr[:, :, :, predicted_channels:],
-                            date_channel,
-                            step_channel,
-                            lead_channel
-                        ],
-                        axis=-1
-                    )
-
-            with profile_region("tf.forecaster_init"):
-                forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs,
-                                                args.num_members, members,
-                                                args.batch_size, not args.no_diffusion,
-                                                args.lead_hours,
-                                                predicted_channels=predicted_channels,
-                                                gfs_channels=gfs_channels,
-                                                static_channels=static_channels,
-                                                pmm_alpha=args.pmm_alpha,
-                                                use_nudging=not args.no_nudging,
-                                                noise_rho=args.noise_rho)
-            run_weather_forecast(
-                forecaster, model, args.lead_hours, model_input, args.output_dir
+        if not args.no_diffusion:
+            rand_channel = np.ones((1, nlat, nlon, predicted_channels), dtype=model_input_hrrr.dtype)
+            model_input = np.concatenate(
+                [
+                    model_input_hrrr[:, :, :, :predicted_channels],
+                    model_input_gfs[0:1, :, :, :],
+                    rand_channel,
+                    model_input_hrrr[:, :, :, predicted_channels:],
+                    date_channel,
+                    step_channel,
+                    lead_channel
+                ],
+                axis=-1
             )
+        else:
+            model_input = np.concatenate(
+                [
+                    model_input_hrrr[:, :, :, :predicted_channels],
+                    model_input_gfs[0:1, :, :, :],
+                    model_input_hrrr[:, :, :, predicted_channels:],
+                    date_channel,
+                    step_channel,
+                    lead_channel
+                ],
+                axis=-1
+            )
+        
+        forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs,
+                                        args.num_members, members,
+                                        args.batch_size, not args.no_diffusion,
+                                        args.lead_hours,
+                                        predicted_channels=predicted_channels,
+                                        gfs_channels=gfs_channels,
+                                        static_channels=static_channels,
+                                        pmm_alpha=args.pmm_alpha,
+                                        use_nudging=not args.no_nudging,
+                                        noise_rho=args.noise_rho)
+        run_weather_forecast(
+            forecaster, model, args.lead_hours, model_input, args.output_dir
+        )
         logger.info(f"All forecasts complete.")
         
     except Exception as e:
