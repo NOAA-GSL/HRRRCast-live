@@ -107,22 +107,28 @@ class ChannelPoolAvg(Layer):
 
 
 @register_keras_serializable()
-class ChannelPoolMax(Layer):
+class ChannelPoolAvg(Layer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
     def call(self, inputs):
-        # Compute max across channel axis (axis=3), keep dims for broadcasting
-        return tf.keras.backend.max(inputs, axis=3, keepdims=True)
+        # Compute mean across channel axis, keep dims for broadcasting
+        return tf.keras.backend.mean(inputs, axis=-1, keepdims=True)
 
     def compute_output_shape(self, input_shape):
         # Output shape same as input except channels become 1
         return input_shape[:-1] + (1,)
 
+    def get_config(self):
+        config = super().get_config()
+        return config
+    
 @register_keras_serializable()
 class RecomputeSubModel(tf.keras.layers.Layer):
-    """  
-    Wrap a Keras submodel so its forward is recomputed during backprop.
+    """Gradient checkpointing wrapper for memory-efficient training.
+    
+    Recomputes intermediate activations during backpropagation instead of storing them,
+    reducing memory usage at the cost of additional computation time.
     """
     def __init__(self, submodel: tf.keras.Model, name=None, **kwargs):
         super().__init__(name=name, **kwargs)
@@ -133,7 +139,6 @@ class RecomputeSubModel(tf.keras.layers.Layer):
 
         self.recompute_fn = tf.recompute_grad(_forward_pass)
 
-    @tf.function(jit_compile=False)
     def call(self, inputs):
         return self.recompute_fn(inputs)
 
@@ -203,8 +208,64 @@ class TimeCondLayer(Layer):
 
 
 @register_keras_serializable()
+class SkipScaleLayer(Layer):
+    """Computes non-learnable diffusion skip scales from the diffusion step channel.
+
+    Uses the second-to-last channel in `time_mask` as normalized diffusion step (t / NUM_DIFFUSION_STEPS).
+    Returns three broadcastable tensors:
+      - a: (noised-input - x_t) scale = 0.3 * sqrt(alpha_bar_t)
+      - b: (x_t) scale = 1.0
+      - c: (network-output) scale = sqrt(max(0, 1 - a^2))
+    """
+
+    def __init__(self, time_mask, **kwargs):
+        super().__init__(**kwargs)
+        self.time_mask = list(time_mask)
+        self._sqrt_alpha_bar = tf.constant(SQRT_ALPHA_BAR, dtype=tf.float32)
+
+    def call(self, inputs):
+        time_mask = tf.constant(self.time_mask, dtype=tf.int32)
+        n_channels = tf.shape(inputs)[-1]
+        time_mask = tf.where(time_mask < 0, time_mask + n_channels, time_mask)
+
+        # By convention, second-to-last time feature stores normalized diffusion step.
+        diffusion_idx = time_mask[-2]
+        diffusion_step = tf.gather(inputs, diffusion_idx, axis=-1)
+        diffusion_step = tf.cast(diffusion_step[:, 0, 0], tf.float32)
+
+        t = tf.cast(tf.round(diffusion_step * tf.cast(NUM_DIFFUSION_STEPS, tf.float32)), tf.int32)
+        t = tf.clip_by_value(t, 0, NUM_DIFFUSION_STEPS - 1)
+
+        a = 0.3 * tf.gather(self._sqrt_alpha_bar, t)
+        b = 1.0
+        c = tf.sqrt(1.0 - tf.square(a))
+
+        a = tf.reshape(a, (-1, 1, 1, 1))
+        b = tf.reshape(b, (-1, 1, 1, 1))
+        c = tf.reshape(c, (-1, 1, 1, 1))
+
+        return a, b, c
+
+    def compute_output_shape(self, input_shape):
+        out = (input_shape[0], 1, 1, 1)
+        return (out, out, out)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'time_mask': self.time_mask,
+        })
+        return config
+
+
+@register_keras_serializable()
 class ReflectPadLayer(Layer):
+    """Applies reflective padding to tensors."""
     def __init__(self, padding, **kwargs):
+        """
+        Args:
+            padding: Padding specification as [[h_top, h_bottom], [w_left, w_right]].
+        """
         super().__init__(**kwargs)
         self.padding = padding
 
@@ -217,10 +278,22 @@ class ReflectPadLayer(Layer):
         shape[2] = shape[2] + self.padding[1][0] + self.padding[1][1]
         return tuple(shape)
 
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'padding': self.padding,
+        })
+        return config
+
 
 @register_keras_serializable()
 class OutputMaskLayer(Layer):
+    """Selects specific output channels based on a mask."""
     def __init__(self, output_tensor_mask, **kwargs):
+        """
+        Args:
+            output_tensor_mask: Indices of channels to extract.
+        """
         super().__init__(**kwargs)
         self.output_tensor_mask = output_tensor_mask
 
@@ -230,10 +303,23 @@ class OutputMaskLayer(Layer):
     def compute_output_shape(self, input_shape):
         return input_shape[:-1] + (len(self.output_tensor_mask),)
 
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'output_tensor_mask': self.output_tensor_mask,
+        })
+        return config
+
 
 @register_keras_serializable()
 class ChannelSliceLayer(Layer):
+    """Extracts a slice of channels from the input tensor."""
     def __init__(self, start, end, **kwargs):
+        """
+        Args:
+            start: Starting channel index (inclusive).
+            end: Ending channel index (exclusive).
+        """
         super().__init__(**kwargs)
         self.start = start
         self.end = end
@@ -246,10 +332,23 @@ class ChannelSliceLayer(Layer):
     def compute_output_shape(self, input_shape):
         return input_shape[:-1] + (self.end - self.start,)
 
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'start': self.start,
+            'end': self.end,
+        })
+        return config
+
 
 @register_keras_serializable()
 class UnpadLayer(Layer):
+    """Removes padding from a padded tensor."""
     def __init__(self, padding, **kwargs):
+        """
+        Args:
+            padding: Padding specification to remove as [[h_top, h_bottom], [w_left, w_right]].
+        """
         super().__init__(**kwargs)
         self.padding = padding
 
@@ -265,9 +364,21 @@ class UnpadLayer(Layer):
         w = input_shape[2] - self.padding[1][0] - self.padding[1][1]
         return (input_shape[0], h, w, input_shape[3])
 
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'padding': self.padding,
+        })
+        return config
+
 @register_keras_serializable()
 class CastLayer(Layer):
+    """Casts input tensor to a specified data type."""
     def __init__(self, dtype, **kwargs):
+        """
+        Args:
+            dtype: Target data type for casting.
+        """
         super().__init__(**kwargs)
         self.target_dtype = dtype
 
@@ -276,3 +387,10 @@ class CastLayer(Layer):
 
     def compute_output_shape(self, input_shape):
         return input_shape
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'dtype': self.target_dtype,
+        })
+        return config
