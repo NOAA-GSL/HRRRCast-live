@@ -778,7 +778,8 @@ class WeatherForecaster:
         # version masks
         v4 = (time_coord >= np.datetime64("2021-03-23T00")).astype(np.float32)
         v3 = ((time_coord >= np.datetime64("2018-07-12T00")) & (time_coord < np.datetime64("2021-03-23T00"))).astype(np.float32)
-        # Stack features into shape [B, 6]
+        gfs_v15 = ((time_coord >= np.datetime64("2019-06-01T00")) & (time_coord < np.datetime64("2021-03-23T00"))).astype(np.float32)
+        # Stack features into shape [B, 7]
         features = np.stack([
             np.sin(2 * np.pi * hours / 24.0).astype(np.float32),
             np.cos(2 * np.pi * hours / 24.0).astype(np.float32),
@@ -786,6 +787,7 @@ class WeatherForecaster:
             np.cos(2 * np.pi * doy / 365.0).astype(np.float32),
             v4.astype(np.float32),
             v3.astype(np.float32),
+            gfs_v15.astype(np.float32),
         ], axis=-1)
         return features
 
@@ -795,8 +797,8 @@ class WeatherForecaster:
         def get_encoding_tensor(enc):
             enc = tf.cast(enc, dtype=tf.float32)
             batch_size, lat, lon = tf.shape(enc)[0], self.input_shape[1], self.input_shape[2]
-            enc = tf.reshape(enc, (batch_size, 1, 1, 6))
-            enc = tf.broadcast_to(enc, (batch_size, lat, lon, 6))
+            enc = tf.reshape(enc, (batch_size, 1, 1, 7))
+            enc = tf.broadcast_to(enc, (batch_size, lat, lon, 7))
             return enc
 
         enc = self.compute_time_features(init_times_np, lead_times_np)
@@ -1013,7 +1015,7 @@ class WeatherForecaster:
             # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
             X_base = tf.concat(
                 [
-                    X[:, :, :, start_pred_noise:-8],
+                    X[:, :, :, start_pred_noise:-(7 + 2)],
                     date_encoding,
                     X[:, :, :, -2:-1],
                     lead_encoding,
@@ -1261,7 +1263,7 @@ def main():
 
         nlat = model_input_hrrr.shape[1]
         nlon = model_input_hrrr.shape[2]
-        date_channel = np.ones((1, nlat, nlon, 6), dtype=model_input_hrrr.dtype)
+        date_channel = np.ones((1, nlat, nlon, 7), dtype=model_input_hrrr.dtype)
         lead_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
         step_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
 

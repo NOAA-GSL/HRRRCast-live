@@ -795,10 +795,10 @@ def compute_convective(ds):
     # =====================================================
     # 2. Convert omega -> w
     # =====================================================
-    # p = xr.DataArray(ds.level.values * 100.0, dims=["level"])
+    p = xr.DataArray(ds.level.values * 100.0, dims=["level"])
 
-    # Tv = T * (1 + 0.61*q)
-    # w = -omega * (Rd*Tv)/(g*p)
+    Tv = T * (1 + 0.61*q)
+    w = -omega * (Rd*Tv)/(g*p)
 
     # =====================================================
     # 3. Horizontal derivatives and vorticity
@@ -884,44 +884,44 @@ def compute_convective(ds):
     ds["HLCY_0_1km"] = hlcy.where(mask1_mid).sum("level", skipna=True).astype(np.float32)
     ds["HLCY_0_3km"] = hlcy.where(mask3_mid).sum("level", skipna=True).astype(np.float32)
 
-    ## =====================================================
-    ## 8. Updraft helicity 0-2 km, 0-3 km, 2–5 km
-    ## =====================================================
-    #w_mid    = (w    + w.shift(level=1)   ).isel(level=slice(1, None)) / 2.0
-    #zeta_mid = (zeta + zeta.shift(level=1)).isel(level=slice(1, None)) / 2.0
+    # =====================================================
+    # 8. Updraft helicity 0-2 km, 0-3 km, 2–5 km
+    # =====================================================
+    w_mid    = (w    + w.shift(level=1)   ).isel(level=slice(1, None)) / 2.0
+    zeta_mid = (zeta + zeta.shift(level=1)).isel(level=slice(1, None)) / 2.0
 
-    #mask2_mid   = (z_agl_mid >= 0)    & (z_agl_mid <= 2000)
-    #mask3_mid   = (z_agl_mid >= 0)    & (z_agl_mid <= 3000)
-    #mask2_5_mid = (z_agl_mid >= 2000) & (z_agl_mid <= 5000)
+    mask2_mid   = (z_agl_mid >= 0)    & (z_agl_mid <= 2000)
+    mask3_mid   = (z_agl_mid >= 0)    & (z_agl_mid <= 3000)
+    mask2_5_mid = (z_agl_mid >= 2000) & (z_agl_mid <= 5000)
 
-    #uh_inst = w_mid * zeta_mid * dz
-    #uh_inst = uh_inst * FUDGE_FACTOR_VORTICITY
+    uh_inst = w_mid * zeta_mid * dz
+    uh_inst = uh_inst * FUDGE_FACTOR_VORTICITY
 
-    ## 0-2 km updraft helicity
-    #uh_inst_0_2 = uh_inst.where(mask2_mid)
-    #ds["MXUPHL_max_0_2km"] = uh_inst_0_2.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
-    #ds["MNUPHL_min_0_2km"] = uh_inst_0_2.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    # 0-2 km updraft helicity
+    uh_inst_0_2 = uh_inst.where(mask2_mid)
+    ds["MXUPHL_max_0_2km"] = uh_inst_0_2.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    ds["MNUPHL_min_0_2km"] = uh_inst_0_2.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
 
-    ## 0-3 km updraft helicity
-    #uh_inst_0_3 = uh_inst.where(mask3_mid)
-    #ds["MXUPHL_max_0_3km"] = uh_inst_0_3.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
-    #ds["MNUPHL_min_0_3km"] = uh_inst_0_3.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    # 0-3 km updraft helicity
+    uh_inst_0_3 = uh_inst.where(mask3_mid)
+    ds["MXUPHL_max_0_3km"] = uh_inst_0_3.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    ds["MNUPHL_min_0_3km"] = uh_inst_0_3.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
 
-    ## 2-5 km updraft helicity
-    #uh_inst_2_5 = uh_inst.where(mask2_5_mid)
-    #ds["MXUPHL_max_2_5km"] = uh_inst_2_5.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
-    #ds["MNUPHL_min_2_5km"] = uh_inst_2_5.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    # 2-5 km updraft helicity
+    uh_inst_2_5 = uh_inst.where(mask2_5_mid)
+    ds["MXUPHL_max_2_5km"] = uh_inst_2_5.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    ds["MNUPHL_min_2_5km"] = uh_inst_2_5.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
 
-    ## =============================================================
-    ## 9. Maximum updraft velocity between 100-1000 mb
-    ## =============================================================
-    #level_hpa = w["level"]
-    #mask_v = (level_hpa >= 100) & (level_hpa <= 1000)
-    #w_layer = w.where(mask_v)
+    # =============================================================
+    # 9. Maximum updraft velocity between 100-1000 mb
+    # =============================================================
+    level_hpa = w["level"]
+    mask_v = (level_hpa >= 100) & (level_hpa <= 1000)
+    w_layer = w.where(mask_v)
 
-    ## upward/downward vertical velocity maxima/minima in 100-1000 mb layer
-    #ds["MAXUVV_max_100_1000mb"] = w_layer.clip(min=0).max("level", skipna=True).fillna(0).astype(np.float32)
-    #ds["MAXDVV_max_100_1000mb"] = w_layer.clip(max=0).min("level", skipna=True).fillna(0).astype(np.float32)
+    # upward/downward vertical velocity maxima/minima in 100-1000 mb layer
+    ds["MAXUVV_max_100_1000mb"] = w_layer.clip(min=0).max("level", skipna=True).fillna(0).astype(np.float32)
+    ds["MAXDVV_max_100_1000mb"] = w_layer.clip(max=0).min("level", skipna=True).fillna(0).astype(np.float32)
 
     return ds
 
