@@ -16,7 +16,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -46,6 +46,13 @@ from diffusion_params import (
 from transform import (
     inverse_log_transform_array,
     inverse_neg_log_transform_array,
+)
+from score_based_da import (
+    create_observation_operator_index,
+    create_observation_operator_interp,
+    create_observation_operator_neighborhood,
+    compute_sda_guidance,
+    build_observation_operator,
 )
 import utils
 from utils import setup_logging
@@ -136,13 +143,11 @@ class PreprocessedDataLoader:
 class ForecastModel:
     """Handles model loading and inference."""
 
-    def __init__(self, model_path: str):
-        self.model_path = model_path
+    def __init__(self):
         self.model = None
-        self._setup_tf_environment()
-        self._load_model()
 
-    def _setup_tf_environment(self) -> None:
+    @staticmethod
+    def setup_tf_environment() -> None:
         """ 
         Set up the TensorFlow environment for optimal performance.
         """
@@ -165,15 +170,19 @@ class ForecastModel:
         # set JIT compilation of graphs
         tf.config.optimizer.set_jit(True)
     
-    def _load_model(self):
-        """Load the TensorFlow model."""
-        if not os.path.exists(self.model_path):
-            raise FileNotFoundError(f"Model file not found: {self.model_path}")
+    def load_model(self, model_path: str):
+        """Load the TensorFlow model.
+        
+        Args:
+            model_path: Path to the model file to load
+        """
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
         
         try:
-            logger.info(f"Loading model from {self.model_path}")
+            logger.info(f"Loading model from {model_path}")
             self.model = tf.keras.models.load_model(
-                self.model_path, 
+                model_path, 
                 safe_mode=False, 
                 compile=False
             )
@@ -181,6 +190,20 @@ class ForecastModel:
         except Exception as e:
             logger.error(f"Error loading model: {e}")
             raise
+    
+    def unload_model(self):
+        """Unload the current model and free memory."""
+        if self.model is not None:
+            logger.info("Unloading model")
+            del self.model
+            self.model = None
+            # Force garbage collection to free GPU memory
+            import gc
+            gc.collect()
+            tf.keras.backend.clear_session()
+            logger.info("Model unloaded successfully")
+        else:
+            logger.warning("No model to unload")
     
     def predict(self, input_data: np.ndarray) -> np.ndarray:
         """Make prediction using the loaded model."""
@@ -905,6 +928,109 @@ class WeatherForecaster:
             y = model.predict(X)
             return y
 
+    def predict_sda(
+        self, model: ForecastModel, X: tf.Tensor, H: Callable, H_adjoint: Callable, y_obs: tf.Tensor, member: int = 0
+    ) -> tf.Tensor:
+        """
+        Perform diffusion-based prediction with data assimilation guidance.
+        Args:
+            model: Diffusion model used for prediction.
+            X: Input tensor including date encoding.
+            H: Observation operator.
+            H_adjoint: Adjoint of the observation operator.
+            y_obs: Ground truth observations.
+            member (int): Ensemble member seed.
+        Returns:
+            tf.Tensor: Predicted outputs for the batch.
+        """
+        num_output_channels = self.predicted_channels
+        nlat, nlon = self.input_shape[1], self.input_shape[2] 
+        nlat_sda, nlon_sda = tf.shape(X)[1], tf.shape(X)[2]
+        input_shape = [self.batch_size, nlat_sda, nlon_sda, num_output_channels]
+
+        # Generate initial noise for the member
+        Xn = tf.random.normal(input_shape, dtype=tf.float32, seed=member)
+
+        def build_diffusion_input(
+            X_in: tf.Tensor,
+            X_noisy: tf.Tensor,
+            step_t: tf.Tensor,
+        ) -> tf.Tensor:
+            step_encoding = tf.fill(
+                tf.concat([input_shape[:-1], [1]], axis=0),
+                tf.cast(step_t / NUM_DIFFUSION_STEPS, tf.float32),
+            )
+            X_out = tf.concat(
+                [
+                    X_noisy,
+                    X_in,
+                    step_encoding,
+                ],
+                axis=-1, 
+            )
+            return X_out
+
+        def predict_x0_and_epsilon(
+            X_in: tf.Tensor,
+            X_noisy: tf.Tensor,
+            step_t: tf.Tensor,
+        ) -> tuple[tf.Tensor, tf.Tensor]:
+            X_model = build_diffusion_input(X_in, X_noisy, step_t)
+            x_0_pred = model.predict(X_model)
+
+            # compute SDA guidance (gradient in x_0 space)
+            grad_likelihood = compute_sda_guidance(
+                x_0=x_0_pred,
+                y_obs=y_obs,
+                H=H,
+                H_adjoint=H_adjoint,
+                t=t,
+                weights=None,
+                R_obs = 0.01,
+                gamma = 0.001,
+                guidance_scale = 0.2,
+            )
+
+            # compute guided x_0
+            x_0_pred = x_0_pred + grad_likelihood
+
+            eps = compute_epsilon(X_noisy, x_0_pred, step_t)
+            return x_0_pred, eps
+
+        # iterate over diffusion steps
+        prev_x0 = None
+        prev_h = None
+        for t_ in range(NUM_INFERENCE_STEPS):
+            ti = NUM_INFERENCE_STEPS - 1 - t_
+            t = INFERENCE_STEPS[ti]
+
+            # compute predicted noise epsilon at this step
+            x0_t, epsilon_t = predict_x0_and_epsilon(X, Xn, t)
+
+            # Choose diffusion sampler
+            if ti == 0:
+                Xn = x0_t
+            else:
+                if self.diffusion_sampler == "ddim-heun":
+                    x_tm1_pred = ddim(Xn, epsilon_t, ti, seed=member, eta=0.0)
+
+                    tm1 = tf.gather(list(INFERENCE_STEPS), ti - 1)
+                    _, epsilon_tm1 = predict_x0_and_epsilon(X, x_tm1_pred, tm1)
+
+                    Xn = ddim_heun(Xn, epsilon_t, epsilon_tm1, ti, seed=member, eta=0.0)
+                elif self.diffusion_sampler == "dpmpp-2m":
+                    Xn, prev_x0, prev_h = dpmpp_2m(Xn, x0_t, ti, prev_x0=prev_x0, prev_h=prev_h)
+                elif self.diffusion_sampler == "ddim":
+                    Xn = ddim(Xn, epsilon_t, ti, seed=member, eta=0.0)
+                else:
+                    Xn = ddpm(Xn, epsilon_t, ti, seed=member)
+
+        # Upsample from SDA
+        if nlat_sda != nlat or nlon_sda != nlon:
+            Xn = tf.image.resize(Xn, size=[nlat, nlon], method='bilinear')
+
+        return Xn
+
     def autoregressive_rollout(self, initial_input: np.ndarray, forcing_input: np.ndarray, model: ForecastModel, 
                              target_hour: int,
                              output_dir: Optional[str] = None,
@@ -1152,11 +1278,7 @@ class WeatherForecaster:
         return ds
     
     def run_forecast(self, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str = "./"):
-        """Run the forecasting pipeline with per-hour streaming outputs. Requires precomputed model_input.
-
-        This function now avoids building a single multi-hour xarray Dataset and avoids bulk NetCDF/GRIB2 writes.
-        Instead, per-hour NetCDF/GRIB2 files are written during the autoregressive rollout.
-        """
+        """Run forecasts"""
         try:
             init_datetime = self.data_loader_hrrr.get_init_datetime()
 
@@ -1178,12 +1300,65 @@ class WeatherForecaster:
             logger.error(f"Forecast failed: {e}")
             raise
 
+    def run_data_assimilation(self, model: ForecastModel, model_input: np.ndarray, args):
+        """Run data assimilation."""
+        try:
+            nlat, nlon = self.input_shape[1], self.input_shape[2]
+            nlat_sda, nlon_sda = 530, 900
+
+            # Construct date encoding tensor
+            init_datetime = self.data_loader_hrrr.get_init_datetime()
+            date_encoding = self.date_encoding_tensor(init_datetime, 0)
+
+            # Downsample static channels and concatenate with date encoding
+            start = 2 * self.predicted_channels + self.gfs_channels
+            static_tensor = tf.convert_to_tensor(
+                model_input[:, :, :, start:start + self.static_channels], dtype=tf.float32)
+            X_static = tf.concat([static_tensor, date_encoding], axis=-1)
+            if nlat_sda != nlat or nlon_sda != nlon:
+                X_static = tf.image.resize(X_static, size=[nlat_sda, nlon_sda], method='bilinear')
+
+            # Downsample HRRR analyses from full grid  to SDA grid
+            model_input_tf = tf.convert_to_tensor(
+                model_input[:, :, :, :self.predicted_channels], dtype=tf.float32)
+            if nlat_sda != nlat or nlon_sda != nlon:
+                model_input_tf = tf.image.resize(model_input_tf, size=[nlat_sda, nlon_sda], method='bilinear')
+
+            # Create observation operator from configuration
+            H, H_adjoint = build_observation_operator(
+                args=args,
+                lat_size=nlat_sda,
+                lon_size=nlon_sda,
+                num_variables=self.predicted_channels,
+            )
+
+            # Apply observation operator to downsampled data
+            y_obs = H(model_input_tf)
+
+            # Call SDA model and then change the model_input to the SDA output
+            y_analyses = self.predict_sda(
+                model, X_static, H=H, H_adjoint=H_adjoint, y_obs=y_obs, member=0)
+            model_input[:, :, :, :self.predicted_channels] = y_analyses.numpy()
+
+            logger.info("Data assimilation completed successfully")
+        except Exception as e:
+            logger.error(f"Data assimilation failed : {e}")
+            raise
+
 def run_weather_forecast(forecaster: WeatherForecaster, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str):
     """Run forecast for a single member. Requires precomputed model_input."""
     try:
         forecaster.run_forecast(model, lead_hours, model_input, output_dir)
     except Exception as e:
         logger.error(f"Forecast failed : {e}")
+        raise
+
+def run_data_assimilation(forecaster: WeatherForecaster, model: ForecastModel, model_input: np.ndarray, args):
+    """Run data assimilation."""
+    try:
+        forecaster.run_data_assimilation(model, model_input, args)
+    except Exception as e:
+        logger.error(f"Data assimilation failed : {e}")
         raise
 
 
@@ -1194,6 +1369,7 @@ def parse_arguments():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
+    # Arguments for forecast model
     parser.add_argument("model_path", help="Path to the trained model")
     parser.add_argument('inittime', help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hours", type=int, help="Lead time in hours")
@@ -1201,6 +1377,7 @@ def parse_arguments():
     parser.add_argument("--members", nargs='+', required=True, help="List of ensemble member IDs (e.g., 0 1 2 or 0,1,2)")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for model inference")
     parser.add_argument("--no_diffusion", default=False, action="store_true", help="Turn off diffusion")
+    parser.add_argument("--sda_model_path", default=None, help="Optional path to Score-based DA model for data assimilation")
     parser.add_argument("--base_dir", default="./", help="Base directory for input preprocessed files")
     parser.add_argument("--output_dir", default="./", help="Output directory for forecast files")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -1211,6 +1388,24 @@ def parse_arguments():
                         help="Noise blend/correlation parameter (0..1)")
     parser.add_argument("--no_nudging", default=False, action="store_true",
                         help="Disable nudging (member perturbation toward consensus)")
+
+    # Add arguments for observation operator and station layout
+    parser.add_argument("--obs_operator", dest="obs_operator", type=str, choices=["index", "interp", "neighborhood"], default="neighborhood",
+                        help="Observation operator type for SDA guidance.")
+    parser.add_argument("--station_layout", dest="station_layout", type=str, choices=["uniform", "random"], default="uniform",
+                        help="Station layout strategy used to build observation locations.")
+    parser.add_argument("--subsampling_factor", dest="subsampling_factor", type=int, default=8,
+                        help="Subsampling factor controlling station density.")
+    parser.add_argument("--obs_random_seed", dest="obs_random_seed", type=int, default=42,
+                        help="Random seed used when station-layout=random.")
+    parser.add_argument("--interp_order", dest="interp_order", type=int, default=1,
+                        help="Interpolation order for interp operator: 1=bilinear, 2=biquadratic, 3=bicubic.")
+    parser.add_argument("--neighborhood_window_size", dest="neighborhood_window_size", type=int, default=None,
+                        help="Neighborhood window size (odd integer). If unset, derived from subsampling factor.")
+    parser.add_argument("--neighborhood_kernel", dest="neighborhood_kernel", type=str, choices=["uniform", "gaussian"], default="uniform",
+                        help="Neighborhood kernel type.")
+    parser.add_argument("--neighborhood_sigma", dest="neighborhood_sigma", type=float, default=None,
+                        help="Gaussian sigma for neighborhood kernel; ignored for uniform kernel.")
     
     return parser.parse_args()
 
@@ -1246,12 +1441,12 @@ def main():
         gfs_preprocessed_file = f"{args.base_dir}/{date_str}/gfs_{filedate_str}.npz"
         data_loader_hrrr = PreprocessedDataLoader(hrrr_preprocessed_file)
         data_loader_gfs = PreprocessedDataLoader(gfs_preprocessed_file)
-        model = ForecastModel(args.model_path)
 
         # Precompute model_input ONCE
         model_input_hrrr = data_loader_hrrr.get_model_input()
         model_input_gfs = data_loader_gfs.get_model_input()
 
+        # Compute channel counts for input tensor construction
         pl_vars = data_loader_hrrr.metadata["pl_vars"]
         sfc_vars = data_loader_hrrr.metadata["sfc_vars"]
         levels = data_loader_hrrr.metadata["levels"]
@@ -1259,6 +1454,10 @@ def main():
         gfs_channels = model_input_gfs.shape[-1]
         static_channels = max(model_input_hrrr.shape[-1] - predicted_channels, 0)
 
+        # Setup TensorFlow environment
+        ForecastModel.setup_tf_environment()
+
+        # Construct additional channels for date, lead time, and step
         nlat = model_input_hrrr.shape[1]
         nlon = model_input_hrrr.shape[2]
         date_channel = np.ones((1, nlat, nlon, 6), dtype=model_input_hrrr.dtype)
@@ -1292,6 +1491,7 @@ def main():
                 axis=-1
             )
         
+        # Create WeatherForecaster instance with preloaded data and model
         forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs,
                                         args.num_members, members,
                                         args.batch_size, not args.no_diffusion,
@@ -1302,9 +1502,33 @@ def main():
                                         pmm_alpha=args.pmm_alpha,
                                         use_nudging=not args.no_nudging,
                                         noise_rho=args.noise_rho)
-        run_weather_forecast(
-            forecaster, model, args.lead_hours, model_input, args.output_dir
-        )
+        
+        # Run data assimilation
+        if args.sda_model_path:
+            sda_model = ForecastModel()
+            sda_model.load_model(args.sda_model_path)
+
+            run_data_assimilation(
+                forecaster, sda_model, model_input, args
+            )
+
+            sda_model.unload_model()
+        else:
+            logger.info("Skipping DA.")
+
+        # Run forecast with the main model
+        if True:
+            model = ForecastModel()
+            model.load_model(args.model_path)
+
+            run_weather_forecast(
+                forecaster, model, args.lead_hours, model_input, args.output_dir
+            )
+
+            model.unload_model()
+        else:
+            logger.info("Skipping forecast.")
+
         logger.info(f"All forecasts complete.")
         
     except Exception as e:
