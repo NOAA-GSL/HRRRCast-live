@@ -52,7 +52,7 @@ from score_based_da import (
     create_observation_operator_interp,
     create_observation_operator_neighborhood,
     compute_sda_guidance,
-    build_observation_operator,
+    build_pseudo_observation_operator,
 )
 import utils
 from utils import setup_logging
@@ -1325,7 +1325,7 @@ class WeatherForecaster:
                 model_input_tf = tf.image.resize(model_input_tf, size=[nlat_sda, nlon_sda], method='bilinear')
 
             # Create observation operator from configuration
-            H, H_adjoint = build_observation_operator(
+            H, H_adjoint = build_pseudo_observation_operator(
                 args=args,
                 lat_size=nlat_sda,
                 lon_size=nlon_sda,
