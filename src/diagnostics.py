@@ -788,9 +788,9 @@ def compute_convective(ds):
     mask6 = (z_agl>=0) & (z_agl<=6000)
     dz = -z_agl.diff("level")
 
-    # fudge factor for maximum relative vorticity and max updraft helicity
+    # fudge factor for maximum relative vorticity and max updraft helicity/velocity
     # to account for max in a 1h window instead of instantaneous value at each lead time
-    FUDGE_FACTOR_VORTICITY = 6
+    FUDGE_FACTOR_MAX = 6
 
     # =====================================================
     # 2. Convert omega -> w
@@ -842,7 +842,7 @@ def compute_convective(ds):
     # =====================================================
     # 5. Relative vorticity maximum in lowest 1 km and 2 km AGL
     # =====================================================
-    RELV_max = zeta * FUDGE_FACTOR_VORTICITY
+    RELV_max = zeta * FUDGE_FACTOR_MAX
     ds["RELV_max_0_1km"] = RELV_max.where(mask1).max("level", skipna=True).fillna(0).astype(np.float32)
     ds["RELV_max_0_2km"] = RELV_max.where(mask2).max("level", skipna=True).fillna(0).astype(np.float32)
 
@@ -895,7 +895,7 @@ def compute_convective(ds):
     mask2_5_mid = (z_agl_mid >= 2000) & (z_agl_mid <= 5000)
 
     uh_inst = w_mid * zeta_mid * dz
-    uh_inst = uh_inst * FUDGE_FACTOR_VORTICITY
+    uh_inst = uh_inst * FUDGE_FACTOR_MAX
 
     # 0-2 km updraft helicity
     uh_inst_0_2 = uh_inst.where(mask2_mid)
@@ -917,7 +917,7 @@ def compute_convective(ds):
     # =============================================================
     level_hpa = w["level"]
     mask_v = (level_hpa >= 100) & (level_hpa <= 1000)
-    w_layer = w.where(mask_v)
+    w_layer = w.where(mask_v) * FUDGE_FACTOR_MAX
 
     # upward/downward vertical velocity maxima/minima in 100-1000 mb layer
     ds["MAXUVV_max_100_1000mb"] = w_layer.clip(min=0).max("level", skipna=True).fillna(0).astype(np.float32)
