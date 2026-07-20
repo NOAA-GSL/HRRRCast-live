@@ -152,6 +152,7 @@ class RecomputeSubModel(tf.keras.layers.Layer):
 
         self.recompute_fn = tf.recompute_grad(_forward_pass)
 
+    @tf.function(jit_compile=False)
     def call(self, inputs):
         return self.recompute_fn(inputs)
 
