@@ -833,8 +833,8 @@ class WeatherForecaster:
             grib2_executor.submit(write_hour_grib2, hour, ds_hour, member)
 
         build_executor = ThreadPoolExecutor(max_workers=len(self.members))
-        nc_executor = ThreadPoolExecutor(max_workers=1)
-        grib2_executor = ThreadPoolExecutor(max_workers=1)
+        nc_executor = ThreadPoolExecutor(max_workers=1) # Serial: HDF5 not thread safe
+        grib2_executor = ThreadPoolExecutor(max_workers=len(self.members)) # Parallel: locked in save_grib2()
         build_futures = []
 
         # Semaphore to limit pending build tasks and prevent OOM from too many queued forecasts
