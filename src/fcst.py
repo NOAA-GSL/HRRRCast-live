@@ -18,12 +18,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import numpy as np
 import tensorflow as tf
 import xarray as xr
 import pandas as pd
-from skimage.exposure import match_histograms
 
 from nc2grib import Netcdf2Grib
 
@@ -832,19 +832,29 @@ class WeatherForecaster:
             nc_executor.submit(write_hour_nc, hour, ds_hour, member)
             grib2_executor.submit(write_hour_grib2, hour, ds_hour, member)
 
-        build_executor = ThreadPoolExecutor(max_workers=self.batch_size)
+        build_executor = ThreadPoolExecutor(max_workers=len(self.members))
         nc_executor = ThreadPoolExecutor(max_workers=1)
         grib2_executor = ThreadPoolExecutor(max_workers=1)
         build_futures = []
 
+        # Semaphore to limit pending build tasks and prevent OOM from too many queued forecasts
+        max_pending_builds = 8
+        build_semaphore = threading.Semaphore(max_pending_builds)
+        
+        def submit_with_backpressure(hour: int, data_tensor: tf.Tensor, member: int) -> None:
+            """Submit build task with semaphore-based backpressure control.
+            The tensor->numpy copy happens AFTER semaphore acquisition to prevent
+            memory buildup when the queue is full.
+            """
+            build_semaphore.acquire()  # Block if queue is full
+            data = data_tensor.numpy()  # Copy from GPU to CPU only after semaphore acquired
+            future = build_executor.submit(build_and_submit_hour_outputs, hour, data, member)
+            future.add_done_callback(lambda _: build_semaphore.release())  # Release when done
+            build_futures.append(future)
+
         # Write out hour 0 (f00) products representing the initial state for each member
         for member in self.members:
-            build_futures.append(
-                build_executor.submit(
-                    build_and_submit_hour_outputs, 0,
-                    state_from_hour[member].numpy(), member
-                )
-            )
+            submit_with_backpressure(0, state_from_hour[member], member)
 
         # phase shift of GFS forcing input
         num_members = self.num_members
@@ -939,12 +949,7 @@ class WeatherForecaster:
                         state_from_hour[member] = y
 
                     # Store the output for this hour and member, then submit write task
-                    build_futures.append(
-                        build_executor.submit(
-                            build_and_submit_hour_outputs, hour, 
-                            y.numpy(), member
-                        )
-                    )
+                    submit_with_backpressure(hour, y, member)  # Pass tensor, not numpy array
 
         # Wait for all background work to complete. Build tasks must drain first so
         # they cannot submit into executors that are already shutting down.
