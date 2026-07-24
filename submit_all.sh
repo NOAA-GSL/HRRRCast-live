@@ -23,13 +23,13 @@ fi
 # set wall clock time limits
 hr=$(echo "$INIT_TIME" | grep -oP '\d{2}$')
 if [[ "$hr" =~ ^(00|06|12|18)$ ]]; then
-    FCST_WALLTIME="02:45:00"
-    PMM_WALLTIME="02:50:00"
+    FCST_WALLTIME="02:20:00"
+    PMM_WALLTIME="02:35:00"
     GET_BCS_WALLTIME="00:30:00"
     MAKE_BCS_WALLTIME="01:00:00"
 else
-    FCST_WALLTIME="01:10:00"
-    PMM_WALLTIME="01:30:00"
+    FCST_WALLTIME="01:00:00"
+    PMM_WALLTIME="01:15:00"
     GET_BCS_WALLTIME="00:15:00"
     MAKE_BCS_WALLTIME="00:30:00"
 fi
