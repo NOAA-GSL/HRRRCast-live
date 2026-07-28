@@ -191,3 +191,57 @@ def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
     if init_datetime is not None:
         ds.attrs["initialization_time"] = init_datetime.strftime("%Y-%m-%dT%H:%M:%SZ")
     return ds
+
+
+def get_cf_encoding(ds: xr.Dataset, init_datetime: datetime) -> dict:
+    """Build CF-compliant encoding dictionary for NetCDF output.
+
+    Constructs encoding specifications that ensure CF-1.6 compliance when
+    writing a dataset to NetCDF. Sets appropriate fill values for data
+    variables and coordinates, forbids fill values on coordinate variables
+    per CF §2.5.1, and uses CF-compatible time encoding.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Dataset to encode. Used to determine which coordinates are present.
+    init_datetime : datetime.datetime
+        Forecast initialization time (UTC). Used for time coordinate encoding.
+
+    Returns
+    -------
+    dict
+        Encoding dictionary suitable for passing to ``xr.Dataset.to_netcdf()``.
+    """
+    # Apply CF-compliance encoding
+    encoding = {v: {"_FillValue": np.float32(-9999.0)}
+                for v in ds.data_vars if v != "grid_mapping"}
+    encoding["latitude"] = {"_FillValue": np.float32(-9999.0)}
+    encoding["longitude"] = {"_FillValue": np.float32(-9999.0)}
+    # CF-1.6: store time as float64 hours since the initialization time
+    # (xarray would otherwise emit int64 nanoseconds, which is not a CF type).
+    # CF §2.5.1 forbids _FillValue on coordinate variables.
+    encoding["time"] = {
+        "units": f"hours since {init_datetime.strftime('%Y-%m-%d %H:%M:%S')}",
+        "calendar": "standard",
+        "dtype": "float64",
+        "_FillValue": None,
+    }
+    if "level" in ds.coords:
+        encoding["level"] = {"dtype": "int32", "_FillValue": None}
+    # CF §2.5.1: projection coordinate variables x, y must not have _FillValue.
+    if "x" in ds.coords:
+        encoding["x"] = {"_FillValue": None}
+    if "y" in ds.coords:
+        encoding["y"] = {"_FillValue": None}
+    # CF §2.5.1: coordinate variables must not have _FillValue.
+    if "forecast_reference_time" in ds.coords:
+        encoding["forecast_reference_time"] = {
+            "units": "hours since 1970-01-01 00:00:00",
+            "calendar": "standard",
+            "dtype": "float64",
+            "_FillValue": None,
+        }
+    if "lead_time" in ds.coords:
+        encoding["lead_time"] = {"dtype": "float32", "_FillValue": None}
+    return encoding

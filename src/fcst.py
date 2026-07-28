@@ -50,7 +50,7 @@ from transform import (
 import utils
 from utils import setup_logging
 from diagnostics import compute_diagnostics
-from cf_attributes import apply_cf_attributes
+from cf_attributes import apply_cf_attributes, get_cf_encoding
 from compute_pmm import compute_PMM
 
 logger = None
@@ -546,37 +546,8 @@ class WeatherForecaster:
             mem_str = f"m{int(member):02d}"
         nc_path = outdir / f"hrrrcast_{mem_str}_f{hour:02d}.nc"
 
-        # spply CF-compliance encoding
-        encoding = {v: {"_FillValue": np.float32(-9999.0)}
-                    for v in ds_hour.data_vars if v != "grid_mapping"}
-        encoding["latitude"] = {"_FillValue": np.float32(-9999.0)}
-        encoding["longitude"] = {"_FillValue": np.float32(-9999.0)}
-        # CF-1.6: store time as float64 hours since the initialization time
-        # (xarray would otherwise emit int64 nanoseconds, which is not a CF type).
-        # CF \u00a72.5.1 forbids _FillValue on coordinate variables.
-        encoding["time"] = {
-            "units": f"hours since {init_datetime.strftime('%Y-%m-%d %H:%M:%S')}",
-            "calendar": "standard",
-            "dtype": "float64",
-            "_FillValue": None,
-        }
-        if "level" in ds_hour.coords:
-            encoding["level"] = {"dtype": "int32", "_FillValue": None}
-        # CF \u00a72.5.1: projection coordinate variables x, y must not have _FillValue.
-        if "x" in ds_hour.coords:
-            encoding["x"] = {"_FillValue": None}
-        if "y" in ds_hour.coords:
-            encoding["y"] = {"_FillValue": None}
-        # CF §2.5.1: coordinate variables must not have _FillValue.
-        if "forecast_reference_time" in ds_hour.coords:
-            encoding["forecast_reference_time"] = {
-                "units": "hours since 1970-01-01 00:00:00",
-                "calendar": "standard",
-                "dtype": "float64",
-                "_FillValue": None,
-            }
-        if "lead_time" in ds_hour.coords:
-            encoding["lead_time"] = {"dtype": "float32", "_FillValue": None}
+        # Get CF-compliant encoding
+        encoding = get_cf_encoding(ds_hour, init_datetime)
         ds_hour.to_netcdf(nc_path, encoding=encoding)
 
         write_time = time.time() - t0
