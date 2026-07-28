@@ -594,7 +594,7 @@ def compute_vvel(ds: xr.Dataset) -> xr.Dataset:
             - latitude/lat: Latitude coordinate
             - longitude/lon: Longitude coordinate
 
-            Dataset must have dimensions: (time, level, latitude, longitude)
+            Dataset must have dimensions: (time, lead_time, level, latitude, longitude)
             Assumes Lambert Conformal Conic projection (e.g., HRRR grid)
 
     Returns:
@@ -712,12 +712,6 @@ def compute_vvel(ds: xr.Dataset) -> xr.Dataset:
 
     # Restore original pressure level coordinates
     vvel = vvel.assign_coords(level=ds.level)
-
-    # CF \u00a72.4: data vars should follow (T, Z, Y, X). Broadcasting placed
-    # the level axis first; reorder to match other pressure-level fields.
-    desired = [d for d in ("time", "level", "latitude", "longitude") if d in vvel.dims]
-    extra = [d for d in vvel.dims if d not in desired]
-    vvel = vvel.transpose(*extra, *desired)
 
     ds["VVEL"] = vvel.astype(np.float32)
     return ds

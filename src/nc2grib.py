@@ -353,14 +353,17 @@ class Netcdf2Grib:
         _, _, _, surface_type, surface_value = GRIB_PARAM_MAP[var_name]
         return surface_type, surface_value
 
-    def save_grib2(self, forecast_starttime: datetime, hour: int, ds_hour: xr.Dataset, member, outdir: str) -> None:
+    def save_grib2(self, forecast_starttime: datetime, ds_hour: xr.Dataset, member, outdir: str) -> None:
         """Write a single-hour GRIB2 file from an xarray.Dataset using grib2io.
 
-        ds_hour is expected to have dims (time=1, [level], y, x) and contain
-        both pressure-level and surface variables. The forecast lead hour is
-        provided explicitly via the ``hour`` argument.
+        ds_hour is expected to have dims (time=1, lead_time=1, [level], y, x) and contain
+        both pressure-level and surface variables.
         """
-        lead = int(hour)
+        # Extract lead hour
+        try:
+            lead = int(np.asarray(ds_hour["lead_time"]).item())
+        except Exception:
+            lead = 0
 
         cycle = forecast_starttime.hour
         if member == "avg":
@@ -402,10 +405,12 @@ class Netcdf2Grib:
                         if plevel < 2000:  # assume provided in hPa
                             plevel *= 100.0
                         msg = self._build_message(var_name, forecast_starttime, lead, surface_type=100, surface_value=plevel)
-                        # Expect data shape (time=1, level=1, y, x) or (level=1, y, x)
+                        # Expect data shape (time=1, lead_time=1, level=1, y, x) or (lead_time=1, level=1, y, x)
                         vals = np.squeeze(da.sel(level=level).values)
-                        # Slice out time if present
-                        if vals.ndim == 3:
+                        # Slice out time/lead if present
+                        if vals.ndim == 4:
+                            vals2d = vals[0, 0, :, :]
+                        elif vals.ndim == 3:
                             vals2d = vals[0, :, :]
                         else:
                             vals2d = vals
@@ -416,7 +421,7 @@ class Netcdf2Grib:
                     msg = self._build_message(var_name, forecast_starttime, lead, surface_type=surface_type, surface_value=surface_value)
                     vals = np.squeeze(da.values)
                     if vals.ndim == 3:
-                        vals2d = vals[0, :, :]
+                        vals2d = vals[0, 0, :, :]
                     elif vals.ndim == 2:
                         vals2d = vals
                     else:

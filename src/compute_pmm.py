@@ -71,6 +71,9 @@ def compute_PMM(fields: xr.DataArray, method=2) -> xr.DataArray:
         raise ValueError(f"Could not identify spatial dimensions. Available dims: {fields.dims}")
     
     # print info for debugging
+    if 'lead_time' in fields.coords:
+        lt = fields.lead_time.values / np.timedelta64(1, "h")
+        logger.debug(f"Lead time {lt}h")
     if 'level' in fields.coords:
         lv = fields.level.values
         logger.debug(f"Level {lv}")
@@ -123,41 +126,50 @@ def compute_PMM(fields: xr.DataArray, method=2) -> xr.DataArray:
 def process_variable_pmm(var_data: xr.DataArray, method: int = 2) -> xr.DataArray:
     """
     Process a variable using Probability-Matched Mean method.
-
+    
     Handles datasets with dimensions:
     - 3D variables: (time, lead_time, level, lat, lon, member)
     - 2D variables: (time, lead_time, lat, lon, member)
     """
-
+    
     # Initialize list to collect results across all dimensions
     time_results = []
-
+    
     # Loop over time dimension
     for t in range(var_data.sizes['time']):
         logger.debug(f"Processing time step {t+1}/{var_data.sizes['time']}")
         time_slice = var_data.isel(time=t)
-
-        # Check if level dimension exists (3D vs 2D variable)
-        if 'level' in time_slice.dims:
-            # 3D variable: process each level separately
-            level_results = []
-            for lev in range(time_slice.sizes['level']):
-                level_slice = time_slice.isel(level=lev)
-                # Now we have (lat, lon, member) - ready for PMM
-                pmm_result = compute_PMM(level_slice, method=method)
-                level_results.append(pmm_result)
-
-            # Concatenate results back along level dimension
-            time_pmm = xr.concat(level_results, dim='level')
-        else:
-            # 2D variable: direct PMM computation on (lat, lon, member)
-            time_pmm = compute_PMM(time_slice, method=method)
-
+        
+        # Loop over lead_time dimension
+        lead_time_results = []
+        for lt in range(time_slice.sizes['lead_time']):
+            lead_time_slice = time_slice.isel(lead_time=lt)
+            
+            # Check if level dimension exists (3D vs 2D variable)
+            if 'level' in lead_time_slice.dims:
+                # 3D variable: process each level separately
+                level_results = []
+                for lev in range(lead_time_slice.sizes['level']):
+                    level_slice = lead_time_slice.isel(level=lev)
+                    # Now we have (lat, lon, member) - ready for PMM
+                    pmm_result = compute_PMM(level_slice, method=method)
+                    level_results.append(pmm_result)
+                
+                # Concatenate results back along level dimension
+                lead_time_pmm = xr.concat(level_results, dim='level')
+            else:
+                # 2D variable: direct PMM computation on (lat, lon, member)
+                lead_time_pmm = compute_PMM(lead_time_slice, method=method)
+            
+            lead_time_results.append(lead_time_pmm)
+        
+        # Concatenate results back along lead_time dimension
+        time_pmm = xr.concat(lead_time_results, dim='lead_time')
         time_results.append(time_pmm)
-
+    
     # Concatenate results back along time dimension
     var_processed = xr.concat(time_results, dim='time')
-
+    
     return var_processed
 
 def process_variable_mean(var_data: xr.DataArray) -> xr.DataArray:
@@ -303,34 +315,16 @@ def compute_ensemble_pmm(datetime_str: str,
                         da = process_variable_mean(var_data)
                         da.attrs['processing_method'] = 'ensemble_mean'
 
-                # Ensure time coord/dim exists for downstream writer
-                # Time coordinate is the valid time (init + lead hour)
-                valid_time = np.datetime64(init_datetime) + np.timedelta64(int(h), 'h')
-                if 'time' in da.dims:
-                    da = da.assign_coords(time=[valid_time])
+                # Ensure time and lead_time coords/dims exist for downstream writer
+                # If dims already exist, just set their coordinate values; else expand dims
+                if 'time' in da.dims and 'lead_time' in da.dims:
+                    da = da.assign_coords(time=[np.datetime64(init_datetime)],
+                                          lead_time=[int(h)])
                 else:
-                    da = da.expand_dims({'time': [valid_time]})
-                # CF-1.6 §4.4.1: lead_time dimension coordinate (forecast_period)
-                # and scalar forecast_reference_time.
-                lead_time_attrs = {
-                    "standard_name": "forecast_period",
-                    "long_name": "forecast period",
-                    "units": "hours",
-                }
-                if 'lead_time' in da.dims:
-                    da = da.assign_coords(lead_time=("lead_time", [int(h)], lead_time_attrs))
-                else:
-                    da = da.expand_dims({"lead_time": [int(h)]})
-                    da = da.assign_coords(lead_time=("lead_time", [int(h)], lead_time_attrs))
-                da = da.assign_coords(
-                    forecast_reference_time=xr.DataArray(
-                        np.datetime64(init_datetime, "ns"),
-                        attrs={
-                            "standard_name": "forecast_reference_time",
-                            "long_name": "model initialization time",
-                        },
-                    ),
-                )
+                    da = da.expand_dims({
+                        'time': [np.datetime64(init_datetime)],
+                        'lead_time': [int(h)]
+                    })
                 processed_datasets[var_name] = da
 
             processed_ds = xr.Dataset(processed_datasets)
@@ -344,41 +338,10 @@ def compute_ensemble_pmm(datetime_str: str,
             # Save per-hour NetCDF
             out_nc = os.path.join(output_date_dir, f"hrrrcast_memavg_f{h:02d}.nc")
             logger.info(f"Saving per-hour processed ensemble to: {out_nc}")
-            encoding = {v: {"_FillValue": np.float32(-9999.0)}
-                        for v in processed_ds.data_vars if v != "grid_mapping"}
-            if "latitude" in processed_ds.coords:
-                encoding["latitude"] = {"_FillValue": np.float32(-9999.0)}
-            if "longitude" in processed_ds.coords:
-                encoding["longitude"] = {"_FillValue": np.float32(-9999.0)}
-            # CF-1.6: time as float64 hours since init; level as int32.
-            # CF \u00a72.5.1 forbids _FillValue on coordinate variables.
-            encoding["time"] = {
-                "units": f"hours since {init_datetime.strftime('%Y-%m-%d %H:%M:%S')}",
-                "calendar": "standard",
-                "dtype": "float64",
-                "_FillValue": None,
-            }
-            if "level" in processed_ds.coords:
-                encoding["level"] = {"dtype": "int32", "_FillValue": None}
-            # CF \u00a72.5.1: projection coordinate variables x, y must not have _FillValue.
-            if "x" in processed_ds.coords:
-                encoding["x"] = {"_FillValue": None}
-            if "y" in processed_ds.coords:
-                encoding["y"] = {"_FillValue": None}
-            # CF §2.5.1: coordinate variables must not have _FillValue.
-            if "forecast_reference_time" in processed_ds.coords:
-                encoding["forecast_reference_time"] = {
-                    "units": "hours since 1970-01-01 00:00:00",
-                    "calendar": "standard",
-                    "dtype": "float64",
-                    "_FillValue": None,
-                }
-            if "lead_time" in processed_ds.coords:
-                encoding["lead_time"] = {"dtype": "float32", "_FillValue": None}
-            processed_ds.to_netcdf(out_nc, encoding=encoding)
+            processed_ds.to_netcdf(out_nc)
 
             # Save per-hour GRIB2 for avg
-            converter.save_grib2(init_datetime, h, processed_ds, 'avg', output_date_dir)
+            converter.save_grib2(init_datetime, processed_ds, 'avg', output_date_dir)
 
             # Close datasets to free memory
             ensemble_ds.close()
