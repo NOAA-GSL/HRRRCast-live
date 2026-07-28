@@ -17,7 +17,7 @@ Constants:
 
 Functions:
     linear_beta_schedule, quadratic_beta_schedule, sigmoid_beta_schedule, cosine_beta_schedule
-    forward_noise, compute_epsilon, ddpm, ddim
+    forward_noise, compute_epsilon, ddpm, ddim, ddim_heun, dpmpp_2m
 """
 
 import numpy as np
@@ -32,8 +32,9 @@ USE_VECTORIZED: bool = False
 
 # ==== Diffusion/CRPS step counts ====
 NUM_DIFFUSION_STEPS: int = 200
-NUM_INFERENCE_STEPS: int = 50
-USE_LOGSNR_SPACED: bool = False
+NUM_INFERENCE_STEPS: int = 25
+INFERENCE_STEP_SPACING: str = "uniform"  # "uniform", "logsnr", "powerlaw"
+POWERLAW_GAMMA: float = 0.45
 NUM_CRPS_ENSEMBLES: int = 4
 
 
@@ -111,34 +112,81 @@ ALPHA_BAR: np.ndarray = np.cumprod(ALPHA, axis=0).astype(np.float32)
 SQRT_ALPHA_BAR: np.ndarray = np.sqrt(ALPHA_BAR).astype(np.float32)
 SQRT_ONE_MINUS_ALPHA_BAR: np.ndarray = np.sqrt(1.0 - ALPHA_BAR).astype(np.float32)
 
-# ==== Inference steps computation ====
-def _compute_log_snr_spaced_steps(num_inference_steps: int, num_diffusion_steps: int, alpha_bar: np.ndarray) -> np.ndarray:
+# ==== Inference timestep clustering utilities ====
+def _powerlaw_deltas_to_0(gamma: float) -> np.ndarray:
+    """Compute power-law deltas that sum to T"""
+    T = NUM_DIFFUSION_STEPS - 1
+    n = NUM_INFERENCE_STEPS
+
+    i = np.arange(1, n + 1)
+
+    # power-law weights
+    w = i ** gamma
+
+    # normalize to sum T
+    d = (w / w.sum()) * T
+
+    # integer projection
+    d = np.floor(d).astype(int)
+
+    # ---- FIX 1: ensure no zeros without destroying structure ----
+    # instead of forcing all zeros to 1, track deficit
+    zero_mask = (d == 0)
+    deficit = np.sum(zero_mask)
+    d[zero_mask] = 1
+
+    # ---- FIX 2: renormalize after fixing zeros ----
+    current_sum = np.sum(d)
+    diff = T - current_sum
+
+    # distribute correction across all elements (NOT just last)
+    if diff != 0:
+        # spread adjustment proportionally to weights
+        order = np.argsort(w)[::-1]  # largest weights get priority
+
+        for k in range(abs(diff)):
+            idx = order[k % len(order)]
+            d[idx] += 1 if diff > 0 else -1
+
+            # prevent going below 1
+            if d[idx] < 1:
+                d[idx] = 1
+
+    return d
+
+def _build_timesteps(deltas: np.ndarray) -> np.ndarray:
+    """Build timesteps from deltas via cumsum"""
+    return np.cumsum(deltas).astype(int)
+
+def cluster_to_T(gamma: float = POWERLAW_GAMMA) -> np.ndarray:
+    """Generate power-law clustered timesteps"""
+    d0 = _powerlaw_deltas_to_0(gamma)
+    dT = d0[::-1]
+    return _build_timesteps(dT)
+
+# ==== Log-SNR steps ====
+_LOGSNR_EPS = 1e-10
+_ALPHA_BAR_CLIP = np.clip(ALPHA_BAR, _LOGSNR_EPS, 1.0 - _LOGSNR_EPS)
+LOG_SNR: np.ndarray = np.log(_ALPHA_BAR_CLIP / (1.0 - _ALPHA_BAR_CLIP)).astype(np.float32)
+LOG_SNR_MIN: float = float(np.min(LOG_SNR))
+LOG_SNR_MAX: float = float(np.max(LOG_SNR))
+
+def _compute_log_snr_spaced_steps() -> np.ndarray:
     """
     Compute inference timesteps by evenly spacing the log-SNR values.
     Returns integer timestep indices in ascending order.
     """
-    alpha_bar = np.array(alpha_bar, dtype=np.float64)
-
-    # Clipping is essential to avoid log(0) or log(inf)
-    eps = 1e-10
-    alpha_bar = np.clip(alpha_bar, eps, 1.0 - eps)
-
-    # Compute log-SNR for all timesteps
-    log_snr = np.log(alpha_bar / (1.0 - alpha_bar))
-
-    # Create evenly spaced log-SNR values
-    log_snr_min = np.min(log_snr)
-    log_snr_max = np.max(log_snr)
 
     # Start with more candidates than needed
-    num_candidates = num_inference_steps * 178 // 100
-    target_log_snr = np.linspace(log_snr_max, log_snr_min, num_candidates)
+    num_candidates = NUM_INFERENCE_STEPS * 178 // 100
+    target_log_snr = np.linspace(LOG_SNR_MAX, LOG_SNR_MIN, num_candidates)
 
     # For each target, find the closest actual timestep
     timesteps = []
     for target in target_log_snr:
-        idx = np.argmin(np.abs(log_snr - target))
-        timesteps.append(idx)
+        idx = np.argmin(np.abs(LOG_SNR - target))
+        if idx > 0:  # Exclude t=0
+            timesteps.append(idx)
 
     # Remove duplicates while preserving order
     seen = set()
@@ -147,29 +195,64 @@ def _compute_log_snr_spaced_steps(num_inference_steps: int, num_diffusion_steps:
         if t not in seen:
             unique_timesteps.append(t)
             seen.add(t)
-            if len(unique_timesteps) == num_inference_steps:
+            if len(unique_timesteps) == NUM_INFERENCE_STEPS:
                 break
 
     # If we still don't have enough (shouldn't happen with 2x candidates)
     # fall back to selecting evenly from remaining pool
-    if len(unique_timesteps) < num_inference_steps:
-        remaining = [t for t in range(num_diffusion_steps) if t not in seen]
+    if len(unique_timesteps) < NUM_INFERENCE_STEPS:
+        remaining = [t for t in range(1, NUM_DIFFUSION_STEPS) if t not in seen]  # Exclude t=0
         # Select from remaining based on their log-SNR values
-        remaining_log_snr = [(t, log_snr[t]) for t in remaining]
+        remaining_log_snr = [(t, LOG_SNR[t]) for t in remaining]
         remaining_log_snr.sort(key=lambda x: x[1], reverse=True)
 
         for t, _ in remaining_log_snr:
             unique_timesteps.append(t)
-            if len(unique_timesteps) == num_inference_steps:
+            if len(unique_timesteps) == NUM_INFERENCE_STEPS:
                 break
 
-    return np.array(sorted(unique_timesteps[:num_inference_steps]))
+    steps = np.array(sorted(unique_timesteps[:NUM_INFERENCE_STEPS]), dtype=np.int32)
 
-# Compute inference steps
-if USE_LOGSNR_SPACED:
-    INFERENCE_STEPS = _compute_log_snr_spaced_steps(NUM_INFERENCE_STEPS, NUM_DIFFUSION_STEPS, ALPHA_BAR)
+    # Ensure endpoint coverage without creating a large last-step jump:
+    # if T is missing, insert it and drop earliest interior points so any
+    # spacing distortion is pushed toward small timesteps near 0.
+    T = NUM_DIFFUSION_STEPS - 1
+    if steps[-1] != T:
+        steps = np.unique(np.append(steps, T)).astype(np.int32)
+        excess = len(steps) - NUM_INFERENCE_STEPS
+        if excess > 0:
+            # Keep the first point and trim from early interior indices.
+            steps = np.concatenate([steps[:1], steps[1 + excess:]]).astype(np.int32)
+
+    return steps.astype(np.int32)
+
+# ==== Uniform steps ====
+def _compute_uniform_spaced_steps() -> np.ndarray:
+    """Compute approximately uniform inference timesteps in ascending order."""
+    return np.linspace(
+        NUM_DIFFUSION_STEPS // NUM_INFERENCE_STEPS - 1,
+        NUM_DIFFUSION_STEPS - 1,
+        NUM_INFERENCE_STEPS,
+        dtype=np.int32)
+
+# ==== Power-law steps ====
+def _compute_powerlaw_spaced_steps(gamma: float = POWERLAW_GAMMA) -> np.ndarray:
+    """Compute power-law-clustered timesteps toward T in ascending order."""
+    return cluster_to_T(gamma=gamma).astype(np.int32)
+
+
+# ==== Inference steps computation ====
+if INFERENCE_STEP_SPACING == "logsnr":
+    INFERENCE_STEPS = _compute_log_snr_spaced_steps()
+elif INFERENCE_STEP_SPACING == "uniform":
+    INFERENCE_STEPS = _compute_uniform_spaced_steps()
+elif INFERENCE_STEP_SPACING == "powerlaw":
+    INFERENCE_STEPS = _compute_powerlaw_spaced_steps()
 else:
-    INFERENCE_STEPS = np.arange(0, NUM_DIFFUSION_STEPS, max(1, NUM_DIFFUSION_STEPS // NUM_INFERENCE_STEPS))
+    raise ValueError(
+        f"Unknown INFERENCE_STEP_SPACING={INFERENCE_STEP_SPACING!r}. "
+        "Expected one of: 'uniform', 'logsnr', 'powerlaw'."
+    )
 
 # ==== DDPM diffusion functions ====
 def forward_noise(x_0: tf.Tensor, t: tf.Tensor) -> tf.Tensor:
@@ -223,7 +306,7 @@ def ddpm(x_t: tf.Tensor, pred_noise: tf.Tensor, t_: int, seed: Union[int, list] 
     else:
         seeds = seed
     
-    t = tf.gather(list(INFERENCE_STEPS), t_ - 1)
+    t = tf.gather(list(INFERENCE_STEPS), t_)
     ALPHA_t = tf.gather(ALPHA, t)
     ALPHA_BAR_t = tf.gather(ALPHA_BAR, t)
     BETA_t = tf.gather(BETA, t)
@@ -310,3 +393,82 @@ def ddim(
         x_tm1 = mean
 
     return x_tm1
+
+
+def ddim_heun(
+    x_t: tf.Tensor,
+    pred_noise_t: tf.Tensor,
+    pred_noise_tm1: tf.Tensor,
+    t_: int,
+    seed: Union[int, list] = 0,
+    eta: float = 0.0,
+) -> tf.Tensor:
+    """
+    Second-order DDIM-Heun step using predictor-corrector averaging in noise space.
+    Args:
+        x_t: Current sample at DDIM inference index t_.
+        pred_noise_t: Predicted noise at x_t.
+        pred_noise_tm1: Predicted noise at Euler-predicted x_{t-1}.
+        t_: Inference index (not training timestep index).
+        seed: RNG seed. If int, use for all samples. If list, must match batch_size.
+        eta: DDIM stochasticity parameter.
+    Returns:
+        x_{t-1} after Heun correction.
+    """
+    pred_noise_avg = 0.5 * (pred_noise_t + pred_noise_tm1)
+    return ddim(x_t, pred_noise_avg, t_, seed=seed, eta=eta)
+
+
+def dpmpp_2m(
+    x_t: tf.Tensor,
+    pred_x0_t: tf.Tensor,
+    t_: int,
+    prev_x0: tf.Tensor | None = None,
+    prev_h: tf.Tensor | None = None,
+) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    """
+    DPM-Solver++(2M) multistep update in x0-prediction space.
+
+    Falls back to first-order DPM-Solver++ on the first step (when prev_x0/prev_h
+    are not available), and uses second-order multistep correction afterwards.
+
+    Args:
+        x_t: Current sample at inference index t_.
+        pred_x0_t: Direct x0 prediction from the network at x_t.
+        t_: Inference index (not training timestep index).
+        prev_x0: Previous step x0 prediction (for multistep correction).
+        prev_h: Previous lambda-step size h.
+    Returns:
+        tuple: (x_{t-1}, x0_t, h)
+    """
+    t = tf.gather(list(INFERENCE_STEPS), t_)
+    tm1 = tf.gather(list(INFERENCE_STEPS), t_ - 1)
+
+    alpha_bar_t = tf.gather(ALPHA_BAR, t)
+    alpha_bar_tm1 = tf.gather(ALPHA_BAR, tm1)
+
+    alpha_t = tf.sqrt(alpha_bar_t)
+    alpha_tm1 = tf.sqrt(alpha_bar_tm1)
+    sigma_t = tf.sqrt(1.0 - alpha_bar_t)
+    sigma_tm1 = tf.sqrt(1.0 - alpha_bar_tm1)
+
+    x0_t = pred_x0_t
+
+    lambda_t = tf.math.log(alpha_t + 1e-12) - tf.math.log(sigma_t + 1e-12)
+    lambda_tm1 = tf.math.log(alpha_tm1 + 1e-12) - tf.math.log(sigma_tm1 + 1e-12)
+    h = lambda_tm1 - lambda_t
+
+    sample_coeff = sigma_tm1 / (sigma_t + 1e-12)
+    phi_1 = tf.math.expm1(-h)
+
+    # First-order DPM-Solver++ update.
+    d0 = x0_t
+    x_tm1 = sample_coeff * x_t - alpha_tm1 * phi_1 * d0
+
+    # Second-order multistep correction when previous model output is available.
+    if prev_x0 is not None and prev_h is not None:
+        r = prev_h / (h + 1e-12)
+        d1 = (d0 - prev_x0) / (r + 1e-12)
+        x_tm1 = x_tm1 - 0.5 * alpha_tm1 * phi_1 * d1
+
+    return x_tm1, x0_t, h

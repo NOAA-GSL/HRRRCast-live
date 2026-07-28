@@ -8,7 +8,6 @@ from model output or observational data.
 import numpy as np
 import xarray as xr
 
-
 def get_lcc_grid_params(ds: xr.Dataset, lat_dim: str = "latitude", lon_dim: str = "longitude"):
     """
     Compute Lambert Conformal Conic (LCC) projection grid parameters.
@@ -509,7 +508,7 @@ def compute_wind_gust(ds: xr.Dataset, gust_factor: float = 1.4) -> xr.Dataset:
     v10 = ds["VGRD10M"]
     
     # Compute 10-meter wind speed
-    wind_10m = np.sqrt(u10**2 + v10**2).astype(np.float32)
+    wind_10m = np.hypot(u10, v10).astype(np.float32)
     
     # Method 1: Gust factor method (empirical)
     gust_empirical = (np.float32(gust_factor) * wind_10m).astype(np.float32)
@@ -519,7 +518,7 @@ def compute_wind_gust(ds: xr.Dataset, gust_factor: float = 1.4) -> xr.Dataset:
     if "level" in ds["UGRD"].dims:
         u3d = ds["UGRD"]
         v3d = ds["VGRD"]
-        wind_3d = np.sqrt(u3d**2 + v3d**2).astype(np.float32)
+        wind_3d = np.hypot(u3d, v3d).astype(np.float32)
         
         # Find maximum wind in the column (typically in lowest 3-4 km)
         # Focus on lower atmosphere (pressure > 700 hPa) where gusts are most relevant
@@ -789,9 +788,9 @@ def compute_convective(ds):
     mask6 = (z_agl>=0) & (z_agl<=6000)
     dz = -z_agl.diff("level")
 
-    # fudge factor for maximum relative vorticity and max updraft helicity
+    # fudge factor for maximum relative vorticity and max updraft helicity/velocity
     # to account for max in a 1h window instead of instantaneous value at each lead time
-    FUDGE_FACTOR_VORTICITY = 6
+    FUDGE_FACTOR_MAX = 6
 
     # =====================================================
     # 2. Convert omega -> w
@@ -817,26 +816,21 @@ def compute_convective(ds):
     # =================================================
     # Shear rate (1/s)
     # =================================================
-    def shear_rate(top):
+    u_bot = u.isel(level=-1)
+    v_bot = v.isel(level=-1)
 
-        u_bot = u.isel(level=-1)
-        v_bot = v.isel(level=-1)
+    # Select the highest model level at or below each target AGL depth.
+    # Compute indices to avoid chunked array indexing issues.
+    level_top_idx_1km = mask1.argmax(dim="level").compute()
+    level_top_idx_6km = mask6.argmax(dim="level").compute()
 
-        # Select the level closest to (but not exceeding) the top height
-        z_agl_above = z_agl.where(z_agl <= top)
-        level_top_idx = z_agl_above.argmax(dim="level").compute()
+    def shear_rate(level_top_idx, depth):
         u_top = u.isel(level=level_top_idx)
         v_top = v.isel(level=level_top_idx)
+        return (u_top - u_bot) / depth, (v_top - v_bot) / depth
 
-        du = u_top - u_bot
-        dv = v_top - v_bot
-
-        depth = top  # meters
-
-        return du / depth, dv / depth
-
-    du1, dv1 = shear_rate(1000)
-    du6, dv6 = shear_rate(6000)
+    du1, dv1 = shear_rate(level_top_idx_1km, 1000.0)
+    du6, dv6 = shear_rate(level_top_idx_6km, 6000.0)
 
     # HRRR variable names
     ds["VUCSH_0_1km"] = du1      # U shear rate
@@ -848,7 +842,7 @@ def compute_convective(ds):
     # =====================================================
     # 5. Relative vorticity maximum in lowest 1 km and 2 km AGL
     # =====================================================
-    RELV_max = zeta * FUDGE_FACTOR_VORTICITY
+    RELV_max = zeta * FUDGE_FACTOR_MAX
     ds["RELV_max_0_1km"] = RELV_max.where(mask1).max("level", skipna=True).fillna(0).astype(np.float32)
     ds["RELV_max_0_2km"] = RELV_max.where(mask2).max("level", skipna=True).fillna(0).astype(np.float32)
 
@@ -857,7 +851,7 @@ def compute_convective(ds):
     # =====================================================
     u06, v06 = du6 * 6000, dv6 * 6000
 
-    shear_mag = np.sqrt(u06**2 + v06**2) + 1e-6
+    shear_mag = np.hypot(u06, v06) + 1e-6
 
     right_u =  v06 / shear_mag
     right_v = -u06 / shear_mag
@@ -890,44 +884,44 @@ def compute_convective(ds):
     ds["HLCY_0_1km"] = hlcy.where(mask1_mid).sum("level", skipna=True).astype(np.float32)
     ds["HLCY_0_3km"] = hlcy.where(mask3_mid).sum("level", skipna=True).astype(np.float32)
 
-    ## =====================================================
-    ## 8. Updraft helicity 0-2 km, 0-3 km, 2–5 km
-    ## =====================================================
-    #w_mid    = (w    + w.shift(level=1)   ).isel(level=slice(1, None)) / 2.0
-    #zeta_mid = (zeta + zeta.shift(level=1)).isel(level=slice(1, None)) / 2.0
+    # =====================================================
+    # 8. Updraft helicity 0-2 km, 0-3 km, 2–5 km
+    # =====================================================
+    w_mid    = (w    + w.shift(level=1)   ).isel(level=slice(1, None)) / 2.0
+    zeta_mid = (zeta + zeta.shift(level=1)).isel(level=slice(1, None)) / 2.0
 
-    #mask2_mid   = (z_agl_mid >= 0)    & (z_agl_mid <= 2000)
-    #mask3_mid   = (z_agl_mid >= 0)    & (z_agl_mid <= 3000)
-    #mask2_5_mid = (z_agl_mid >= 2000) & (z_agl_mid <= 5000)
+    mask2_mid   = (z_agl_mid >= 0)    & (z_agl_mid <= 2000)
+    mask3_mid   = (z_agl_mid >= 0)    & (z_agl_mid <= 3000)
+    mask2_5_mid = (z_agl_mid >= 2000) & (z_agl_mid <= 5000)
 
-    #uh_inst = w_mid * zeta_mid * dz
-    #uh_inst = uh_inst * FUDGE_FACTOR_VORTICITY
+    uh_inst = w_mid * zeta_mid * dz
+    uh_inst = uh_inst * FUDGE_FACTOR_MAX
 
-    ## 0-2 km updraft helicity
-    #uh_inst_0_2 = uh_inst.where(mask2_mid)
-    #ds["MXUPHL_max_0_2km"] = uh_inst_0_2.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
-    #ds["MNUPHL_min_0_2km"] = uh_inst_0_2.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    # 0-2 km updraft helicity
+    uh_inst_0_2 = uh_inst.where(mask2_mid)
+    ds["MXUPHL_max_0_2km"] = uh_inst_0_2.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    ds["MNUPHL_min_0_2km"] = uh_inst_0_2.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
 
-    ## 0-3 km updraft helicity
-    #uh_inst_0_3 = uh_inst.where(mask3_mid)
-    #ds["MXUPHL_max_0_3km"] = uh_inst_0_3.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
-    #ds["MNUPHL_min_0_3km"] = uh_inst_0_3.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    # 0-3 km updraft helicity
+    uh_inst_0_3 = uh_inst.where(mask3_mid)
+    ds["MXUPHL_max_0_3km"] = uh_inst_0_3.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    ds["MNUPHL_min_0_3km"] = uh_inst_0_3.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
 
-    ## 2-5 km updraft helicity
-    #uh_inst_2_5 = uh_inst.where(mask2_5_mid)
-    #ds["MXUPHL_max_2_5km"] = uh_inst_2_5.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
-    #ds["MNUPHL_min_2_5km"] = uh_inst_2_5.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    # 2-5 km updraft helicity
+    uh_inst_2_5 = uh_inst.where(mask2_5_mid)
+    ds["MXUPHL_max_2_5km"] = uh_inst_2_5.clip(min=0).sum("level", skipna=True).fillna(0).astype(np.float32)
+    ds["MNUPHL_min_2_5km"] = uh_inst_2_5.clip(max=0).sum("level", skipna=True).fillna(0).astype(np.float32)
 
-    ## =============================================================
-    ## 9. Maximum updraft velocity between 100-1000 mb
-    ## =============================================================
-    #level_hpa = w["level"]
-    #mask_v = (level_hpa >= 100) & (level_hpa <= 1000)
-    #w_layer = w.where(mask_v)
+    # =============================================================
+    # 9. Maximum updraft velocity between 100-1000 mb
+    # =============================================================
+    level_hpa = w["level"]
+    mask_v = (level_hpa >= 100) & (level_hpa <= 1000)
+    w_layer = w.where(mask_v) * FUDGE_FACTOR_MAX
 
-    ## upward/downward vertical velocity maxima/minima in 100-1000 mb layer
-    #ds["MAXUVV_max_100_1000mb"] = w_layer.clip(min=0).max("level", skipna=True).fillna(0).astype(np.float32)
-    #ds["MAXDVV_max_100_1000mb"] = w_layer.clip(max=0).min("level", skipna=True).fillna(0).astype(np.float32)
+    # upward/downward vertical velocity maxima/minima in 100-1000 mb layer
+    ds["MAXUVV_max_100_1000mb"] = w_layer.clip(min=0).max("level", skipna=True).fillna(0).astype(np.float32)
+    ds["MAXDVV_max_100_1000mb"] = w_layer.clip(max=0).min("level", skipna=True).fillna(0).astype(np.float32)
 
     return ds
 
@@ -1003,22 +997,16 @@ def compute_0C_isotherm(ds):
     ds["HGT_0C"] = h_0C.astype(np.float32)
 
     # =====================================================
-    # 3. Interpolate variables to 0°C level
+    # 3. Interpolate variables to 0°C level (precompute, reuse index)
     # =====================================================
-    
-    # Get values at the 0°C level
+    # Get all variables at 0°C level using precomputed index
     u_0C = u.isel(level=level_0C_idx)
     v_0C = v.isel(level=level_0C_idx)
+    
     ds["UGRD_0C"] = u_0C
     ds["VGRD_0C"] = v_0C
-
-    # Wind speed at 0°C level
-    wind_speed_0C = np.sqrt(u_0C**2 + v_0C**2)
-    ds["WIND_0C"] = wind_speed_0C
-
-    # Specific humidity at 0°C level
-    q_0C = q.isel(level=level_0C_idx)
-    ds["SPFH_0C"] = q_0C
+    ds["WIND_0C"] = np.hypot(u_0C, v_0C).astype(np.float32)  # Use hypot instead of sqrt
+    ds["SPFH_0C"] = q.isel(level=level_0C_idx)
 
     # =====================================================
     # 4. Wind shear relative to surface
@@ -1029,25 +1017,24 @@ def compute_0C_isotherm(ds):
 
     du_0C = u_0C - u_sfc
     dv_0C = v_0C - v_sfc
+    
     ds["DU_SFC_0C"] = du_0C
     ds["DV_SFC_0C"] = dv_0C
-
-    shear_mag_0C = np.sqrt(du_0C**2 + dv_0C**2)
-    ds["SHEAR_SFC_0C"] = shear_mag_0C
+    ds["SHEAR_SFC_0C"] = np.hypot(du_0C, dv_0C).astype(np.float32)  # Use hypot instead of sqrt
 
     # =====================================================
     # 5. Relative humidity at 0°C level
     # =====================================================
-    # Saturation vapor pressure at 0°C (hPa)
-    es_0C = 6.112 * np.exp((17.67 * 0) / (0 + 243.5))
+    # Saturation vapor pressure at 0°C (hPa) - constant
+    es_0C = 6.112  # exp(0) = 1, so es_0C = 6.112
     
-    # Pressure at 0°C level from level values
-    p_levels = xr.DataArray(ds.level.values, dims=["level"])  # In hPa
-    p_0C = p_levels.isel(level=level_0C_idx)
+    # Pressure at 0°C level from level coordinate
+    p_0C = ds.level.isel(level=level_0C_idx).astype(np.float32)
     
     # Vapor pressure at 0°C from specific humidity
     # q = (epsilon * e) / (p - (1-epsilon)*e), solve for e
     epsilon = 0.622
+    q_0C = q.isel(level=level_0C_idx)
     e_0C = (q_0C * p_0C) / (epsilon + (1.0 - epsilon) * q_0C)
     
     # Relative humidity at 0°C
@@ -1130,9 +1117,7 @@ def compute_diagnostics(
         ('r2m', compute_r2m),
         ('spfh2m', compute_spfh2m),
         ('pot2m', compute_pot2m),
-        ('mslma', compute_mslma),
         ('pwat', compute_pwat),
-        ('vvel', compute_vvel),
         ('conditional_rain', compute_conditional_rain),
         ('conditional_freezing_rain', compute_conditional_freezing_rain),
         ('wind_gust', compute_wind_gust),

@@ -93,7 +93,7 @@ def download_hrrr_data(datetime_str: str, base_dir: str = "{DATAROOT}/") -> dict
     output_dir = create_output_directory(base_dir, date_str)
     logger.info(f"Output directory: {output_dir}")
     
-    results = {'hrrr': [], 'prev_hour_surface_f01': False}
+    results = {'hrrr': [], 'prev_hour_surface_f01': False, 'prev_hour_pressure_f01': False}
     
     # Download HRRR data
     try:
@@ -121,6 +121,25 @@ def download_hrrr_data(datetime_str: str, base_dir: str = "{DATAROOT}/") -> dict
     except Exception as e:
         logger.error(f"Failed downloading previous hour surface f01 file: {e}")
         results['prev_hour_surface_f01'] = False
+
+    # Also download previous hour cycle's 1h pressure level forecast (wrfprsf01.grib2) for VVEL
+    try:
+        prev_cycle_dt = init_datetime - timedelta(hours=1)
+        _, prev_year, prev_month, prev_day, prev_hour = utils.validate_datetime(prev_cycle_dt.strftime('%Y-%m-%dT%H'))
+        # Keep file naming with original cycle timestamp but store in current output_dir
+        prev_cycle_date = f"{prev_year}{prev_month}{prev_day}"
+        prev_prs_url = f"{Config.HRRR_BASE_URL}/hrrr.{prev_cycle_date}/conus/hrrr.t{prev_hour}z.wrfprsf01.grib2"
+        prev_prs_filename = f"hrrr_{prev_cycle_date}_{prev_hour}_pressure_f01.grib2"
+        prev_prs_path = output_dir / prev_prs_filename
+        if not prev_prs_path.exists():
+            logger.info(f"Downloading previous hour pressure 1h forecast (VVEL source) into current directory from {prev_prs_url}")
+            results['prev_hour_pressure_f01'] = download_file_with_retry(prev_prs_url, str(prev_prs_path))
+        else:
+            logger.info(f"Previous hour pressure 1h forecast already present in current directory: {prev_prs_path}")
+            results['prev_hour_pressure_f01'] = True
+    except Exception as e:
+        logger.error(f"Failed downloading previous hour pressure f01 file: {e}")
+        results['prev_hour_pressure_f01'] = False
     
     return results
 
@@ -155,8 +174,8 @@ Examples:
         )
         
         # Summary
-        total_successful = sum(results['hrrr']) + (1 if results.get('prev_hour_surface_f01') else 0)
-        total_attempted = len(results['hrrr']) + 1
+        total_successful = sum(results['hrrr']) + (1 if results.get('prev_hour_surface_f01') else 0) + (1 if results.get('prev_hour_pressure_f01') else 0)
+        total_attempted = len(results['hrrr']) + 2
 
         logger.info(f"Download summary: {total_successful}/{total_attempted} files successful")
 

@@ -18,12 +18,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import numpy as np
 import tensorflow as tf
 import xarray as xr
 import pandas as pd
-from skimage.exposure import match_histograms
 
 from nc2grib import Netcdf2Grib
 
@@ -40,6 +40,8 @@ from diffusion_params import (
     compute_epsilon,
     ddpm,
     ddim,
+    ddim_heun,
+    dpmpp_2m,
 )
 from transform import (
     inverse_log_transform_array,
@@ -52,6 +54,30 @@ from cf_attributes import apply_cf_attributes
 from compute_pmm import compute_PMM
 
 logger = None
+
+
+def make_noise(
+    anchor_noise: tf.Tensor, hour: int, member_seed: int, rho: float = 0.9
+) -> tf.Tensor:
+    """Generate blended previous-state + hourly innovation noise.
+    
+    Args:
+        anchor_noise: Previous member noise state, shape (1, H, W, C)
+        hour: Lead time hour (used for seed)
+        member_seed: Member ID (used for seed)
+        rho: Blend factor (1.0 = pure anchor, 0.0 = pure innovation)
+    
+    Returns:
+        Tensor same shape as anchor_noise, blended with innovation
+    """
+    sigma = tf.sqrt(tf.constant(1.0 - rho**2, dtype=tf.float32))
+    eps = tf.random.stateless_normal(
+        shape=tf.shape(anchor_noise),
+        dtype=tf.float32,
+        seed=[member_seed, hour],
+    )
+    return rho * anchor_noise + sigma * eps
+
 
 class PreprocessedDataLoader:
     """Handles loading and validation of preprocessed data."""
@@ -180,11 +206,13 @@ class WeatherForecaster:
         members: List[int],
         batch_size: int,
         use_diffusion: bool,
+        lead_hours: int,
         predicted_channels: Optional[int] = None,
         gfs_channels: Optional[int] = None,
         static_channels: Optional[int] = None,
         pmm_alpha: float = 0.65,
-        use_nudging: bool = True,
+        diffusion_sampler: str = "dpmpp-2m",
+        noise_rho: float = 0.9,
     ):
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
@@ -193,8 +221,10 @@ class WeatherForecaster:
         self.members = members
         self.batch_size = batch_size
         self.use_diffusion = use_diffusion
+        self.lead_hours = lead_hours
         self.pmm_alpha = pmm_alpha
-        self.use_nudging = use_nudging and len(members) > 1
+        self.diffusion_sampler = diffusion_sampler
+        self.noise_rho = noise_rho
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
@@ -240,158 +270,34 @@ class WeatherForecaster:
             logger.error(f"Error loading/processing normalization file: {e}")
             raise
 
-        # set member noise for all members
-        self.member_noise = {}
+        # Initialize per-member base noise anchors (on-the-fly generation in predict)
+        logger.info(f"Initializing member anchors for {len(self.members)} members")
+        self.member_anchors: Dict[int, tf.Tensor] = {}
+
+        # Generate the base anchor for each member
         for member in self.members:
             if self.use_diffusion:
-                noise = tf.random.stateless_normal(
+                anchor = tf.random.stateless_normal(
                     shape=(nlat, nlon, self.predicted_channels),
                     dtype=tf.float32,
                     seed=[member, 0]
                 )
-                noise = tf.expand_dims(noise, axis=0)
+                anchor = tf.expand_dims(anchor, axis=0)
             else:
-                noise = tf.random.stateless_uniform(
+                anchor = tf.random.stateless_uniform(
                     shape=(),
                     minval=0.0,
                     maxval=1.0,
                     dtype=tf.float32,
                     seed=[member, 0]
                 )
-                noise = tf.tile(
-                    tf.reshape(noise, (1, 1, 1, 1)),
+                anchor = tf.tile(
+                    tf.reshape(anchor, (1, 1, 1, 1)),
                     [1, nlat, nlon, 1]
                 )
-            self.member_noise[member] = noise
+            self.member_anchors[member] = anchor
 
-    def _compute_pmm_mean(self, member_outputs: Dict[int, np.ndarray], method: int = 2) -> Tuple[np.ndarray, List[int]]:
-        """Compute PMM mean for REFC and APCP channels only.
-
-        Args:
-            member_outputs: Dict mapping member -> array shape (1, H, W, C) or (H, W, C)
-            method: PMM method (1 or 2)
-
-        Returns:
-            Tuple of (pmm_values, channel_indices)
-            - pmm_values: shape (H, W, num_pmm_channels) containing only REFC/APCP
-            - channel_indices: list of channel indices for REFC/APCP
-        """
-        if not member_outputs:
-            raise ValueError("member_outputs is empty; cannot compute PMM")
-
-        # Identify REFC and APCP channel indices
-        pl_vars = self.metadata['pl_vars']
-        sfc_vars = self.metadata['sfc_vars']
-        levels = self.metadata['levels']
-        num_pl_channels = len(pl_vars) * len(levels)
-        
-        pmm_channels = []
-        for var_name in ['REFC', 'APCP']:
-            if var_name in sfc_vars:
-                sfc_idx = sfc_vars.index(var_name)
-                channel_idx = num_pl_channels + sfc_idx
-                pmm_channels.append(channel_idx)
-        
-        if not pmm_channels:
-            # No REFC/APCP channels
-            members_sorted = sorted(member_outputs.keys())
-            first_arr = member_outputs[members_sorted[0]]
-            if first_arr.ndim == 4:
-                first_arr = first_arr[0]
-            ny, nx = first_arr.shape[:2]
-            return np.empty((ny, nx, 0), dtype=first_arr.dtype), []
-        
-        # Stack members for PMM computation
-        members_sorted = sorted(member_outputs.keys())
-        stack_list = []
-        for m in members_sorted:
-            arr = member_outputs[m]
-            if arr.ndim == 4:
-                arr = arr[0]
-            stack_list.append(arr)
-        stack = np.stack(stack_list, axis=0)
-        m_count = stack.shape[0]
-        ny, nx, nchan = stack.shape[1:]
-        
-        # Compute PMM only for REFC and APCP channels
-        pmm_results = []
-        valid_channels = []
-        for c in pmm_channels:
-            if c < nchan:
-                channel_stack = np.transpose(stack[:, :, :, c], (1, 2, 0))
-                da = xr.DataArray(
-                    channel_stack,
-                    dims=("latitude", "longitude", "member"),
-                    coords={
-                        "member": np.arange(m_count),
-                    },
-                )
-                pmm_da = compute_PMM(da, method=method)
-                pmm_results.append(pmm_da.values)
-                valid_channels.append(c)
-        
-        if not pmm_results:
-            return np.empty((ny, nx, 0), dtype=stack.dtype), []
-        
-        # Stack PMM results (H, W, num_pmm_channels)
-        pmm_values = np.stack(pmm_results, axis=-1)
-        logger.debug(f"Computed PMM for channels {valid_channels} (REFC/APCP)")
-        return pmm_values, valid_channels
-
-    def _nudge_members_toward_pmm(
-        self,
-        member_outputs: Dict[int, np.ndarray],
-        pmm_values: np.ndarray,
-        pmm_channels: List[int],
-        alpha: float,
-    ) -> Dict[int, np.ndarray]:
-        """Nudge each member towards PMM mean with histogram matching.
-
-        Only applies nudging to REFC and APCP channels; other channels remain unchanged.
-        Blends: blended = alpha * member + (1 - alpha) * PMM
-        Then applies histogram matching: nudged = match_histograms(blended, member)
-        
-        Args:
-            member_outputs: Dict mapping member -> array shape (1, H, W, C) or (H, W, C)
-            pmm_values: PMM values shape (H, W, num_pmm_channels) for REFC/APCP only
-            pmm_channels: List of channel indices corresponding to pmm_values
-            alpha: Blending factor
-        """
-        if not pmm_channels or pmm_values.shape[-1] == 0:
-            # No nudging needed, return original outputs
-            return member_outputs
-        
-        nudged_outputs: Dict[int, np.ndarray] = {}
-        for member, arr in member_outputs.items():
-            if arr.ndim == 4:
-                arr2 = arr[0]
-            else:
-                arr2 = arr
-            
-            # Start with original member data
-            nudged = arr2.copy()
-            
-            # Apply nudging only to REFC and APCP channels
-            for i, c in enumerate(pmm_channels):
-                if c < arr2.shape[-1] and i < pmm_values.shape[-1]:
-                    # Extract single channel
-                    member_channel = arr2[:, :, c]
-                    pmm_channel = pmm_values[:, :, i]
-                    
-                    # Blend with PMM
-                    blended_channel = alpha * member_channel + (1.0 - alpha) * pmm_channel
-                    
-                    # Apply histogram matching to preserve member's distribution
-                    nudged_channel = match_histograms(blended_channel, member_channel, channel_axis=None)
-                    
-                    # Replace channel in output
-                    nudged[:, :, c] = nudged_channel
-            
-            nudged_outputs[member] = nudged[None, ...]
-        
-        logger.debug(f"Applied nudging to channels {pmm_channels} (REFC/APCP)")
-        return nudged_outputs
-
+        logger.info("Member anchors initialized; noise will be generated on-the-fly during inference")
 
 
     def _init_channel_stats(self, ds_norm: xr.Dataset):
@@ -534,19 +440,12 @@ class WeatherForecaster:
         variables. Safe to call when variables are absent.
         """
         try:
-            applied = []
             for var in self.LOG_TRANSFORM_VARS:
                 if var in ds.variables:
-                    data_arr = ds[var].values
-                    ds[var].values[:] = inverse_log_transform_array(data_arr)
-                    applied.append(var)
+                    ds[var] = inverse_log_transform_array(ds[var])
             for var in self.NEG_LOG_TRANSFORM_VARS:
                 if var in ds.variables:
-                    data_arr = ds[var].values
-                    ds[var].values[:] = inverse_neg_log_transform_array(data_arr)
-                    applied.append(var)
-            if applied:
-                logger.info(f"Applied inverse transforms to: {', '.join(applied)}")
+                    ds[var] = inverse_neg_log_transform_array(ds[var])
         except Exception as e:
             logger.error(f"Failed applying inverse transforms: {e}")
         return ds
@@ -570,6 +469,8 @@ class WeatherForecaster:
         Returns:
             xr.Dataset with dims (time=1, lead_time=1, [level], latitude, longitude)
         """
+        t0 = time.time()
+
         # Denormalize to physical units
         denorm = self.denormalize(forecast_norm)
         # Ensure shape (time=1, Ny, Nx, C)
@@ -613,6 +514,9 @@ class WeatherForecaster:
         # Apply CF-compliant long_name and units to all variables
         ds_hour = apply_cf_attributes(ds_hour, init_datetime=init_datetime)
 
+        build_time = time.time() - t0
+        logger.info(f"Build output dataset in {build_time:.3f}s")
+
         return ds_hour
 
     def write_single_hour_netcdf(
@@ -622,11 +526,13 @@ class WeatherForecaster:
         ds_hour: xr.Dataset,
         output_dir: str,
         member: Union[int, str],
-    ) -> str:
+    ) -> None:
         """Write a NetCDF file for a single lead time.
 
         Returns the output file path.
         """
+        t0 = time.time()
+
         init_year = self.metadata['init_year']
         init_month = self.metadata['init_month']
         init_day = self.metadata['init_day']
@@ -635,9 +541,12 @@ class WeatherForecaster:
         utils.make_directory(f"{output_dir}/{date_str}")
         outdir = Path(f"{output_dir}/{date_str}")
         outdir.mkdir(parents=True, exist_ok=True)
-        mem_str = f"avg" if str(member) == "avg" else f"mem{int(member)}"
+        mem_str = str(member)
+        if mem_str not in {"avg", "spr"}:
+            mem_str = f"m{int(member):02d}"
         nc_path = outdir / f"hrrrcast_{mem_str}_f{hour:02d}.nc"
-        logger.info(f"Saving single-hour NetCDF to {nc_path}")
+
+        # spply CF-compliance encoding
         encoding = {v: {"_FillValue": np.float32(-9999.0)}
                     for v in ds_hour.data_vars if v != "grid_mapping"}
         encoding["latitude"] = {"_FillValue": np.float32(-9999.0)}
@@ -669,7 +578,9 @@ class WeatherForecaster:
         if "lead_time" in ds_hour.coords:
             encoding["lead_time"] = {"dtype": "float32", "_FillValue": None}
         ds_hour.to_netcdf(nc_path, encoding=encoding)
-        return str(nc_path)
+
+        write_time = time.time() - t0
+        logger.info(f"Wrote NetCDF in {write_time:.3f}s : {nc_path}")
 
     def write_single_hour_grib2(
         self,
@@ -684,6 +595,8 @@ class WeatherForecaster:
         Netcdf2Grib iterates over available time points; with a single-hour dataset,
         it will produce only the requested f{hour:02d} product.
         """
+        t0 = time.time()
+
         init_year = self.metadata['init_year']
         init_month = self.metadata['init_month']
         init_day = self.metadata['init_day']
@@ -692,9 +605,23 @@ class WeatherForecaster:
         utils.make_directory(f"{output_dir}/{date_str}")
         outdir = Path(f"{output_dir}/{date_str}")
         outdir.mkdir(parents=True, exist_ok=True)
+        mem_str = str(member)
+        if mem_str not in {"avg", "spr"}:
+            mem_str = f"m{int(member):02d}"
+        grib2_path = outdir / f"hrrrcast.{mem_str}.t{init_datetime.hour:02d}z.pgrb2.f{hour:02d}"
 
         converter = Netcdf2Grib()
-        converter.save_grib2(init_datetime, hour, ds_hour, member, outdir)
+        # Ensure ds_hour has exactly one lead_time equal to 'hour'
+        if 'lead_time' in ds_hour.coords:
+            try:
+                # If needed, overwrite lead_time coord to match the requested hour
+                ds_hour = ds_hour.assign_coords(lead_time=("lead_time", [hour]))
+            except Exception:
+                pass
+        converter.save_grib2(init_datetime, ds_hour, str(grib2_path))
+
+        write_time = time.time() - t0
+        logger.info(f"Wrote GRIB2 in {write_time:.3f}s : {grib2_path}")
 
     def get_variable_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -763,7 +690,8 @@ class WeatherForecaster:
         # version masks
         v4 = (time_coord >= np.datetime64("2021-03-23T00")).astype(np.float32)
         v3 = ((time_coord >= np.datetime64("2018-07-12T00")) & (time_coord < np.datetime64("2021-03-23T00"))).astype(np.float32)
-        # Stack features into shape [B, 6]
+        gfs_v15 = ((time_coord >= np.datetime64("2019-06-01T00")) & (time_coord < np.datetime64("2021-03-23T00"))).astype(np.float32)
+        # Stack features into shape [B, 7]
         features = np.stack([
             np.sin(2 * np.pi * hours / 24.0).astype(np.float32),
             np.cos(2 * np.pi * hours / 24.0).astype(np.float32),
@@ -771,6 +699,7 @@ class WeatherForecaster:
             np.cos(2 * np.pi * doy / 365.0).astype(np.float32),
             v4.astype(np.float32),
             v3.astype(np.float32),
+            gfs_v15.astype(np.float32),
         ], axis=-1)
         return features
 
@@ -780,15 +709,21 @@ class WeatherForecaster:
         def get_encoding_tensor(enc):
             enc = tf.cast(enc, dtype=tf.float32)
             batch_size, lat, lon = tf.shape(enc)[0], self.input_shape[1], self.input_shape[2]
-            enc = tf.reshape(enc, (batch_size, 1, 1, 6))
-            enc = tf.broadcast_to(enc, (batch_size, lat, lon, 6))
+            enc = tf.reshape(enc, (batch_size, 1, 1, 7))
+            enc = tf.broadcast_to(enc, (batch_size, lat, lon, 7))
             return enc
 
         enc = self.compute_time_features(init_times_np, lead_times_np)
         enc = get_encoding_tensor(enc)
         return enc
 
-    def predict(self, model: ForecastModel, X: tf.Tensor, members: Union[int, List[int]]) -> tf.Tensor:
+    def _next_member_noise(self, member: int, hour: int) -> tf.Tensor:
+        """Advance a member's noise state by one hour and return it."""
+        next_noise = make_noise(self.member_anchors[member], hour, member, self.noise_rho)
+        self.member_anchors[member] = next_noise
+        return next_noise
+
+    def predict(self, model: ForecastModel, X: tf.Tensor, members: Union[int, List[int]], hour: int) -> tf.Tensor:
         """Predict using diffusion or CRPS model.
         
         Args:
@@ -796,6 +731,7 @@ class WeatherForecaster:
             X: Input tensor, shape (batch_size, H, W, C)
             members: Single member ID (int) for batch_size=1, or list of member IDs for batch_size>1
                     Length must match batch_size of X.
+            hour: Lead time hour to retrieve noise for
         
         Returns:
             Predicted tensor of shape (batch_size, H, W, predicted_channels)
@@ -804,40 +740,73 @@ class WeatherForecaster:
             num_output_channels = self.predicted_channels
             start = self.predicted_channels + self.gfs_channels
 
-            # Start from complete gaussian noise (per member)
-            Xn_list = [self.member_noise[m] for m in members]
+            # Advance each member's noise state in-order (hour-to-hour correlation)
+            Xn_list = [self._next_member_noise(m, hour) for m in members]
             Xn = tf.concat(Xn_list, axis=0)  # (batch_size, H, W, C)
 
-            # iterate over diffusion steps
-            for t_ in range(NUM_INFERENCE_STEPS - 1):
-                ti = NUM_INFERENCE_STEPS - 1 - t_
-                t = INFERENCE_STEPS[ti]
-
-                # set the correct time embedding
+            def build_diffusion_input(
+                X_in: tf.Tensor,
+                X_noisy: tf.Tensor,
+                step_t: tf.Tensor,
+            ) -> tf.Tensor:
                 step_encoding = tf.fill(
-                    tf.concat([tf.shape(X)[:-1], [1]], axis=0),
-                    tf.cast(t / NUM_DIFFUSION_STEPS, tf.float32),
+                    tf.concat([tf.shape(X_in)[:-1], [1]], axis=0),
+                    tf.cast(step_t / NUM_DIFFUSION_STEPS, X_in.dtype),
                 )
-                X = tf.concat(
+                X_out = tf.concat(
                     [
-                        X[:, :, :, :start],
-                        Xn,
-                        X[:, :, :, start + num_output_channels :-2],
+                        X_in[:, :, :, :start],
+                        X_noisy,
+                        X_in[:, :, :, start + num_output_channels :-2],
                         step_encoding,
-                        X[:, :, :, -1:],
+                        X_in[:, :, :, -1:],
                     ],
                     axis=-1,
                 )
+                return X_out
 
-                # predict total noise
-                x_0 = model.predict(X)
-                epsilon_t = compute_epsilon(Xn, x_0, t)
-                Xn = ddim(Xn, epsilon_t, ti, seed=members)
+            def predict_x0_and_epsilon(
+                X_in: tf.Tensor,
+                X_noisy: tf.Tensor,
+                step_t: tf.Tensor,
+            ) -> tuple[tf.Tensor, tf.Tensor]:
+                X_model = build_diffusion_input(X_in, X_noisy, step_t)
+                x_0_pred = model.predict(X_model)
+                eps = compute_epsilon(X_noisy, x_0_pred, step_t)
+                return x_0_pred, eps
+
+            # iterate over diffusion steps
+            prev_x0 = None
+            prev_h = None
+            for t_ in range(NUM_INFERENCE_STEPS):
+                ti = NUM_INFERENCE_STEPS - 1 - t_
+                t = INFERENCE_STEPS[ti]
+
+                # compute predicted noise epsilon at this step
+                x0_t, epsilon_t = predict_x0_and_epsilon(X, Xn, t)
+
+                # Choose diffusion sampler
+                if ti == 0:
+                    Xn = x0_t
+                else:
+                    if self.diffusion_sampler == "ddim-heun":
+                        x_tm1_pred = ddim(Xn, epsilon_t, ti, seed=members, eta=0.0)
+
+                        tm1 = tf.gather(list(INFERENCE_STEPS), ti - 1)
+                        _, epsilon_tm1 = predict_x0_and_epsilon(X, x_tm1_pred, tm1)
+
+                        Xn = ddim_heun(Xn, epsilon_t, epsilon_tm1, ti, seed=members, eta=0.0)
+                    elif self.diffusion_sampler == "dpmpp-2m":
+                        Xn, prev_x0, prev_h = dpmpp_2m(Xn, x0_t, ti, prev_x0=prev_x0, prev_h=prev_h)
+                    elif self.diffusion_sampler == "ddim":
+                        Xn = ddim(Xn, epsilon_t, ti, seed=members, eta=0.0)
+                    else:
+                        Xn = ddpm(Xn, epsilon_t, ti, seed=members)
 
             return Xn
         else:
-            # set CRPS member (per-member noise)
-            Xn_list = [self.member_noise[m] for m in members]
+            # CRPS branch also advances per-member noise state in-order
+            Xn_list = [self._next_member_noise(m, hour) for m in members]
             Xn = tf.concat(Xn_list, axis=0)  # (batch_size, H, W, C)
             X = tf.concat(
                 [
@@ -853,13 +822,16 @@ class WeatherForecaster:
     def autoregressive_rollout(self, initial_input: np.ndarray, forcing_input: np.ndarray, model: ForecastModel, 
                              target_hour: int,
                              output_dir: Optional[str] = None,
-                             init_datetime: Optional[datetime] = None,
-                             write_per_hour: bool = False) -> Dict[int, Dict]:
+                             init_datetime: Optional[datetime] = None) -> Dict[int, Dict]:
         """Perform greedy autoregressive rollout with overlapped I/O.
 
-        When write_per_hour=True, persist single-hour NetCDF and GRIB2 files for each lead hour,
-        including f00 representing the initial state. I/O is done in background threads to overlap
+        Persist single-hour NetCDF and GRIB2 files for each lead hour, including f00
+        representing the initial state. I/O is done in background threads to overlap
         with forecasting.
+        
+        Uses correlated noise for each lead time: different noise vectors per lead hour
+        but with temporal correlation (rho=0.9 by default) to maintain coherence
+        across the forecast period.
         """
         logger.info(f"Starting autoregressive rollout for {target_hour} hours")
         
@@ -873,61 +845,80 @@ class WeatherForecaster:
 
         start_pred_noise = self.predicted_channels + self.gfs_channels
 
-        # Lazily fetch coordinates if writing outputs per hour
-        lats = lons = None
-        if write_per_hour:
-            lats, lons = self.data_loader_hrrr.get_coordinates()
+        lats, lons = self.data_loader_hrrr.get_coordinates()
 
-        # Local helper to write outputs for any hour using shared context
-        def write_hour_outputs(hour: int, data: np.ndarray, member: int) -> None:
-            """Build dataset and write NetCDF/GRIB2 for a given hour if output context is available."""
-            if not (write_per_hour and output_dir is not None and init_datetime is not None and lats is not None and lons is not None):
-                return
+        # Local helpers to build hourly datasets and fan them out to file writers.
+        def write_hour_nc(hour: int, ds_hour: xr.Dataset, member: int) -> None:
+            """Write NetCDF for a given hour."""
+            try:
+                self.write_single_hour_netcdf(init_datetime, hour, ds_hour, output_dir, member)
+                logger.debug(f"Completed writing NetCDF hour {hour} for member {member}")
+            except Exception as e:
+                logger.error(f"Failed writing NetCDF hour {hour} for member {member}: {e}")
+
+        def write_hour_grib2(hour: int, ds_hour: xr.Dataset, member: int) -> None:
+            """Write GRIB2 for a given hour."""
+            try:
+                self.write_single_hour_grib2(init_datetime, hour, ds_hour, output_dir, member)
+                logger.debug(f"Completed writing GRIB2 hour {hour} for member {member}")
+            except Exception as e:
+                logger.error(f"Failed writing GRIB2 hour {hour} for member {member}: {e}")
+
+        def build_and_submit_hour_outputs(hour: int, data: np.ndarray, member: int) -> None:
+            """Build the dataset in a worker, then submit both file writes."""
             try:
                 ds_hour = self.build_single_hour_dataset(init_datetime, hour, lats, lons, data)
-                _ = self.write_single_hour_netcdf(init_datetime, hour, ds_hour, output_dir, member)
-                self.write_single_hour_grib2(init_datetime, hour, ds_hour, output_dir, member)
-                logger.debug(f"Completed writing hour {hour} for member {member}")
             except Exception as e:
-                logger.error(f"Failed writing hour {hour} outputs for member {member}: {e}")
+                logger.error(f"Failed building dataset for hour {hour} member {member}: {e}")
+                return
 
-        # ThreadPoolExecutor for non-blocking I/O submission
-        # Note: Only 1 worker since the _io_write_lock serializes all writes anyway
-        io_executor = ThreadPoolExecutor(max_workers=1) if write_per_hour else None
-        io_futures = []
+            nc_executor.submit(write_hour_nc, hour, ds_hour, member)
+            grib2_executor.submit(write_hour_grib2, hour, ds_hour, member)
+
+        build_executor = ThreadPoolExecutor(max_workers=len(self.members))
+        nc_executor = ThreadPoolExecutor(max_workers=1) # Serial: HDF5 not thread safe
+        grib2_executor = ThreadPoolExecutor(max_workers=len(self.members)) # Parallel: locked in save_grib2()
+        build_futures = []
+
+        # Semaphore to limit pending build tasks and prevent OOM from too many queued forecasts
+        max_pending_builds = 8
+        build_semaphore = threading.Semaphore(max_pending_builds)
+        
+        def submit_with_backpressure(hour: int, data_tensor: tf.Tensor, member: int) -> None:
+            """Submit build task with semaphore-based backpressure control.
+            The tensor->numpy copy happens AFTER semaphore acquisition to prevent
+            memory buildup when the queue is full.
+            """
+            build_semaphore.acquire()  # Block if queue is full
+            data = data_tensor.numpy()  # Copy from GPU to CPU only after semaphore acquired
+            future = build_executor.submit(build_and_submit_hour_outputs, hour, data, member)
+            future.add_done_callback(lambda _: build_semaphore.release())  # Release when done
+            build_futures.append(future)
 
         # Write out hour 0 (f00) products representing the initial state for each member
-        hour0_outputs: Dict[int, np.ndarray] = {
-            member: state_from_hour[member].numpy().copy() for member in self.members
-        }
-        if self.use_nudging:
-            pmm0_values, pmm0_channels = self._compute_pmm_mean(hour0_outputs)
-            nudged_hour0 = self._nudge_members_toward_pmm(hour0_outputs, pmm0_values, pmm0_channels, self.pmm_alpha)
-        else:
-            nudged_hour0 = hour0_outputs
         for member in self.members:
-            if io_executor:
-                future = io_executor.submit(write_hour_outputs, 0, nudged_hour0[member], member)
-                io_futures.append(future)
-            else:
-                write_hour_outputs(0, nudged_hour0[member], member)
+            submit_with_backpressure(0, state_from_hour[member], member)
 
         # phase shift of GFS forcing input
         num_members = self.num_members
         members_sorted = list(range(num_members))
-        half_count = num_members // 2  # Half count for symmetry
-        step = 1.0 / (half_count + (num_members % 2))  # Adjust step for odd/even
+        half_count = (num_members // 2 - ((num_members + 1) % 2)) # Half count for symmetry
+        step = 1.0 / half_count if half_count > 0 else 0.0
         seq = []
-        if num_members % 2 == 1:  # Add zero phase shift for odd
+        seq.append(0.0)  # Always include zero phase shift for the first member
+        if num_members % 2 == 0:
             seq.append(0.0)
         for i in range(half_count):
             seq.append(step * (i + 1))  # Positive phase shifts
             seq.append(-step * (i + 1))  # Negative phase shifts
         phase_angle = {member: seq[i] for i, member in enumerate(members_sorted)}
 
+        # rollout hour
+        rollout_hour = 6
+
         # Process all hourly steps
         for hour in range(1, target_hour + 1):
-            from_hour = ((hour - 1) // 6) * 6
+            from_hour = ((hour - 1) // rollout_hour) * rollout_hour
             step = hour - from_hour
             logger.info(f"Forecasting hour {hour:2d}: from hour {from_hour:2d} using step {step}h")
 
@@ -941,7 +932,7 @@ class WeatherForecaster:
             # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
             X_base = tf.concat(
                 [
-                    X[:, :, :, start_pred_noise:-8],
+                    X[:, :, :, start_pred_noise:-(7 + 2)],
                     date_encoding,
                     X[:, :, :, -2:-1],
                     lead_encoding,
@@ -951,7 +942,6 @@ class WeatherForecaster:
 
             # Process members in batches
             batch_size = self.batch_size
-            hour_member_outputs: Dict[int, np.ndarray] = {}
             for batch_start in range(0, len(self.members), batch_size):
                 batch_end = min(batch_start + batch_size, len(self.members))
                 batch_members_list = self.members[batch_start:batch_end]
@@ -980,9 +970,9 @@ class WeatherForecaster:
                 # Stack batch inputs
                 X_batch = tf.concat(batch_X_members, axis=0)
                 
-                # Predict next-hour fields for entire batch
+                # Predict next-hour fields for entire batch using hour-specific noise
                 t0 = time.time()
-                y_batch = self.predict(model, X_batch, batch_members_list)
+                y_batch = self.predict(model, X_batch, batch_members_list, hour=hour)
                 predict_time = time.time() - t0
                 logger.info(f"Hour {hour}, batch {batch_start//batch_size + 1}: predict took {predict_time:.3f}s")
                 
@@ -998,37 +988,24 @@ class WeatherForecaster:
                     
                     # When we reach a 6-hour boundary, update the reference 
                     # state for this member
-                    if hour % 6 == 0:
+                    if hour % rollout_hour == 0:
                         state_from_hour[member] = y
-                    hour_member_outputs[member] = y.numpy().copy()
 
-            # Compute PMM mean for this hour and nudge members before writing (if enabled)
-            if self.use_nudging:
-                pmm_values, pmm_channels = self._compute_pmm_mean(hour_member_outputs)
-                nudged_outputs = self._nudge_members_toward_pmm(
-                    hour_member_outputs, pmm_values, pmm_channels, self.pmm_alpha
-                )
-            else:
-                nudged_outputs = hour_member_outputs
+                    # Store the output for this hour and member, then submit write task
+                    submit_with_backpressure(hour, y, member)  # Pass tensor, not numpy array
 
-            # Write out per-hour products asynchronously after all members computed
-            for member in self.members:
-                if io_executor:
-                    future = io_executor.submit(write_hour_outputs, hour, nudged_outputs[member], member)
-                    io_futures.append(future)
-                else:
-                    write_hour_outputs(hour, nudged_outputs[member], member)
-
-        # Wait for all I/O operations to complete
-        if io_executor:
-            logger.info(f"Waiting for {len(io_futures)} I/O operations to complete...")
-            for future in as_completed(io_futures):
-                try:
-                    future.result()  # Raise any exceptions that occurred
-                except Exception as e:
-                    logger.error(f"I/O operation failed: {e}")
-            io_executor.shutdown(wait=True)
-            logger.info("All I/O operations completed")
+        # Wait for all background work to complete. Build tasks must drain first so
+        # they cannot submit into executors that are already shutting down.
+        logger.info(f"Waiting for {len(build_futures)} background build operations to complete...")
+        for future in as_completed(build_futures):
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Background build operation failed: {e}")
+        build_executor.shutdown(wait=True)
+        nc_executor.shutdown(wait=True)
+        grib2_executor.shutdown(wait=True)
+        logger.info("All background output operations completed")
 
         logger.info("Autoregressive rollout completed")
 
@@ -1144,7 +1121,6 @@ class WeatherForecaster:
                 lead_hours,
                 output_dir=output_dir,
                 init_datetime=init_datetime,
-                write_per_hour=True,
             )
             logger.info("Forecast completed successfully (per-hour outputs written during rollout)")
         except Exception as e:
@@ -1180,8 +1156,8 @@ def parse_arguments():
                        help="Logging level")
     parser.add_argument("--pmm_alpha", type=float, default=0.7,
                         help="Nudge factor toward PMM mean for member outputs (0..1)")
-    parser.add_argument("--no_nudging", default=False, action="store_true",
-                        help="Disable nudging (member perturbation toward consensus)")
+    parser.add_argument("--noise_rho", type=float, default=0.9,
+                        help="Noise blend/correlation parameter (0..1)")
     
     return parser.parse_args()
 
@@ -1232,7 +1208,7 @@ def main():
 
         nlat = model_input_hrrr.shape[1]
         nlon = model_input_hrrr.shape[2]
-        date_channel = np.ones((1, nlat, nlon, 6), dtype=model_input_hrrr.dtype)
+        date_channel = np.ones((1, nlat, nlon, 7), dtype=model_input_hrrr.dtype)
         lead_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
         step_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
 
@@ -1266,11 +1242,12 @@ def main():
         forecaster = WeatherForecaster(data_loader_hrrr, data_loader_gfs,
                                         args.num_members, members,
                                         args.batch_size, not args.no_diffusion,
+                                        args.lead_hours,
                                         predicted_channels=predicted_channels,
                                         gfs_channels=gfs_channels,
                                         static_channels=static_channels,
                                         pmm_alpha=args.pmm_alpha,
-                                        use_nudging=not args.no_nudging)
+                                        noise_rho=args.noise_rho)
         run_weather_forecast(
             forecaster, model, args.lead_hours, model_input, args.output_dir
         )

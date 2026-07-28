@@ -133,6 +133,36 @@ class GRIBPreprocessor:
             normalized_vals, raw_vals = [], []
             logger.info("Processing pressure level variables with per-variable normalization...")
 
+            # Attempt to load previous hour 1h pressure forecast file (downloaded alongside analysis) for VVEL replacement
+            prev_vvel_vals = {}  # dict mapping level_idx to VVEL values
+            try:
+                base_name = os.path.basename(pres_file)  # hrrr_YYYYMMDD_HH_pressure.grib2
+                parts = base_name.split('_')
+                if len(parts) >= 4:
+                    ymd = parts[1]
+                    hh = parts[2]
+                    cur_dt = datetime.strptime(ymd+hh, "%Y%m%d%H")
+                    prev_dt = cur_dt - timedelta(hours=1)
+                    prev_ymd = prev_dt.strftime("%Y%m%d")
+                    prev_hh = prev_dt.strftime("%H")
+                    f01_name = f"hrrr_{prev_ymd}_{prev_hh}_pressure_f01.grib2"
+                    f01_path = os.path.join(os.path.dirname(pres_file), f01_name)
+                    if os.path.exists(f01_path):
+                        try:
+                            grbs_prev = pg.open(f01_path)
+                            w_msgs = grbs_prev.select(shortName='w', level=self.config.levels)
+                            if w_msgs:
+                                for l_idx, w_msg in enumerate(w_msgs):
+                                    prev_vvel_vals[l_idx] = w_msg.values[::self.config.downsample_factor, ::self.config.downsample_factor]
+                                logger.info(f"Loaded VVEL from previous hour forecast file {f01_name} ({len(prev_vvel_vals)} levels)")
+                            grbs_prev.close()
+                        except Exception as e:
+                            logger.warning(f"Failed reading previous hour forecast VVEL from {f01_path}: {e}")
+                    else:
+                        logger.warning(f"Previous hour VVEL forecast file not found: {f01_name}")
+            except Exception as e:
+                logger.warning(f"Error preparing previous hour VVEL replacement: {e}")
+
             for var in varnames:
                 norm_name = grib_to_norm[var]
                 if norm_name not in ds_norm.variables:
@@ -153,6 +183,11 @@ class GRIBPreprocessor:
                     except Exception as e:
                         logger.warning(f"Failed reading data for {var} level index {l_idx}: {e}")
                         continue
+
+                    # Always prefer previous hour 1h forecast VVEL if available
+                    if var == "w" and l_idx in prev_vvel_vals:
+                        logger.info(f"Using previous hour 1h forecast VVEL at level index {l_idx} (replacing analysis VVEL)")
+                        vals = prev_vvel_vals[l_idx]
 
                     # Store raw (pre-transform) values
                     raw_vals.append(vals)
@@ -273,6 +308,7 @@ class GRIBPreprocessor:
                 # Clean / transform as needed
                 if var == "REFC":
                     vals = np.maximum(vals, 0)
+
                 # Always prefer previous hour 1h accumulation APCP if available
                 if var == "APCP" and prev_apcp_vals is not None:
                     logger.info("Using previous hour 1h forecast APCP values (replacing analysis APCP)")

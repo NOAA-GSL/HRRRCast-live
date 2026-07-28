@@ -24,6 +24,8 @@ Notes/assumptions:
 
 import os
 import subprocess
+import time
+import threading
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
@@ -124,6 +126,9 @@ GRIB_PARAM_MAP = {
 
 
 class Netcdf2Grib:
+    # Class-level lock for grib2io operations (g2c library may not be thread-safe)
+    _grib2io_lock = threading.Lock()
+
     def __init__(self, section3: Optional[np.ndarray] = None, pdtn_default: int = 0, drtn_default: int = 3):
         self.section3 = self._resolve_section3(section3)
         self.pdtn_default = pdtn_default
@@ -353,7 +358,7 @@ class Netcdf2Grib:
         _, _, _, surface_type, surface_value = GRIB_PARAM_MAP[var_name]
         return surface_type, surface_value
 
-    def save_grib2(self, forecast_starttime: datetime, ds_hour: xr.Dataset, member, outdir: str) -> None:
+    def save_grib2(self, forecast_starttime: datetime, ds_hour: xr.Dataset, output_path: str) -> None:
         """Write a single-hour GRIB2 file from an xarray.Dataset using grib2io.
 
         ds_hour is expected to have dims (time=1, lead_time=1, [level], y, x) and contain
@@ -365,19 +370,11 @@ class Netcdf2Grib:
         except Exception:
             lead = 0
 
-        cycle = forecast_starttime.hour
-        if member == "avg":
-            outfile = os.path.join(outdir, f"hrrrcast.avg.t{cycle:02d}z.pgrb2.f{lead:02d}")
-        else:
-            outfile = os.path.join(outdir, f"hrrrcast.m{int(member):02d}.t{cycle:02d}z.pgrb2.f{lead:02d}")
+        outfile = output_path
 
-        # Remove existing file if present
-        if os.path.isfile(outfile):
-            os.remove(outfile)
-
-        # Open GRIB2 file for writing
-        g2 = grib2io.open(outfile, mode="w")
-        logger.info(f"Writing GRIB2: {outfile}")
+        # Prepare all messages outside the lock (parallel-safe operations)
+        # This includes dataset iteration, numpy operations, and message building
+        messages_to_write = []
 
         try:
             # Ensure y,x dims exist (rename from latitude/longitude if needed)
@@ -415,8 +412,7 @@ class Netcdf2Grib:
                         else:
                             vals2d = vals
                         msg.data = np.asarray(vals2d)
-                        msg.pack()
-                        g2.write(msg)
+                        messages_to_write.append(msg)
                 else:
                     msg = self._build_message(var_name, forecast_starttime, lead, surface_type=surface_type, surface_value=surface_value)
                     vals = np.squeeze(da.values)
@@ -427,19 +423,38 @@ class Netcdf2Grib:
                     else:
                         vals2d = np.squeeze(vals)
                     msg.data = np.asarray(vals2d)
-                    msg.pack()
-                    g2.write(msg)
+                    messages_to_write.append(msg)
         except Exception as e:
-            logger.warning("Error writing GRIB messages: %s", e)
+            logger.warning("Error preparing GRIB messages: %s", e)
+            return
 
-        g2.close()
+        # Now serialize the grib2io operations (g2c library may not be thread-safe)
+        with self._grib2io_lock:
+            # Remove existing file if present
+            if os.path.isfile(outfile):
+                os.remove(outfile)
+
+            # Open GRIB2 file for writing
+            g2 = grib2io.open(outfile, mode="w")
+
+            try:
+                # Write all prepared messages
+                for msg in messages_to_write:
+                    msg.pack()  # g2c packing may use global state
+                    g2.write(msg)
+            except Exception as e:
+                logger.warning("Error writing GRIB messages: %s", e)
+            finally:
+                g2.close()
 
         # Optionally create an index via wgrib2 if available
         try:
             wgrib2 = os.environ.get("WGRIB2", "wgrib2")
             idxfile = f"{outfile}.idx"
+            t0 = time.time()
             with open(idxfile, "w") as f_out:
                 subprocess.run([wgrib2, "-s", outfile], stdout=f_out, check=True)
-            logger.info(f"Index created: {idxfile}")
+            t1 = time.time()
+            logger.info(f"Index created in {t1 - t0:.2f}s: {idxfile}")
         except Exception as e:
             logger.warning(f"Skipping index creation with wgrib2: {e}")
