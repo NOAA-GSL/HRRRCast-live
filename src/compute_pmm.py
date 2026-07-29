@@ -37,7 +37,7 @@ import time
 import utils
 
 from nc2grib import Netcdf2Grib
-from cf_attributes import get_cf_encoding
+from cf_attributes import get_cf_encoding, apply_cf_attributes
 
 # Configure logging
 logging.basicConfig(
@@ -331,55 +331,16 @@ def compute_ensemble_pmm(datetime_str: str,
                     spread_da = process_variable_spread(var_data)
                     spread_da.attrs['processing_method'] = 'ensemble_spread_stddev'
 
-                # CF-1.6 §4.4.1: lead_time dimension coordinate (forecast_period)
-                # and scalar forecast_reference_time.
-                lead_time_attrs = {
-                    "standard_name": "forecast_period",
-                    "long_name": "forecast period",
-                    "units": "hours",
-                }
-                forecast_ref_attrs = {
-                    "standard_name": "forecast_reference_time",
-                    "long_name": "model initialization time",
-                }
-                # Create forecast_reference_time as a scalar DataArray
-                forecast_reference_time = xr.DataArray(
-                    np.datetime64(init_datetime, "ns"),
-                    attrs=forecast_ref_attrs,
-                )
-
-                # Ensure time and lead_time coords/dims exist for downstream writer
-                # If dims already exist, just set their coordinate values; else expand dims
-                if 'time' in da.dims and 'lead_time' in da.dims:
-                    da = da.assign_coords(time=[np.datetime64(init_datetime)],
-                                          lead_time=[int(h)])
-                    da['lead_time'].attrs.update(lead_time_attrs)
-                else:
-                    da = da.expand_dims({
-                        'time': [np.datetime64(init_datetime)],
-                        'lead_time': [int(h)]
-                    })
-                    da['lead_time'].attrs.update(lead_time_attrs)
-
-                if 'time' in spread_da.dims and 'lead_time' in spread_da.dims:
-                    spread_da = spread_da.assign_coords(time=[np.datetime64(init_datetime)],
-                                                        lead_time=[int(h)])
-                    spread_da['lead_time'].attrs.update(lead_time_attrs)
-                else:
-                    spread_da = spread_da.expand_dims({
-                        'time': [np.datetime64(init_datetime)],
-                        'lead_time': [int(h)]
-                    })
-                    spread_da['lead_time'].attrs.update(lead_time_attrs)
-
-                da = da.assign_coords(forecast_reference_time=forecast_reference_time)
-                spread_da = spread_da.assign_coords(forecast_reference_time=forecast_reference_time)
-
                 processed_datasets[var_name] = da
                 spread_datasets[var_name] = spread_da
 
             processed_ds = xr.Dataset(processed_datasets)
             spread_ds = xr.Dataset(spread_datasets)
+
+            # Apply CF attributes
+            processed_ds = apply_cf_attributes(processed_ds, init_datetime=init_datetime)
+            spread_ds = apply_cf_attributes(spread_ds, init_datetime=init_datetime)
+
             # Copy attributes and annotate
             processed_ds.attrs = ensemble_ds.attrs.copy()
             processed_ds.attrs['postprocessing_method'] = 'PMM for REFC/APCP, mean for others'

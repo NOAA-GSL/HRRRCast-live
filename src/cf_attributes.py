@@ -90,6 +90,54 @@ CF_ATTRS = {
 }
 
 
+# CF-compliant coordinate attributes for standard forecast dimensions
+CF_COORD_ATTRS = {
+    "time": {
+        "standard_name": "time",
+        "long_name": "time",
+        "axis": "T",
+    },
+    "lead_time": {
+        "standard_name": "forecast_period",
+        "long_name": "forecast period",
+        "units": "hours",
+    },
+    "level": {
+        "standard_name": "air_pressure",
+        "long_name": "pressure level",
+        "units": "hPa",
+        "positive": "down",
+        "axis": "Z",
+    },
+    "latitude": {
+        "standard_name": "latitude",
+        "long_name": "latitude",
+        "units": "degrees_north",
+    },
+    "longitude": {
+        "standard_name": "longitude",
+        "long_name": "longitude",
+        "units": "degrees_east",
+    },
+    "forecast_reference_time": {
+        "standard_name": "forecast_reference_time",
+        "long_name": "model initialization time",
+    },
+    "x": {
+        "standard_name": "projection_x_coordinate",
+        "long_name": "x coordinate of projection",
+        "units": "m",
+        "axis": "X",
+    },
+    "y": {
+        "standard_name": "projection_y_coordinate",
+        "long_name": "y coordinate of projection",
+        "units": "m",
+        "axis": "Y",
+    },
+}
+
+
 def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
     """Apply CF-1.6 metadata to a HRRRCast dataset.
 
@@ -159,23 +207,13 @@ def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
         nx = ds.sizes["x"]
         x_vals = ((np.arange(nx, dtype=np.float64) - (nx - 1) / 2.0) * HRRR_DX_M)
         ds = ds.assign_coords(
-            x=("x", x_vals, {
-                "standard_name": "projection_x_coordinate",
-                "long_name": "x coordinate of projection",
-                "units": "m",
-                "axis": "X",
-            }),
+            x=("x", x_vals, CF_COORD_ATTRS["x"]),
         )
     if "y" in ds.dims and "y" not in ds.coords:
         ny = ds.sizes["y"]
         y_vals = ((np.arange(ny, dtype=np.float64) - (ny - 1) / 2.0) * HRRR_DX_M)
         ds = ds.assign_coords(
-            y=("y", y_vals, {
-                "standard_name": "projection_y_coordinate",
-                "long_name": "y coordinate of projection",
-                "units": "m",
-                "axis": "Y",
-            }),
+            y=("y", y_vals, CF_COORD_ATTRS["y"]),
         )
 
     # Global attributes

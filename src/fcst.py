@@ -50,7 +50,7 @@ from transform import (
 import utils
 from utils import setup_logging
 from diagnostics import compute_diagnostics
-from cf_attributes import apply_cf_attributes, get_cf_encoding
+from cf_attributes import apply_cf_attributes, get_cf_encoding, CF_COORD_ATTRS
 from compute_pmm import compute_PMM
 
 logger = None
@@ -490,18 +490,10 @@ class WeatherForecaster:
                     const_4d,
                     dims=("time", "lead_time", "latitude", "longitude"),
                     coords={
-                        "time": ("time", valid_times,
-                                 {"standard_name": "time", "long_name": "time", "axis": "T"}),
-                        "lead_time": ("lead_time", lead_times,
-                                      {"standard_name": "forecast_period",
-                                       "long_name": "forecast period",
-                                       "units": "hours"}),
-                        "latitude": (("latitude", "longitude"), lats,
-                                     {"standard_name": "latitude", "long_name": "latitude",
-                                      "units": "degrees_north"}),
-                        "longitude": (("latitude", "longitude"), lons,
-                                      {"standard_name": "longitude", "long_name": "longitude",
-                                       "units": "degrees_east"}),
+                        "time": ("time", valid_times, CF_COORD_ATTRS["time"]),
+                        "lead_time": ("lead_time", lead_times, CF_COORD_ATTRS["lead_time"]),
+                        "latitude": (("latitude", "longitude"), lats, CF_COORD_ATTRS["latitude"]),
+                        "longitude": (("latitude", "longitude"), lons, CF_COORD_ATTRS["longitude"]),
                     },
                     name=cname,
                 )
@@ -1007,41 +999,6 @@ class WeatherForecaster:
         # Compute valid times for all forecast steps
         valid_times = [init_datetime + timedelta(hours=int(t)) for t in lead_times]
 
-        # CF-1.6 attributes for the coordinate variables. The 2D latitude/longitude
-        # arrays are auxiliary coordinates on a Lambert Conformal grid; the 1D
-        # dimensions of the same name carry the projection x/y axes.
-        time_attrs = {
-            "standard_name": "time",
-            "long_name": "time",
-            "axis": "T",
-        }
-        lead_time_attrs = {
-            "standard_name": "forecast_period",
-            "long_name": "forecast period",
-            "units": "hours",
-        }
-        level_attrs = {
-            "standard_name": "air_pressure",
-            "long_name": "pressure level",
-            "units": "hPa",
-            "positive": "down",
-            "axis": "Z",
-        }
-        lat_attrs = {
-            "standard_name": "latitude",
-            "long_name": "latitude",
-            "units": "degrees_north",
-        }
-        lon_attrs = {
-            "standard_name": "longitude",
-            "long_name": "longitude",
-            "units": "degrees_east",
-        }
-        forecast_ref_attrs = {
-            "standard_name": "forecast_reference_time",
-            "long_name": "model initialization time",
-        }
-
         # Pressure-level variables: (time, lead_time, level, latitude, longitude)
         for pl_var in pl_vars:
             pl_data = np.transpose(data[..., var_index:var_index+len(levels)], (0, 3, 1, 2))
@@ -1051,11 +1008,11 @@ class WeatherForecaster:
                 pl_data,
                 dims=("time", "lead_time", "level", "latitude", "longitude"),
                 coords={
-                    "time": ("time", valid_times, time_attrs),
-                    "lead_time": ("lead_time", lead_times, lead_time_attrs),
-                    "level": ("level", levels, level_attrs),
-                    "latitude": (("latitude", "longitude"), lats, lat_attrs),
-                    "longitude": (("latitude", "longitude"), lons, lon_attrs),
+                    "time": ("time", valid_times, CF_COORD_ATTRS["time"]),
+                    "lead_time": ("lead_time", lead_times, CF_COORD_ATTRS["lead_time"]),
+                    "level": ("level", levels, CF_COORD_ATTRS["level"]),
+                    "latitude": (("latitude", "longitude"), lats, CF_COORD_ATTRS["latitude"]),
+                    "longitude": (("latitude", "longitude"), lons, CF_COORD_ATTRS["longitude"]),
                 },
                 name=pl_var
             )
@@ -1070,10 +1027,10 @@ class WeatherForecaster:
                 sfc_data,
                 dims=("time", "lead_time", "latitude", "longitude"),
                 coords={
-                    "time": ("time", valid_times, time_attrs),
-                    "lead_time": ("lead_time", lead_times, lead_time_attrs),
-                    "latitude": (("latitude", "longitude"), lats, lat_attrs),
-                    "longitude": (("latitude", "longitude"), lons, lon_attrs),
+                    "time": ("time", valid_times, CF_COORD_ATTRS["time"]),
+                    "lead_time": ("lead_time", lead_times, CF_COORD_ATTRS["lead_time"]),
+                    "latitude": (("latitude", "longitude"), lats, CF_COORD_ATTRS["latitude"]),
+                    "longitude": (("latitude", "longitude"), lons, CF_COORD_ATTRS["longitude"]),
                 },
                 name=sfc_var
             )
@@ -1085,7 +1042,7 @@ class WeatherForecaster:
         ds = ds.assign_coords(
             forecast_reference_time=xr.DataArray(
                 np.datetime64(init_datetime, "ns"),
-                attrs=forecast_ref_attrs,
+                attrs=CF_COORD_ATTRS["forecast_reference_time"],
             ),
         )
 
