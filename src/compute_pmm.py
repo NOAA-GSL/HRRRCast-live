@@ -129,8 +129,8 @@ def process_variable_pmm(var_data: xr.DataArray, method: int = 2) -> xr.DataArra
     Process a variable using Probability-Matched Mean method.
     
     Handles datasets with dimensions:
-    - 3D variables: (time, lead_time, level, lat, lon, member)
-    - 2D variables: (time, lead_time, lat, lon, member)
+    - 3D variables: (lead_time, time, level, lat, lon, member)
+    - 2D variables: (lead_time, time, lat, lon, member)
     """
     
     # Initialize list to collect results across all dimensions
@@ -178,8 +178,8 @@ def process_variable_mean(var_data: xr.DataArray) -> xr.DataArray:
     Process a variable using standard ensemble mean.
     
     Simply computes the mean across the member dimension, preserving all other dimensions:
-    - 3D variables: (time, lead_time, level, lat, lon, member) -> (time, lead_time, level, lat, lon)
-    - 2D variables: (time, lead_time, lat, lon, member) -> (time, lead_time, lat, lon)
+    - 3D variables: (lead_time, time, level, lat, lon, member) -> (lead_time, time, level, lat, lon)
+    - 2D variables: (lead_time, time, lat, lon, member) -> (lead_time, time, lat, lon)
     """
     processed_var = var_data.mean(dim='member')
     return processed_var

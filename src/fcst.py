@@ -467,7 +467,7 @@ class WeatherForecaster:
             forecast_norm: normalized model output for this hour, shape (1, Ny, Nx, C)
 
         Returns:
-            xr.Dataset with dims (time=1, lead_time=1, [level], latitude, longitude)
+            xr.Dataset with dims (lead_time=1, time=1, [level], latitude, longitude)
         """
         t0 = time.time()
 
@@ -485,13 +485,13 @@ class WeatherForecaster:
             raw_key = f"{cname}_raw"
             if hasattr(self.data_loader_hrrr, "data") and raw_key in self.data_loader_hrrr.data.files and cname not in ds_hour:
                 cvals = self.data_loader_hrrr.data[raw_key].astype(np.float32)
-                const_4d = np.tile(cvals[None, None, :, :], (1, len(lead_times), 1, 1))
+                const_4d = np.tile(cvals[None, None, :, :], (len(lead_times), 1, 1, 1))
                 ds_hour[cname] = xr.DataArray(
                     const_4d,
-                    dims=("time", "lead_time", "latitude", "longitude"),
+                    dims=("lead_time", "time", "latitude", "longitude"),
                     coords={
-                        "time": ("time", valid_times, CF_COORD_ATTRS["time"]),
                         "lead_time": ("lead_time", lead_times, CF_COORD_ATTRS["lead_time"]),
+                        "time": ("time", valid_times, CF_COORD_ATTRS["time"]),
                         "latitude": (("latitude", "longitude"), lats, CF_COORD_ATTRS["latitude"]),
                         "longitude": (("latitude", "longitude"), lons, CF_COORD_ATTRS["longitude"]),
                     },
@@ -999,17 +999,18 @@ class WeatherForecaster:
         # Compute valid times for all forecast steps
         valid_times = [init_datetime + timedelta(hours=int(t)) for t in lead_times]
 
-        # Pressure-level variables: (time, lead_time, level, latitude, longitude)
+        # Pressure-level variables: (lead_time, time, level, latitude, longitude)
+        # CF conventions: non-standard dimensions (lead_time) come before T, Z, Y, X
         for pl_var in pl_vars:
             pl_data = np.transpose(data[..., var_index:var_index+len(levels)], (0, 3, 1, 2))
-            # Add lead_time dimension
-            pl_data = np.expand_dims(pl_data, axis=1)
+            # Add lead_time dimension at axis 0 (leftmost position)
+            pl_data = np.expand_dims(pl_data, axis=0)
             data_vars[pl_var] = xr.DataArray(
                 pl_data,
-                dims=("time", "lead_time", "level", "latitude", "longitude"),
+                dims=("lead_time", "time", "level", "latitude", "longitude"),
                 coords={
-                    "time": ("time", valid_times, CF_COORD_ATTRS["time"]),
                     "lead_time": ("lead_time", lead_times, CF_COORD_ATTRS["lead_time"]),
+                    "time": ("time", valid_times, CF_COORD_ATTRS["time"]),
                     "level": ("level", levels, CF_COORD_ATTRS["level"]),
                     "latitude": (("latitude", "longitude"), lats, CF_COORD_ATTRS["latitude"]),
                     "longitude": (("latitude", "longitude"), lons, CF_COORD_ATTRS["longitude"]),
@@ -1018,17 +1019,18 @@ class WeatherForecaster:
             )
             var_index += len(levels)
 
-        # Surface variables: (time, lead_time, latitude, longitude)
+        # Surface variables: (lead_time, time, latitude, longitude)
+        # CF conventions: non-standard dimensions (lead_time) come before T, Y, X
         for sfc_var in sfc_vars:
             sfc_data = data[..., var_index]
-            # Add lead_time dimension
-            sfc_data = np.expand_dims(sfc_data, axis=1)
+            # Add lead_time dimension at axis 0 (leftmost position)
+            sfc_data = np.expand_dims(sfc_data, axis=0)
             data_vars[sfc_var] = xr.DataArray(
                 sfc_data,
-                dims=("time", "lead_time", "latitude", "longitude"),
+                dims=("lead_time", "time", "latitude", "longitude"),
                 coords={
-                    "time": ("time", valid_times, CF_COORD_ATTRS["time"]),
                     "lead_time": ("lead_time", lead_times, CF_COORD_ATTRS["lead_time"]),
+                    "time": ("time", valid_times, CF_COORD_ATTRS["time"]),
                     "latitude": (("latitude", "longitude"), lats, CF_COORD_ATTRS["latitude"]),
                     "longitude": (("latitude", "longitude"), lons, CF_COORD_ATTRS["longitude"]),
                 },

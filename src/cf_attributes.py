@@ -1,11 +1,15 @@
 """
 CF (Climate and Forecast) metadata conventions for HRRRCast output.
 
-This module centralizes everything related to CF-1.6 metadata: the
-per-variable ``long_name``/``units`` table (:data:`CF_ATTRS`) and the
+This module centralizes everything related to CF-1.6 metadata and GRIB2 encoding:
+the per-variable metadata table (:data:`VARIABLE_METADATA`) containing both CF
+attributes (long_name/units) and GRIB2 encoding parameters, plus the
 :func:`apply_cf_attributes` helper that annotates a HRRRCast dataset with
 the grid mapping, projection coordinates, and global attributes required
 by the CF conventions.
+
+The consolidated :data:`VARIABLE_METADATA` dictionary ensures consistency between
+NetCDF (CF-1.6) and GRIB2 outputs by maintaining all variable metadata in one place.
 """
 
 from datetime import datetime
@@ -14,79 +18,368 @@ import numpy as np
 import xarray as xr
 
 
-# CF-compliant long_name and units for all model output and diagnostic variables
-CF_ATTRS = {
+# Consolidated metadata for all model output and diagnostic variables
+# Each entry contains:
+#   - long_name: CF-compliant descriptive name
+#   - units: CF-compliant units string
+#   - grib2: (discipline, category, number, surface_type, surface_value) for GRIB2 encoding
+VARIABLE_METADATA = {
     # Pressure-level variables
-    "UGRD":             {"long_name": "U-component of wind",                           "units": "m s-1"},
-    "VGRD":             {"long_name": "V-component of wind",                           "units": "m s-1"},
-    "VVEL":             {"long_name": "Vertical velocity (pressure coordinate)",        "units": "Pa s-1"},
-    "TMP":              {"long_name": "Temperature",                                    "units": "K"},
-    "HGT":              {"long_name": "Geopotential height",                            "units": "m"},
-    "SPFH":             {"long_name": "Specific humidity",                              "units": "kg kg-1"},
+    "UGRD": {
+        "long_name": "U-component of wind",
+        "units": "m s-1",
+        "grib2": (0, 2, 2, 100, None),
+    },
+    "VGRD": {
+        "long_name": "V-component of wind",
+        "units": "m s-1",
+        "grib2": (0, 2, 3, 100, None),
+    },
+    "VVEL": {
+        "long_name": "Vertical velocity (pressure coordinate)",
+        "units": "Pa s-1",
+        "grib2": (0, 2, 8, 100, None),
+    },
+    "TMP": {
+        "long_name": "Temperature",
+        "units": "K",
+        "grib2": (0, 0, 0, 100, None),
+    },
+    "HGT": {
+        "long_name": "Geopotential height",
+        "units": "m",
+        "grib2": (0, 3, 5, 100, None),
+    },
+    "SPFH": {
+        "long_name": "Specific humidity",
+        "units": "kg kg-1",
+        "grib2": (0, 1, 0, 100, None),
+    },
     # Surface variables
-    "PRES":             {"long_name": "Surface pressure",                               "units": "Pa"},
-    "MSLMA":            {"long_name": "Mean sea level pressure (MAPS reduction)",       "units": "Pa"},
-    "REFC":             {"long_name": "Composite reflectivity",                         "units": "dBZ"},
-    "T2M":              {"long_name": "2-meter temperature",                            "units": "K"},
-    "UGRD10M":          {"long_name": "U-component of 10-meter wind",                  "units": "m s-1"},
-    "VGRD10M":          {"long_name": "V-component of 10-meter wind",                  "units": "m s-1"},
-    "UGRD80M":          {"long_name": "U-component of 80-meter wind",                  "units": "m s-1"},
-    "VGRD80M":          {"long_name": "V-component of 80-meter wind",                  "units": "m s-1"},
-    "D2M":              {"long_name": "2-meter dew point temperature",                  "units": "K"},
-    "TCDC":             {"long_name": "Total cloud cover",                              "units": "%"},
-    "LCDC":             {"long_name": "Low-level cloud cover",                          "units": "%"},
-    "MCDC":             {"long_name": "Mid-level cloud cover",                          "units": "%"},
-    "HCDC":             {"long_name": "High-level cloud cover",                         "units": "%"},
-    "VIS":              {"long_name": "Visibility",                                     "units": "m"},
-    "APCP":             {"long_name": "Total precipitation",                            "units": "kg m-2"},
-    "HGTCC":            {"long_name": "Convective cloud top height",                    "units": "m"},
-    "CAPE":             {"long_name": "Convective available potential energy",           "units": "J kg-1"},
-    "CIN":              {"long_name": "Convective inhibition",                          "units": "J kg-1"},
+    "PRES": {
+        "long_name": "Surface pressure",
+        "units": "Pa",
+        "grib2": (0, 3, 0, 1, None),
+    },
+    "MSLMA": {
+        "long_name": "Mean sea level pressure (MAPS reduction)",
+        "units": "Pa",
+        "grib2": (0, 3, 198, 101, None),
+    },
+    "REFC": {
+        "long_name": "Composite reflectivity",
+        "units": "dBZ",
+        "grib2": (0, 16, 196, 10, None),
+    },
+    "T2M": {
+        "long_name": "2-meter temperature",
+        "units": "K",
+        "grib2": (0, 0, 0, 103, 2.0),
+    },
+    "UGRD10M": {
+        "long_name": "U-component of 10-meter wind",
+        "units": "m s-1",
+        "grib2": (0, 2, 2, 103, 10.0),
+    },
+    "VGRD10M": {
+        "long_name": "V-component of 10-meter wind",
+        "units": "m s-1",
+        "grib2": (0, 2, 3, 103, 10.0),
+    },
+    "UGRD80M": {
+        "long_name": "U-component of 80-meter wind",
+        "units": "m s-1",
+        "grib2": (0, 2, 2, 103, 80.0),
+    },
+    "VGRD80M": {
+        "long_name": "V-component of 80-meter wind",
+        "units": "m s-1",
+        "grib2": (0, 2, 3, 103, 80.0),
+    },
+    "D2M": {
+        "long_name": "2-meter dew point temperature",
+        "units": "K",
+        "grib2": (0, 0, 6, 103, 2.0),
+    },
+    "TCDC": {
+        "long_name": "Total cloud cover",
+        "units": "%",
+        "grib2": (0, 6, 1, 10, None),
+    },
+    "LCDC": {
+        "long_name": "Low-level cloud cover",
+        "units": "%",
+        "grib2": (0, 6, 3, 214, None),
+    },
+    "MCDC": {
+        "long_name": "Mid-level cloud cover",
+        "units": "%",
+        "grib2": (0, 6, 4, 224, None),
+    },
+    "HCDC": {
+        "long_name": "High-level cloud cover",
+        "units": "%",
+        "grib2": (0, 6, 5, 234, None),
+    },
+    "VIS": {
+        "long_name": "Visibility",
+        "units": "m",
+        "grib2": (0, 19, 0, 1, None),
+    },
+    "APCP": {
+        "long_name": "Total precipitation",
+        "units": "kg m-2",
+        "grib2": (0, 1, 8, 1, None),
+    },
+    "HGTCC": {
+        "long_name": "Convective cloud top height",
+        "units": "m",
+        "grib2": (0, 3, 5, 215, None),
+    },
+    "CAPE": {
+        "long_name": "Convective available potential energy",
+        "units": "J kg-1",
+        "grib2": (0, 7, 6, 1, None),
+    },
+    "CIN": {
+        "long_name": "Convective inhibition",
+        "units": "J kg-1",
+        "grib2": (0, 7, 7, 1, None),
+    },
     # Constant/static fields
-    "LAND":             {"long_name": "Land-sea mask",                                  "units": "1"},
-    "OROG":             {"long_name": "Surface orography",                              "units": "m"},
+    "LAND": {
+        "long_name": "Land-sea mask",
+        "units": "1",
+        "grib2": (2, 0, 0, 1, None),
+    },
+    "OROG": {
+        "long_name": "Surface orography",
+        "units": "m",
+        "grib2": (0, 3, 5, 1, None),
+    },
     # Surface diagnostics
-    "R2M":              {"long_name": "Relative humidity at 2 m",                       "units": "%"},
-    "SPFH2M":           {"long_name": "Specific humidity at 2 m",                       "units": "kg kg-1"},
-    "POT2M":            {"long_name": "Potential temperature at 2 m",                   "units": "K"},
+    "R2M": {
+        "long_name": "Relative humidity at 2 m",
+        "units": "%",
+        "grib2": (0, 1, 1, 103, 2.0),
+    },
+    "SPFH2M": {
+        "long_name": "Specific humidity at 2 m",
+        "units": "kg kg-1",
+        "grib2": (0, 1, 0, 103, 2.0),
+    },
+    "POT2M": {
+        "long_name": "Potential temperature at 2 m",
+        "units": "K",
+        "grib2": (0, 0, 2, 103, 2.0),
+    },
     # Column-integrated
-    "PWAT":             {"long_name": "Precipitable water",                             "units": "kg m-2"},
+    "PWAT": {
+        "long_name": "Precipitable water",
+        "units": "kg m-2",
+        "grib2": (0, 1, 3, 10, None),
+    },
     # Precipitation diagnostics
-    "CRAIN":            {"long_name": "Conditional rain rate",                          "units": "kg m-2"},
-    "RAIN_MASK":        {"long_name": "Rain occurrence mask",                           "units": "1"},
-    "RAIN_FRACTION":    {"long_name": "Rain area fraction",                             "units": "1"},
-    "CFRZR":            {"long_name": "Conditional freezing rain rate",                 "units": "kg m-2"},
-    "FRZR_MASK":        {"long_name": "Freezing rain occurrence mask",                  "units": "1"},
-    "FRZR_FRACTION":    {"long_name": "Freezing rain area fraction",                    "units": "1"},
-    "WARM_LAYER_DEPTH": {"long_name": "Warm layer depth above surface",                 "units": "hPa"},
-    "COLD_LAYER_DEPTH": {"long_name": "Cold layer depth near surface",                  "units": "hPa"},
+    "CRAIN": {
+        "long_name": "Conditional rain rate",
+        "units": "kg m-2",
+        "grib2": (0, 1, 33, 1, None),
+    },
+    "RAIN_MASK": {
+        "long_name": "Rain occurrence mask",
+        "units": "1",
+    },
+    "RAIN_FRACTION": {
+        "long_name": "Rain area fraction",
+        "units": "1",
+    },
+    "CFRZR": {
+        "long_name": "Conditional freezing rain rate",
+        "units": "kg m-2",
+        "grib2": (0, 1, 34, 1, None),
+    },
+    "FRZR_MASK": {
+        "long_name": "Freezing rain occurrence mask",
+        "units": "1",
+    },
+    "FRZR_FRACTION": {
+        "long_name": "Freezing rain area fraction",
+        "units": "1",
+    },
+    "WARM_LAYER_DEPTH": {
+        "long_name": "Warm layer depth above surface",
+        "units": "hPa",
+    },
+    "COLD_LAYER_DEPTH": {
+        "long_name": "Cold layer depth near surface",
+        "units": "hPa",
+    },
     # Wind diagnostics
-    "GUST":             {"long_name": "Wind gust speed",                                "units": "m s-1"},
-    "GUST_FACTOR":      {"long_name": "Empirical gust factor estimate",                 "units": "m s-1"},
-    "GUST_CONV":        {"long_name": "Convective gust estimate",                       "units": "m s-1"},
-    "WIND_10M":         {"long_name": "10-meter wind speed",                            "units": "m s-1"},
-    "WIND_MAX":         {"long_name": "Maximum wind speed in lower atmospheric column", "units": "m s-1"},
+    "GUST": {
+        "long_name": "Wind gust speed",
+        "units": "m s-1",
+        "grib2": (0, 2, 22, 1, None),
+    },
+    "GUST_FACTOR": {
+        "long_name": "Empirical gust factor estimate",
+        "units": "m s-1",
+    },
+    "GUST_CONV": {
+        "long_name": "Convective gust estimate",
+        "units": "m s-1",
+    },
+    "WIND_10M": {
+        "long_name": "10-meter wind speed",
+        "units": "m s-1",
+        "grib2": (0, 2, 1, 103, 10.0),
+    },
+    "WIND_MAX": {
+        "long_name": "Maximum wind speed in lower atmospheric column",
+        "units": "m s-1",
+    },
     # Convective diagnostics
-    "VUCSH_0_1km":      {"long_name": "U-component wind shear rate 0-1 km AGL",        "units": "s-1"},
-    "VVCSH_0_1km":      {"long_name": "V-component wind shear rate 0-1 km AGL",        "units": "s-1"},
-    "VUCSH_0_6km":      {"long_name": "U-component wind shear rate 0-6 km AGL",        "units": "s-1"},
-    "VVCSH_0_6km":      {"long_name": "V-component wind shear rate 0-6 km AGL",        "units": "s-1"},
-    "RELV_max_0_1km":   {"long_name": "Maximum relative vorticity 0-1 km AGL",         "units": "s-1"},
-    "RELV_max_0_2km":   {"long_name": "Maximum relative vorticity 0-2 km AGL",         "units": "s-1"},
-    "USTM_0_6km":       {"long_name": "U-component of storm motion 0-6 km (Bunkers)",  "units": "m s-1"},
-    "VSTM_0_6km":       {"long_name": "V-component of storm motion 0-6 km (Bunkers)",  "units": "m s-1"},
-    "HLCY_0_1km":       {"long_name": "Storm-relative helicity 0-1 km AGL",            "units": "m2 s-2"},
-    "HLCY_0_3km":       {"long_name": "Storm-relative helicity 0-3 km AGL",            "units": "m2 s-2"},
+    "VUCSH_0_1km": {
+        "long_name": "U-component wind shear rate 0-1 km AGL",
+        "units": "s-1",
+        "grib2": (0, 2, 15, 103, (1000.0, 0.0)),
+    },
+    "VVCSH_0_1km": {
+        "long_name": "V-component wind shear rate 0-1 km AGL",
+        "units": "s-1",
+        "grib2": (0, 2, 16, 103, (1000.0, 0.0)),
+    },
+    "VUCSH_0_6km": {
+        "long_name": "U-component wind shear rate 0-6 km AGL",
+        "units": "s-1",
+        "grib2": (0, 2, 15, 103, (6000.0, 0.0)),
+    },
+    "VVCSH_0_6km": {
+        "long_name": "V-component wind shear rate 0-6 km AGL",
+        "units": "s-1",
+        "grib2": (0, 2, 16, 103, (6000.0, 0.0)),
+    },
+    "RELV_max_0_1km": {
+        "long_name": "Maximum relative vorticity 0-1 km AGL",
+        "units": "s-1",
+        "grib2": (0, 2, 12, 103, (1000.0, 0.0)),
+    },
+    "RELV_max_0_2km": {
+        "long_name": "Maximum relative vorticity 0-2 km AGL",
+        "units": "s-1",
+        "grib2": (0, 2, 12, 103, (2000.0, 0.0)),
+    },
+    "USTM_0_6km": {
+        "long_name": "U-component of storm motion 0-6 km (Bunkers)",
+        "units": "m s-1",
+        "grib2": (0, 2, 194, 103, (0.0, 6000.0)),
+    },
+    "VSTM_0_6km": {
+        "long_name": "V-component of storm motion 0-6 km (Bunkers)",
+        "units": "m s-1",
+        "grib2": (0, 2, 195, 103, (0.0, 6000.0)),
+    },
+    "HLCY_0_1km": {
+        "long_name": "Storm-relative helicity 0-1 km AGL",
+        "units": "m2 s-2",
+        "grib2": (0, 7, 8, 103, (1000.0, 0.0)),
+    },
+    "HLCY_0_3km": {
+        "long_name": "Storm-relative helicity 0-3 km AGL",
+        "units": "m2 s-2",
+        "grib2": (0, 7, 8, 103, (3000.0, 0.0)),
+    },
+    # Diagnostic fields - updraft helicity
+    "MXUPHL_max_0_2km": {
+        "long_name": "Maximum updraft helicity 0-2 km AGL",
+        "units": "m2 s-2",
+        "grib2": (0, 7, 199, 103, (2000.0, 0.0)),
+    },
+    "MNUPHL_min_0_2km": {
+        "long_name": "Minimum updraft helicity 0-2 km AGL",
+        "units": "m2 s-2",
+        "grib2": (0, 7, 200, 103, (2000.0, 0.0)),
+    },
+    "MXUPHL_max_0_3km": {
+        "long_name": "Maximum updraft helicity 0-3 km AGL",
+        "units": "m2 s-2",
+        "grib2": (0, 7, 199, 103, (3000.0, 0.0)),
+    },
+    "MNUPHL_min_0_3km": {
+        "long_name": "Minimum updraft helicity 0-3 km AGL",
+        "units": "m2 s-2",
+        "grib2": (0, 7, 200, 103, (3000.0, 0.0)),
+    },
+    "MXUPHL_max_2_5km": {
+        "long_name": "Maximum updraft helicity 2-5 km AGL",
+        "units": "m2 s-2",
+        "grib2": (0, 7, 199, 103, (5000.0, 2000.0)),
+    },
+    "MNUPHL_min_2_5km": {
+        "long_name": "Minimum updraft helicity 2-5 km AGL",
+        "units": "m2 s-2",
+        "grib2": (0, 7, 200, 103, (5000.0, 2000.0)),
+    },
+    # Diagnostic fields - vertical velocity extrema
+    "MAXUVV_max_100_1000mb": {
+        "long_name": "Maximum upward vertical velocity 100-1000 hPa",
+        "units": "Pa s-1",
+        "grib2": (0, 2, 220, 100, (10000.0, 100000.0)),
+    },
+    "MAXDVV_max_100_1000mb": {
+        "long_name": "Maximum downward vertical velocity 100-1000 hPa",
+        "units": "Pa s-1",
+        "grib2": (0, 2, 221, 100, (10000.0, 100000.0)),
+    },
     # 0 degC isotherm diagnostics
-    "HGT_0C":           {"long_name": "Height AGL at the 0 degC isotherm",             "units": "m"},
-    "UGRD_0C":          {"long_name": "U-component of wind at 0 degC isotherm",        "units": "m s-1"},
-    "VGRD_0C":          {"long_name": "V-component of wind at 0 degC isotherm",        "units": "m s-1"},
-    "WIND_0C":          {"long_name": "Wind speed at 0 degC isotherm",                 "units": "m s-1"},
-    "SPFH_0C":          {"long_name": "Specific humidity at 0 degC isotherm",          "units": "kg kg-1"},
-    "DU_SFC_0C":        {"long_name": "U-component wind shear surface to 0 degC isotherm", "units": "m s-1"},
-    "DV_SFC_0C":        {"long_name": "V-component wind shear surface to 0 degC isotherm", "units": "m s-1"},
-    "SHEAR_SFC_0C":     {"long_name": "Wind shear magnitude surface to 0 degC isotherm", "units": "m s-1"},
-    "RH_0C":            {"long_name": "Relative humidity at 0 degC isotherm",          "units": "%"},
+    "HGT_0C": {
+        "long_name": "Height AGL at the 0 degC isotherm",
+        "units": "m",
+        "grib2": (0, 3, 5, 4, None),
+    },
+    "UGRD_0C": {
+        "long_name": "U-component of wind at 0 degC isotherm",
+        "units": "m s-1",
+        "grib2": (0, 2, 2, 4, None),
+    },
+    "VGRD_0C": {
+        "long_name": "V-component of wind at 0 degC isotherm",
+        "units": "m s-1",
+        "grib2": (0, 2, 3, 4, None),
+    },
+    "WIND_0C": {
+        "long_name": "Wind speed at 0 degC isotherm",
+        "units": "m s-1",
+        "grib2": (0, 2, 1, 4, None),
+    },
+    "SPFH_0C": {
+        "long_name": "Specific humidity at 0 degC isotherm",
+        "units": "kg kg-1",
+        "grib2": (0, 1, 0, 4, None),
+    },
+    "DU_SFC_0C": {
+        "long_name": "U-component wind shear surface to 0 degC isotherm",
+        "units": "m s-1",
+    },
+    "DV_SFC_0C": {
+        "long_name": "V-component wind shear surface to 0 degC isotherm",
+        "units": "m s-1",
+    },
+    "SHEAR_SFC_0C": {
+        "long_name": "Wind shear magnitude surface to 0 degC isotherm",
+        "units": "m s-1",
+    },
+    "RH_0C": {
+        "long_name": "Relative humidity at 0 degC isotherm",
+        "units": "%",
+        "grib2": (0, 1, 1, 4, None),
+    },
+}
+
+
+# Derived dictionary for backward compatibility: CF attributes only
+CF_ATTRS = {
+    var: {k: v for k, v in meta.items() if k in ["long_name", "units"]}
+    for var, meta in VARIABLE_METADATA.items()
 }
 
 
