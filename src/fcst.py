@@ -479,13 +479,14 @@ class WeatherForecaster:
         times = [hour]
         ds_hour = self.create_xarray_dataset(init_datetime, times, lats, lons, denorm)
 
-        # Inject constants if present in preprocessed NPZ
+        # Inject constants if present in preprocessed NPZ (repeat across lead_time length 1)
         for cname in ["LAND", "OROG"]:
             raw_key = f"{cname}_raw"
             if hasattr(self.data_loader_hrrr, "data") and raw_key in self.data_loader_hrrr.data.files and cname not in ds_hour:
                 cvals = self.data_loader_hrrr.data[raw_key].astype(np.float32)
+                const_4d = np.tile(cvals[None, None, :, :], (1, len(times), 1, 1))
                 ds_hour[cname] = xr.DataArray(
-                    cvals[None, None, :, :],
+                    const_4d,
                     dims=("time", "lead_time", "latitude", "longitude"),
                     coords={
                         "time": ("time", [init_datetime + timedelta(hours=hour)],
