@@ -35,6 +35,7 @@ except ImportError:
 # Local imports
 import utils
 from utils import setup_logging
+from cf_attributes import VARIABLE_METADATA
 
 logger = None
 
@@ -67,79 +68,6 @@ class ForecastPlotterConfig:
         self.figure_size = (12, 8)
         self.dpi = 300
         self.cmap_default = 'viridis'
-        
-        # Variable-specific plotting parameters
-        # Expanded variable configs (surface + pressure)
-        self.var_configs = {
-            # Pressure-level
-            'UGRD':   {'cmap': 'RdBu_r',    'units': 'm/s',   'long_name': 'U-component of Wind'},
-            'VGRD':   {'cmap': 'RdBu_r',    'units': 'm/s',   'long_name': 'V-component of Wind'},
-            'VVEL':   {'cmap': 'RdBu_r',    'units': 'Pa/s',  'long_name': 'Vertical Velocity'},
-            'TMP':    {'cmap': 'coolwarm',  'units': 'K',     'long_name': 'Temperature'},
-            'HGT':    {'cmap': 'terrain',   'units': 'm',     'long_name': 'Geopotential Height'},
-            'SPFH':   {'cmap': 'Blues',     'units': 'kg/kg', 'long_name': 'Specific Humidity'},
-            # Surface
-            'PRES':    {'cmap': 'viridis',  'units': 'Pa',    'long_name': 'Surface Pressure'},
-            'MSLMA':   {'cmap': 'viridis',  'units': 'Pa',    'long_name': 'Mean Sea Level Pressure'},
-            'REFC':    {'cmap': 'pyart_NWSRef', 'units': 'dBZ','long_name': 'Composite Reflectivity'},
-            'T2M':     {'cmap': 'coolwarm', 'units': 'K',     'long_name': '2m Temperature'},
-            'UGRD10M': {'cmap': 'RdBu_r',   'units': 'm/s',   'long_name': '10m U Wind'},
-            'VGRD10M': {'cmap': 'RdBu_r',   'units': 'm/s',   'long_name': '10m V Wind'},
-            'UGRD80M': {'cmap': 'RdBu_r',   'units': 'm/s',   'long_name': '80m U Wind'},
-            'VGRD80M': {'cmap': 'RdBu_r',   'units': 'm/s',   'long_name': '80m V Wind'},
-            'D2M':     {'cmap': 'coolwarm', 'units': 'K',     'long_name': '2m Dewpoint'},
-            'R2M':     {'cmap': 'YlGnBu',   'units': '%',     'long_name': '2m Relative Humidity'},
-            'SPFH2M':  {'cmap': 'Blues',    'units': 'kg/kg', 'long_name': '2m Specific Humidity'},
-            'POT2M':   {'cmap': 'coolwarm','units': 'K',     'long_name': '2m Potential Temperature'},
-            'TCDC':    {'cmap': 'Greys',    'units': 'frac',  'long_name': 'Total Cloud Cover'},
-            'LCDC':    {'cmap': 'Blues',    'units': 'frac',  'long_name': 'Low Cloud Cover'},
-            'MCDC':    {'cmap': 'Greens',   'units': 'frac',  'long_name': 'Medium Cloud Cover'},
-            'HCDC':    {'cmap': 'Reds',     'units': 'frac',  'long_name': 'High Cloud Cover'},
-            'VIS':     {'cmap': 'plasma_r', 'units': 'm',     'long_name': 'Visibility'},
-            'APCP':    {'cmap': 'Blues',    'units': 'mm',    'long_name': 'Accumulated Precipitation'},
-            'HGTCC':   {'cmap': 'cividis',  'units': 'm',     'long_name': 'Cloud Ceiling Height'},
-            'CAPE':    {'cmap': 'Spectral_r','units': 'J/kg', 'long_name': 'CAPE'},
-            'CIN':     {'cmap': 'PuOr',     'units': 'J/kg',  'long_name': 'CIN'},
-            'PWAT':    {'cmap': 'YlGnBu',   'units': 'mm',    'long_name': 'Precipitable Water'},
-            'CRAIN':   {'cmap': 'Blues',    'units': 'mm',    'long_name': 'Conditional Rain Rate'},
-            'RAIN_MASK': {'cmap': 'Greys',  'units': '1',     'long_name': 'Rain Mask'},
-            'CFRZR':   {'cmap': 'PuBu',     'units': 'mm',    'long_name': 'Conditional Freezing Rain Rate'},
-            'FRZR_MASK': {'cmap': 'Greys',  'units': '1',     'long_name': 'Freezing Rain Mask'},
-            'WARM_LAYER_DEPTH': {'cmap': 'YlOrRd', 'units': 'hPa', 'long_name': 'Warm Layer Depth'},
-            'COLD_LAYER_DEPTH': {'cmap': 'PuBuGn', 'units': 'hPa', 'long_name': 'Cold Layer Depth'},
-            'GUST':    {'cmap': 'viridis',  'units': 'm/s',   'long_name': 'Wind Gust'},
-            'GUST_FACTOR': {'cmap': 'magma', 'units': '1',    'long_name': 'Gust Factor'},
-            'GUST_CONV': {'cmap': 'magma',  'units': 'm/s',   'long_name': 'Convective Gust Enhancement'},
-            'WIND_10M': {'cmap': 'viridis', 'units': 'm/s',   'long_name': '10m Wind Speed'},
-            'WIND_MAX': {'cmap': 'viridis', 'units': 'm/s',   'long_name': 'Maximum Wind Speed'},
-            'VUCSH_0_1km': {'cmap': 'RdBu_r','units': '1/s',  'long_name': 'U Shear Rate 0-1 km'},
-            'VVCSH_0_1km': {'cmap': 'RdBu_r','units': '1/s',  'long_name': 'V Shear Rate 0-1 km'},
-            'VUCSH_0_6km': {'cmap': 'RdBu_r','units': '1/s',  'long_name': 'U Shear Rate 0-6 km'},
-            'VVCSH_0_6km': {'cmap': 'RdBu_r','units': '1/s',  'long_name': 'V Shear Rate 0-6 km'},
-            'RELV_max_0_1km': {'cmap': 'Spectral_r', 'units': '1/s', 'long_name': 'Max Relative Vorticity 0-1 km'},
-            'RELV_max_0_2km': {'cmap': 'Spectral_r', 'units': '1/s', 'long_name': 'Max Relative Vorticity 0-2 km'},
-            'USTM_0_6km': {'cmap': 'RdBu_r','units': 'm/s',  'long_name': 'Storm Motion U 0-6 km'},
-            'VSTM_0_6km': {'cmap': 'RdBu_r','units': 'm/s',  'long_name': 'Storm Motion V 0-6 km'},
-            'HLCY_0_1km': {'cmap': 'PuOr',  'units': 'm^2/s^2', 'long_name': 'Storm-Relative Helicity 0-1 km'},
-            'HLCY_0_3km': {'cmap': 'PuOr',  'units': 'm^2/s^2', 'long_name': 'Storm-Relative Helicity 0-3 km'},
-            'MXUPHL_max_0_2km': {'cmap': 'RdPu', 'units': 'm^2/s^2', 'long_name': 'Max Updraft Helicity 0-2 km'},
-            'MNUPHL_min_0_2km': {'cmap': 'RdPu', 'units': 'm^2/s^2', 'long_name': 'Min Updraft Helicity 0-2 km'},
-            'MXUPHL_max_0_3km': {'cmap': 'RdPu', 'units': 'm^2/s^2', 'long_name': 'Max Updraft Helicity 0-3 km'},
-            'MNUPHL_min_0_3km': {'cmap': 'RdPu', 'units': 'm^2/s^2', 'long_name': 'Min Updraft Helicity 0-3 km'},
-            'MXUPHL_max_2_5km': {'cmap': 'RdPu', 'units': 'm^2/s^2', 'long_name': 'Max Updraft Helicity 2-5 km'},
-            'MNUPHL_min_2_5km': {'cmap': 'RdPu', 'units': 'm^2/s^2', 'long_name': 'Min Updraft Helicity 2-5 km'},
-            'MAXUVV_max_100_1000mb': {'cmap': 'Reds', 'units': 'm/s', 'long_name': 'Max Upward Vertical Velocity 100-1000 mb'},
-            'MAXDVV_max_100_1000mb': {'cmap': 'Blues', 'units': 'm/s', 'long_name': 'Max Downward Vertical Velocity 100-1000 mb'},
-            'HGT_0C':   {'cmap': 'terrain', 'units': 'm',    'long_name': '0°C Isotherm Height AGL'},
-            'UGRD_0C':  {'cmap': 'RdBu_r',  'units': 'm/s',  'long_name': 'U Wind at 0°C Isotherm'},
-            'VGRD_0C':  {'cmap': 'RdBu_r',  'units': 'm/s',  'long_name': 'V Wind at 0°C Isotherm'},
-            'WIND_0C':  {'cmap': 'viridis','units': 'm/s',  'long_name': 'Wind Speed at 0°C Isotherm'},
-            'SPFH_0C':  {'cmap': 'Blues',  'units': 'kg/kg','long_name': 'Specific Humidity at 0°C Isotherm'},
-            'RH_0C':    {'cmap': 'YlGnBu', 'units': '%',    'long_name': 'Relative Humidity at 0°C Isotherm'},
-            'DU_SFC_0C': {'cmap': 'RdBu_r', 'units': 'm/s',  'long_name': 'U Wind Shear Surface to 0°C'},
-            'DV_SFC_0C': {'cmap': 'RdBu_r', 'units': 'm/s',  'long_name': 'V Wind Shear Surface to 0°C'},
-            'SHEAR_SFC_0C': {'cmap': 'viridis', 'units': 'm/s', 'long_name': 'Wind Shear Magnitude Surface to 0°C'},
-        }
 
 
 class ForecastPlotter:
@@ -237,10 +165,10 @@ class ForecastPlotter:
                    title_suffix: str = "") -> plt.Figure:
         """Create a plot for a given variable."""
         
-        # Get variable configuration
-        var_config = self.config.var_configs.get(var_name, {})
-        units = var_config.get('units', '')
-        long_name = var_config.get('long_name', var_name)
+        # Get variable configuration from VARIABLE_METADATA
+        var_meta = VARIABLE_METADATA.get(var_name, {})
+        units = var_meta.get('units', '')
+        long_name = var_meta.get('long_name', var_name)
         
         # Special handling for categorical / thresholded fields
         norm = None
@@ -257,7 +185,7 @@ class ForecastPlotter:
         elif var_name == 'HGTCC':
             cmap, norm, vmin, vmax = self.get_hgtcc_cmap()
         else:
-            cmap = var_config.get('cmap', self.config.cmap_default)
+            cmap = var_meta.get('cmap', self.config.cmap_default)
             norm = None
             vmin = np.nanmin(data)
             vmax = np.nanmax(data)
@@ -432,9 +360,9 @@ class ForecastPlotter:
                 else:
                     data = ds[var_name].isel(time=0, lead_time=0).values
                 
-                # Get colormap
-                var_config = self.config.var_configs.get(var_display, {})
-                cmap = var_config.get('cmap', self.config.cmap_default)
+                # Get colormap from VARIABLE_METADATA
+                var_meta = VARIABLE_METADATA.get(var_display, {})
+                cmap = var_meta.get('cmap', self.config.cmap_default)
                 
                 # Special handling for REFC/APCP
                 if var_display == 'REFC':
