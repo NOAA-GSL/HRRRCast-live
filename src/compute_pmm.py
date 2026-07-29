@@ -170,7 +170,13 @@ def process_variable_pmm(var_data: xr.DataArray, method: int = 2) -> xr.DataArra
     
     # Concatenate results back along time dimension
     var_processed = xr.concat(time_results, dim='time')
-    
+
+    # Transpose to CF-compliant dimension order: (lead_time, time, [level], y, x)
+    if 'level' in var_processed.dims:
+        var_processed = var_processed.transpose('lead_time', 'time', 'level', 'y', 'x')
+    else:
+        var_processed = var_processed.transpose('lead_time', 'time', 'y', 'x')
+ 
     return var_processed
 
 def process_variable_mean(var_data: xr.DataArray) -> xr.DataArray:
@@ -330,6 +336,26 @@ def compute_ensemble_pmm(datetime_str: str,
                     logger.info(f"Spread for {var_name} at f{h:02d}")
                     spread_da = process_variable_spread(var_data)
                     spread_da.attrs['processing_method'] = 'ensemble_spread_stddev'
+
+                # Ensure time and lead_time coords/dims exist for downstream writer
+                # If dims already exist, just set their coordinate values; else expand dims
+                if 'time' in da.dims and 'lead_time' in da.dims:
+                    da = da.assign_coords(time=[np.datetime64(init_datetime)],
+                                          lead_time=[int(h)])
+                else:
+                    da = da.expand_dims({
+                        'time': [np.datetime64(init_datetime)],
+                        'lead_time': [int(h)]
+                    })
+
+                if 'time' in spread_da.dims and 'lead_time' in spread_da.dims:
+                    spread_da = spread_da.assign_coords(time=[np.datetime64(init_datetime)],
+                                                        lead_time=[int(h)])
+                else:
+                    spread_da = spread_da.expand_dims({
+                        'time': [np.datetime64(init_datetime)],
+                        'lead_time': [int(h)]
+                    })
 
                 processed_datasets[var_name] = da
                 spread_datasets[var_name] = spread_da
