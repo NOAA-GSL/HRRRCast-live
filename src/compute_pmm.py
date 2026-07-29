@@ -338,13 +338,14 @@ def compute_ensemble_pmm(datetime_str: str,
                     "long_name": "forecast period",
                     "units": "hours",
                 }
+                forecast_ref_attrs = {
+                    "standard_name": "forecast_reference_time",
+                    "long_name": "model initialization time",
+                }
                 # Create forecast_reference_time as a scalar DataArray
                 forecast_reference_time = xr.DataArray(
                     np.datetime64(init_datetime, "ns"),
-                    attrs={
-                        "standard_name": "forecast_reference_time",
-                        "long_name": "model initialization time",
-                    },
+                    attrs=forecast_ref_attrs,
                 )
 
                 # Ensure time and lead_time coords/dims exist for downstream writer
