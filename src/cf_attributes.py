@@ -448,14 +448,14 @@ VARIABLE_METADATA = {
 
 
 # Derived dictionary for backward compatibility: CF attributes only
-CF_ATTRS = {
+__CF_ATTRS = {
     var: {k: v for k, v in meta.items() if k in ["long_name", "units"]}
     for var, meta in VARIABLE_METADATA.items()
 }
 
 
 # CF-compliant coordinate attributes for standard forecast dimensions
-CF_COORD_ATTRS = {
+__CF_COORD_ATTRS = {
     "time": {
         "standard_name": "time",
         "long_name": "time",
@@ -536,8 +536,8 @@ def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
     for var in ds.data_vars:
         if var == "grid_mapping":
             continue
-        if var in CF_ATTRS:
-            ds[var].attrs.update(CF_ATTRS[var])
+        if var in __CF_ATTRS:
+            ds[var].attrs.update(__CF_ATTRS[var])
         ds[var].attrs["grid_mapping"] = "grid_mapping"
         # CF \u00a75.5: only declare the 2D lat/lon auxiliary coordinates on
         # variables whose dims actually contain the spatial axes. Domain-
@@ -571,14 +571,19 @@ def apply_cf_attributes(ds: xr.Dataset, init_datetime=None) -> xr.Dataset:
         nx = ds.sizes["x"]
         x_vals = ((np.arange(nx, dtype=np.float64) - (nx - 1) / 2.0) * HRRR_DX_M)
         ds = ds.assign_coords(
-            x=("x", x_vals, CF_COORD_ATTRS["x"]),
+            x=("x", x_vals),
         )
     if "y" in ds.dims and "y" not in ds.coords:
         ny = ds.sizes["y"]
         y_vals = ((np.arange(ny, dtype=np.float64) - (ny - 1) / 2.0) * HRRR_DX_M)
         ds = ds.assign_coords(
-            y=("y", y_vals, CF_COORD_ATTRS["y"]),
+            y=("y", y_vals),
         )
+
+    # Apply CF coordinate attributes to all coordinates present in the dataset
+    for coord_name in ds.coords:
+        if coord_name in __CF_COORD_ATTRS:
+            ds[coord_name].attrs.update(__CF_COORD_ATTRS[coord_name])
 
     # Global attributes
     ds.attrs["Conventions"] = "CF-1.6"
@@ -618,8 +623,10 @@ def get_cf_encoding(ds: xr.Dataset, init_datetime: datetime) -> dict:
     # Apply CF-compliance encoding
     encoding = {v: {"_FillValue": np.float32(-9999.0)}
                 for v in ds.data_vars if v != "grid_mapping"}
-    encoding["latitude"] = {"_FillValue": np.float32(-9999.0)}
-    encoding["longitude"] = {"_FillValue": np.float32(-9999.0)}
+    if "latitude" in ds.coords:
+        encoding["latitude"] = {"_FillValue": np.float32(-9999.0)}
+    if "longitude" in ds.coords:
+        encoding["longitude"] = {"_FillValue": np.float32(-9999.0)}
     # CF-1.6: store time as float64 hours since the initialization time
     # (xarray would otherwise emit int64 nanoseconds, which is not a CF type).
     # CF §2.5.1 forbids _FillValue on coordinate variables.

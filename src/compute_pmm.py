@@ -318,6 +318,10 @@ def compute_ensemble_pmm(datetime_str: str,
             spread_datasets: Dict[str, xr.DataArray] = {}
 
             for var_name in ensemble_ds.data_vars:
+                # Skip CF metadata variables
+                if var_name == 'grid_mapping':
+                    continue
+                    
                 var_data = ensemble_ds[var_name]
                 if 'member' not in var_data.dims:
                     logger.warning(f"Variable {var_name} missing 'member' dim at f{lead_hour:02d}, copying as-is")
@@ -367,17 +371,19 @@ def compute_ensemble_pmm(datetime_str: str,
             processed_ds = apply_cf_attributes(processed_ds, init_datetime=init_datetime)
             spread_ds = apply_cf_attributes(spread_ds, init_datetime=init_datetime)
 
-            # Copy attributes and annotate
-            processed_ds.attrs = ensemble_ds.attrs.copy()
-            processed_ds.attrs['postprocessing_method'] = 'PMM for REFC/APCP, mean for others'
-            processed_ds.attrs['pmm_method'] = method
-            processed_ds.attrs['processed_timestamp'] = str(datetime.now())
-            processed_ds.attrs['source_files'] = [os.path.basename(f) for f in files]
+            # Add processing-specific attributes
+            processed_ds.attrs.update({
+                'postprocessing_method': 'PMM for REFC/APCP, mean for others',
+                'pmm_method': method,
+                'processed_timestamp': str(datetime.now()),
+                'source_files': [os.path.basename(f) for f in files]
+            })
 
-            spread_ds.attrs = ensemble_ds.attrs.copy()
-            spread_ds.attrs['postprocessing_method'] = 'ensemble spread (standard deviation)'
-            spread_ds.attrs['processed_timestamp'] = str(datetime.now())
-            spread_ds.attrs['source_files'] = [os.path.basename(f) for f in files]
+            spread_ds.attrs.update({
+                'postprocessing_method': 'ensemble spread (standard deviation)',
+                'processed_timestamp': str(datetime.now()),
+                'source_files': [os.path.basename(f) for f in files]
+            })
 
             cycle = init_datetime.hour
 
