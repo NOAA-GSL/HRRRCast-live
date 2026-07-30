@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -50,6 +50,7 @@ from transform import (
 import utils
 from utils import setup_logging
 from diagnostics import compute_diagnostics
+from cf_attributes import apply_cf_attributes, get_cf_encoding
 from compute_pmm import compute_PMM
 
 logger = None
@@ -466,7 +467,7 @@ class WeatherForecaster:
             forecast_norm: normalized model output for this hour, shape (1, Ny, Nx, C)
 
         Returns:
-            xr.Dataset with dims (time=1, lead_time=1, [level], latitude, longitude)
+            xr.Dataset with dims (lead_time=1, time=1, [level], latitude, longitude)
         """
         t0 = time.time()
 
@@ -475,21 +476,22 @@ class WeatherForecaster:
         # Ensure shape (time=1, Ny, Nx, C)
         if denorm.ndim == 3:
             denorm = denorm[None, ...]
-        times = [hour]
-        ds_hour = self.create_xarray_dataset(init_datetime, times, lats, lons, denorm)
+        lead_times = [hour]
+        valid_times = [init_datetime + timedelta(hours=int(t)) for t in lead_times]
+        ds_hour = self.create_xarray_dataset(init_datetime, lead_times, lats, lons, denorm)
 
         # Inject constants if present in preprocessed NPZ (repeat across lead_time length 1)
         for cname in ["LAND", "OROG"]:
             raw_key = f"{cname}_raw"
             if hasattr(self.data_loader_hrrr, "data") and raw_key in self.data_loader_hrrr.data.files and cname not in ds_hour:
                 cvals = self.data_loader_hrrr.data[raw_key].astype(np.float32)
-                const_4d = np.tile(cvals[None, None, :, :], (1, len(times), 1, 1))
+                const_4d = np.tile(cvals[None, None, :, :], (len(lead_times), 1, 1, 1))
                 ds_hour[cname] = xr.DataArray(
                     const_4d,
-                    dims=("time", "lead_time", "latitude", "longitude"),
+                    dims=("lead_time", "time", "latitude", "longitude"),
                     coords={
-                        "time": [init_datetime],
-                        "lead_time": ("lead_time", times, {"units": "hours"}),
+                        "lead_time": ("lead_time", lead_times),
+                        "time": ("time", valid_times),
                         "latitude": (("latitude", "longitude"), lats),
                         "longitude": (("latitude", "longitude"), lons),
                     },
@@ -502,6 +504,9 @@ class WeatherForecaster:
 
         # compute diagnostics
         ds_hour = compute_diagnostics(ds_hour)
+
+        # Apply CF-compliant long_name and units to all variables
+        ds_hour = apply_cf_attributes(ds_hour, init_datetime=init_datetime)
 
         build_time = time.time() - t0
         logger.info(f"Build output dataset in {build_time:.3f}s")
@@ -534,7 +539,10 @@ class WeatherForecaster:
         if mem_str not in {"avg", "spr"}:
             mem_str = f"m{int(member):02d}"
         nc_path = outdir / f"hrrrcast_{mem_str}_f{hour:02d}.nc"
-        ds_hour.to_netcdf(nc_path)
+
+        # Get CF-compliant encoding
+        encoding = get_cf_encoding(ds_hour, init_datetime)
+        ds_hour.to_netcdf(nc_path, encoding=encoding)
 
         write_time = time.time() - t0
         logger.info(f"Wrote NetCDF in {write_time:.3f}s : {nc_path}")
@@ -966,50 +974,78 @@ class WeatherForecaster:
 
         logger.info("Autoregressive rollout completed")
 
-    def create_xarray_dataset(self, init_datetime: datetime, times: List[int], 
+    def create_xarray_dataset(self, init_datetime: datetime, lead_times: List[int],
                             lats: np.ndarray, lons: np.ndarray, data: np.ndarray) -> xr.Dataset:
-        """Convert numpy array to xarray.Dataset."""
+        """Convert numpy array to xarray.Dataset.
+        
+        Args:
+            init_datetime: Forecast initialization time
+            lead_times: List of lead times in hours (e.g., [0, 1, 2] for f00, f01, f02)
+            lats, lons: 2D latitude/longitude arrays (Ny, Nx)
+            data: Forecast data with shape (n_times, Ny, Nx, C)
+        
+        Returns:
+            xr.Dataset with CF-1.6 compliant forecast structure with separate time
+            and lead_time dimensions for flexibility in multi-hour output files.
+        """
         data_vars = {}
         var_index = 0
-        
+
         pl_vars = self.metadata['pl_vars']
         sfc_vars = self.metadata['sfc_vars']
-        levels = self.metadata['levels']
-        
-        # Pressure-level variables: (time, level, y, x)
+        # Cast pressure levels to int32 (CF-1.6 disallows int64 for coordinates).
+        levels = np.asarray(self.metadata['levels'], dtype=np.int32)
+
+        # Compute valid times for all forecast steps
+        valid_times = [init_datetime + timedelta(hours=int(t)) for t in lead_times]
+
+        # Pressure-level variables: (lead_time, time, level, latitude, longitude)
+        # CF conventions: non-standard dimensions (lead_time) come before T, Z, Y, X
         for pl_var in pl_vars:
             pl_data = np.transpose(data[..., var_index:var_index+len(levels)], (0, 3, 1, 2))
+            # Add lead_time dimension at axis 0 (leftmost position)
+            pl_data = np.expand_dims(pl_data, axis=0)
             data_vars[pl_var] = xr.DataArray(
-                np.expand_dims(pl_data, 0),
-                dims=("time", "lead_time", "level", "latitude", "longitude"),
+                pl_data,
+                dims=("lead_time", "time", "level", "latitude", "longitude"),
                 coords={
-                    "time": [init_datetime],
-                    "lead_time": ("lead_time", times, {"units": "hours"}),
-                    "level": ("level", levels, {"units": "hPa"}),
+                    "lead_time": ("lead_time", lead_times),
+                    "time": ("time", valid_times),
+                    "level": ("level", levels),
                     "latitude": (("latitude", "longitude"), lats),
                     "longitude": (("latitude", "longitude"), lons),
                 },
                 name=pl_var
             )
             var_index += len(levels)
-        
-        # Surface variables: (time, y, x)
+
+        # Surface variables: (lead_time, time, latitude, longitude)
+        # CF conventions: non-standard dimensions (lead_time) come before T, Y, X
         for sfc_var in sfc_vars:
             sfc_data = data[..., var_index]
+            # Add lead_time dimension at axis 0 (leftmost position)
+            sfc_data = np.expand_dims(sfc_data, axis=0)
             data_vars[sfc_var] = xr.DataArray(
-                np.expand_dims(sfc_data, 0),
-                dims=("time", "lead_time", "latitude", "longitude"),
+                sfc_data,
+                dims=("lead_time", "time", "latitude", "longitude"),
                 coords={
-                    "time": [init_datetime],
-                    "lead_time": ("lead_time", times, {"units": "hours"}),
+                    "lead_time": ("lead_time", lead_times),
+                    "time": ("time", valid_times),
                     "latitude": (("latitude", "longitude"), lats),
                     "longitude": (("latitude", "longitude"), lons),
                 },
                 name=sfc_var
             )
             var_index += 1
-        
+
         ds = xr.Dataset(data_vars)
+
+        # CF-1.6 §4.4.1: scalar forecast_reference_time (model initialization time).
+        ds = ds.assign_coords(
+            forecast_reference_time=xr.DataArray(
+                np.datetime64(init_datetime, "ns"),
+            ),
+        )
 
         return ds
     

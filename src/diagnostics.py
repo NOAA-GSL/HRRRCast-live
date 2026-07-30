@@ -593,7 +593,7 @@ def compute_vvel(ds: xr.Dataset) -> xr.Dataset:
             - latitude/lat: Latitude coordinate
             - longitude/lon: Longitude coordinate
 
-            Dataset must have dimensions: (time, lead_time, level, latitude, longitude)
+            Dataset must have dimensions: (lead_time, time, level, latitude, longitude)
             Assumes Lambert Conformal Conic projection (e.g., HRRR grid)
 
     Returns:

@@ -37,6 +37,7 @@ import time
 import utils
 
 from nc2grib import Netcdf2Grib
+from cf_attributes import get_cf_encoding, apply_cf_attributes
 
 # Configure logging
 logging.basicConfig(
@@ -128,8 +129,8 @@ def process_variable_pmm(var_data: xr.DataArray, method: int = 2) -> xr.DataArra
     Process a variable using Probability-Matched Mean method.
     
     Handles datasets with dimensions:
-    - 3D variables: (time, lead_time, level, lat, lon, member)
-    - 2D variables: (time, lead_time, lat, lon, member)
+    - 3D variables: (lead_time, time, level, lat, lon, member)
+    - 2D variables: (lead_time, time, lat, lon, member)
     """
     
     # Initialize list to collect results across all dimensions
@@ -169,7 +170,13 @@ def process_variable_pmm(var_data: xr.DataArray, method: int = 2) -> xr.DataArra
     
     # Concatenate results back along time dimension
     var_processed = xr.concat(time_results, dim='time')
-    
+
+    # Transpose to CF-compliant dimension order: (lead_time, time, [level], y, x)
+    if 'level' in var_processed.dims:
+        var_processed = var_processed.transpose('lead_time', 'time', 'level', 'y', 'x')
+    else:
+        var_processed = var_processed.transpose('lead_time', 'time', 'y', 'x')
+ 
     return var_processed
 
 def process_variable_mean(var_data: xr.DataArray) -> xr.DataArray:
@@ -177,8 +184,8 @@ def process_variable_mean(var_data: xr.DataArray) -> xr.DataArray:
     Process a variable using standard ensemble mean.
     
     Simply computes the mean across the member dimension, preserving all other dimensions:
-    - 3D variables: (time, lead_time, level, lat, lon, member) -> (time, lead_time, level, lat, lon)
-    - 2D variables: (time, lead_time, lat, lon, member) -> (time, lead_time, lat, lon)
+    - 3D variables: (lead_time, time, level, lat, lon, member) -> (lead_time, time, level, lat, lon)
+    - 2D variables: (lead_time, time, lat, lon, member) -> (lead_time, time, lat, lon)
     """
     processed_var = var_data.mean(dim='member')
     return processed_var
@@ -311,6 +318,10 @@ def compute_ensemble_pmm(datetime_str: str,
             spread_datasets: Dict[str, xr.DataArray] = {}
 
             for var_name in ensemble_ds.data_vars:
+                # Skip CF metadata variables
+                if var_name == 'grid_mapping':
+                    continue
+                    
                 var_data = ensemble_ds[var_name]
                 if 'member' not in var_data.dims:
                     logger.warning(f"Variable {var_name} missing 'member' dim at f{lead_hour:02d}, copying as-is")
@@ -355,27 +366,37 @@ def compute_ensemble_pmm(datetime_str: str,
 
             processed_ds = xr.Dataset(processed_datasets)
             spread_ds = xr.Dataset(spread_datasets)
-            # Copy attributes and annotate
-            processed_ds.attrs = ensemble_ds.attrs.copy()
-            processed_ds.attrs['postprocessing_method'] = 'PMM for REFC/APCP, mean for others'
-            processed_ds.attrs['pmm_method'] = method
-            processed_ds.attrs['processed_timestamp'] = str(datetime.now())
-            processed_ds.attrs['source_files'] = [os.path.basename(f) for f in files]
 
-            spread_ds.attrs = ensemble_ds.attrs.copy()
-            spread_ds.attrs['postprocessing_method'] = 'ensemble spread (standard deviation)'
-            spread_ds.attrs['processed_timestamp'] = str(datetime.now())
-            spread_ds.attrs['source_files'] = [os.path.basename(f) for f in files]
+            # Apply CF attributes
+            processed_ds = apply_cf_attributes(processed_ds, init_datetime=init_datetime)
+            spread_ds = apply_cf_attributes(spread_ds, init_datetime=init_datetime)
+
+            # Add processing-specific attributes
+            processed_ds.attrs.update({
+                'postprocessing_method': 'PMM for REFC/APCP, mean for others',
+                'pmm_method': method,
+                'processed_timestamp': str(datetime.now()),
+                'source_files': [os.path.basename(f) for f in files]
+            })
+
+            spread_ds.attrs.update({
+                'postprocessing_method': 'ensemble spread (standard deviation)',
+                'processed_timestamp': str(datetime.now()),
+                'source_files': [os.path.basename(f) for f in files]
+            })
 
             cycle = init_datetime.hour
 
             # Save per-hour NetCDF
             out_nc = os.path.join(output_date_dir, f"hrrrcast_avg_f{h:02d}.nc")
-            processed_ds.to_netcdf(out_nc)
+            # Get CF-compliant encoding
+            encoding = get_cf_encoding(processed_ds, init_datetime)
+            processed_ds.to_netcdf(out_nc, encoding=encoding)
             logger.info(f"Wrote NetCDF : {out_nc}")
 
             out_nc_spread = os.path.join(output_date_dir, f"hrrrcast_spr_f{h:02d}.nc")
-            spread_ds.to_netcdf(out_nc_spread)
+            encoding = get_cf_encoding(spread_ds, init_datetime)
+            spread_ds.to_netcdf(out_nc_spread, encoding=encoding)
             logger.info(f"Wrote NetCDF : {out_nc_spread}")
 
             # Save per-hour GRIB2
