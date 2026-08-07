@@ -59,5 +59,5 @@ MEMBER_RANGE="${start}-${end}"
 
 echo "In fcst, INIT_TIME=${INIT_TIME}, LEAD_HOUR=${LEAD_HOUR}, TASK_ID=${TASK_ID}, MEMBER_RANGE=${MEMBER_RANGE}, base_dir=${DATAROOT}"
 
-python ${PACKAGEROOT}/src/fcst.py $PACKAGEROOT/net-diffusion/model.keras ${INIT_TIME} ${LEAD_HOUR} \
+python ${PACKAGEROOT}/src/fcst.py $PACKAGEROOT/net-diffusion/model.keras --sda_model_path $PACKAGEROOT/net-diffusion/model_da.keras ${INIT_TIME} ${LEAD_HOUR} \
     --no_nudging --num_members ${N_ENSEMBLES} --members ${MEMBER_RANGE} --base_dir ${DATAROOT} --output_dir ${DATAROOT}
