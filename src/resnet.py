@@ -232,6 +232,56 @@ class TimeCondLayer(Layer):
         })
         return config
 
+@register_keras_serializable()
+class SkipScaleLayer(Layer):
+    """Computes non-learnable diffusion skip scales from the diffusion step channel.
+
+    Uses the second-to-last channel in `time_mask` as normalized diffusion step (t / NUM_DIFFUSION_STEPS).
+    Returns three broadcastable tensors:
+      - a: (noised-input - x_t) scale = 0.3 * sqrt(alpha_bar_t)
+      - b: (x_t) scale = 1.0
+      - c: (network-output) scale = sqrt(max(0, 1 - a^2))
+    """
+
+    def __init__(self, time_mask, **kwargs):
+        super().__init__(**kwargs)
+        self.time_mask = list(time_mask)
+        self._sqrt_alpha_bar = tf.constant(SQRT_ALPHA_BAR, dtype=tf.float32)
+
+    def call(self, inputs):
+        time_mask = tf.constant(self.time_mask, dtype=tf.int32)
+        n_channels = tf.shape(inputs)[-1]
+        time_mask = tf.where(time_mask < 0, time_mask + n_channels, time_mask)
+
+        # By convention, second-to-last time feature stores normalized diffusion step.
+        diffusion_idx = time_mask[-2]
+        diffusion_step = tf.gather(inputs, diffusion_idx, axis=-1)
+        diffusion_step = tf.cast(diffusion_step[:, 0, 0], tf.float32)
+
+        t = tf.cast(tf.round(diffusion_step * tf.cast(NUM_DIFFUSION_STEPS, tf.float32)), tf.int32)
+        t = tf.clip_by_value(t, 0, NUM_DIFFUSION_STEPS - 1)
+
+        a = 0.3 * tf.gather(self._sqrt_alpha_bar, t)
+        b = 1.0
+        c = tf.sqrt(1.0 - tf.square(a))
+
+        a = tf.reshape(a, (-1, 1, 1, 1))
+        b = tf.reshape(b, (-1, 1, 1, 1))
+        c = tf.reshape(c, (-1, 1, 1, 1))
+
+        return a, b, c
+
+    def compute_output_shape(self, input_shape):
+        out = (input_shape[0], 1, 1, 1)
+        return (out, out, out)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'time_mask': self.time_mask,
+        })
+        return config
+
 
 @register_keras_serializable()
 class ReflectPadLayer(Layer):
