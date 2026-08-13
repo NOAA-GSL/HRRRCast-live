@@ -10,6 +10,7 @@ PACKAGEROOT=${5:-`pwd`}
 DATAROOT=${6:-`pwd`}
 RUNPLOT=${7:-"YES"}
 ENVMODE=${8:-``}
+RUNCLEANUP=${9:-"NO"}
 
 ACCNR=${ACCNR:-gsd-hpcs}
 FCST_ACCNR=${FCST_ACCNR:-$ACCNR}
@@ -94,12 +95,14 @@ echo "Submitted job: $jobid4"
 atparse < $PACKAGEROOT/jobs/job-fcst.sh > $DATAROOT/logs/job-fcst.sh
 jobid5=$(submit_with_check sbatch --dependency=afterok:$jobid3:$jobid4 --array=0-$((N_GPUS-1)) --wait-all-nodes=1 ${FCST_RESERVATION} --parsable $DATAROOT/logs/job-fcst.sh)
 echo "Submitted forecast job array: $jobid5"
+last_jobid=$jobid5
 
 # submit plots as job array
 if [ "$RUNPLOT" == "YES" ]; then
     atparse < $PACKAGEROOT/jobs/job-plot.sh > $DATAROOT/logs/job-plot.sh
     jobid6=$(submit_with_check sbatch --dependency=afterok:$jobid5 --array=0-$((N_GPUS-1)) --wait-all-nodes=1 --parsable $DATAROOT/logs/job-plot.sh)
     echo "Submitted plot job array: $jobid6"
+    last_jobid=$jobid6
 fi
 
 # ensemble PMM
@@ -107,10 +110,20 @@ if [ $N_ENSEMBLES -ge 2 ]; then
     atparse < $PACKAGEROOT/jobs/job-compute-pmm.sh > $DATAROOT/logs/job-compute-pmm.sh
     jobid7=$(submit_with_check sbatch --dependency=after:$jobid5 --parsable $DATAROOT/logs/job-compute-pmm.sh)
     echo "Submitted job: $jobid7"
+    last_jobid=$jobid7
 
     if [ "$RUNPLOT" == "YES" ]; then
         atparse < $PACKAGEROOT/jobs/job-plot.sh > $DATAROOT/logs/job-plot-pmm.sh
         jobid8=$(submit_with_check sbatch --dependency=afterok:$jobid7 --parsable $DATAROOT/logs/job-plot-pmm.sh)
         echo "Submitted job: $jobid8"
+        last_jobid=$jobid8
     fi
 fi
+
+# submit cleanup job to run after all jobs complete
+if [ "$RUNCLEANUP" == "YES" ]; then
+    atparse < $PACKAGEROOT/jobs/job-cleanup.sh > $DATAROOT/logs/job-cleanup.sh
+    jobid_cleanup=$(submit_with_check sbatch --dependency=afterany:$last_jobid --parsable $DATAROOT/logs/job-cleanup.sh)
+    echo "Submitted cleanup job: $jobid_cleanup (depends on job $last_jobid)"
+fi
+
