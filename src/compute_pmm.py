@@ -221,11 +221,16 @@ def wait_for_hour_files(date_str: str,
                         hour: int,
                         n_ensembles: int,
                         poll_seconds: int = 60,
-                        min_age_seconds: int = 90) -> List[str]:
+                        min_age_seconds: int = 90,
+                        timeout_seconds: Optional[int] = None) -> List[str]:
     """Wait until all expected member files exist and are stable for the given hour.
 
     Stability is defined as not modified within the last min_age_seconds.
     Checks every poll_seconds. Returns the list of file paths when ready.
+    
+    Parameters:
+    - timeout_seconds: Maximum time to wait in seconds. None means wait indefinitely.
+                      If timeout is reached, raises TimeoutError.
     """
     date_dir = os.path.join(forecast_dir, date_str)
     if not os.path.isdir(date_dir):
@@ -234,7 +239,16 @@ def wait_for_hour_files(date_str: str,
     def file_path(m: int) -> str:
         return os.path.join(date_dir, f"hrrrcast_m{m:02d}_f{hour:02d}.nc")
 
+    start_time = time.time()
     while True:
+        # Check timeout
+        if timeout_seconds is not None:
+            elapsed = time.time() - start_time
+            if elapsed > timeout_seconds:
+                raise TimeoutError(
+                    f"Timeout after {elapsed:.0f}s waiting for hour f{hour:02d} files. "
+                    f"Forecast job may have failed or died."
+                )
         files: List[str] = []
         all_present = True
         for m in range(n_ensembles):
@@ -305,10 +319,18 @@ def compute_ensemble_pmm(datetime_str: str,
         # Polling configuration (overridable via env)
         poll_seconds = int(os.environ.get("PMM_POLL_SECONDS", "60"))
         min_age_seconds = int(os.environ.get("PMM_MIN_AGE_SECONDS", "90"))
+        timeout_seconds = int(os.environ.get("PMM_TIMEOUT_SECONDS", "600"))
 
         for h in range(0, int(lead_hour) + 1):
             # Wait until files are present and stable before processing this hour
-            files = wait_for_hour_files(date_str, forecast_dir, h, n_ensembles, poll_seconds, min_age_seconds)
+            # Hour 0: wait indefinitely; subsequent hours: max timeout_seconds
+            timeout = None if h == 0 else timeout_seconds
+            try:
+                files = wait_for_hour_files(date_str, forecast_dir, h, n_ensembles, poll_seconds, min_age_seconds, timeout_seconds=timeout)
+            except TimeoutError as e:
+                logger.error(f"Files not found for hour f{h:02d}: {e}")
+                logger.error("Forecast job appears to be dead or has failed. Exiting PMM computation.")
+                sys.exit(1)
             logger.info(f"Processing forecast hour f{h:02d} with {len(files)} member files")
 
             # Load per-hour ensemble
