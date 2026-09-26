@@ -18,7 +18,7 @@ import logging
 import os
 import sys
 from datetime import timedelta
-from typing import Optional
+from typing import List, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import matplotlib.pyplot as plt
@@ -38,6 +38,18 @@ from utils import setup_logging
 from cf_attributes import VARIABLE_METADATA
 
 logger = None
+
+
+def _normalize_range(range_values: Optional[List[float]], range_name: str) -> Optional[tuple]:
+    """Validate and normalize a two-value [min, max] numeric range."""
+    if range_values is None:
+        return None
+    if len(range_values) != 2:
+        raise ValueError(f"{range_name} must contain exactly 2 values: min max")
+    low, high = float(range_values[0]), float(range_values[1])
+    if low == high:
+        raise ValueError(f"{range_name} min and max cannot be equal")
+    return (min(low, high), max(low, high))
 
 
 class ForecastPlotterConfig:
@@ -68,6 +80,7 @@ class ForecastPlotterConfig:
         self.figure_size = (12, 8)
         self.dpi = 300
         self.cmap_default = 'viridis'
+        self.zoom_extent = None
 
 
 class ForecastPlotter:
@@ -97,13 +110,14 @@ class ForecastPlotter:
         base = plt.get_cmap(name)
         return [mcolors.to_hex(base(i/(n-1))) for i in range(n)]
 
+
     @staticmethod
     def get_refc_cmap() -> tuple:
-        """Return colormap + norm for composite reflectivity (REFC)."""
-        reflectivity_levels = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70]
+        """Return a colormap and normalization for reflectivity (REFC)."""
+        reflectivity_levels = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75]
         reflectivity_colors = [
-            "#FFFFFF", "#B0E2FF", "#7EC0EE", "#00FA9A", "#32CD32", "#FFFF00", "#FFD700",
-            "#FFA500", "#FF4500", "#FF0000", "#8B0000", "#9400D3", "#8B008B", "#4B0082",
+            "#FFFFFF", "#00F9F9", "#0080FF", "#0004FF", "#00FF00", "#00C100", "#008000", "#F5FA00",
+            "#FFBF00", "#FF8200", "#FF0400", "#BF0000", "#820000", "#FF00FF", "#9062CD",
         ]
         vmin, vmax = min(reflectivity_levels), max(reflectivity_levels)
         cmap = mcolors.ListedColormap(reflectivity_colors)
@@ -197,6 +211,8 @@ class ForecastPlotter:
             ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
             ax.add_feature(cfeature.BORDERS, linewidth=0.5)
             ax.add_feature(cfeature.STATES, linewidth=0.3)
+            if self.config.zoom_extent is not None:
+                ax.set_extent(self.config.zoom_extent, crs=ccrs.PlateCarree())
 
             ax.gridlines(draw_labels=True)
         else:
@@ -336,6 +352,8 @@ class ForecastPlotter:
                     ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
                     ax.add_feature(cfeature.BORDERS, linewidth=0.5)
                     ax.add_feature(cfeature.STATES, linewidth=0.3)
+                    if self.config.zoom_extent is not None:
+                        ax.set_extent(self.config.zoom_extent, crs=ccrs.PlateCarree())
                     axes.append(ax)
             else:
                 axes = axes.flatten()
@@ -423,6 +441,7 @@ def plot_lead_hour(h, ds_path, init_datetime, init_year, init_month, init_day, i
 
 def plot_forecast_data(datetime_str: str,
                       lead_hour: str, member: str,
+                      zoom_extent: Optional[tuple] = None,
                       forecast_dir: str = "./", output_dir: str = "./"):
     """Main plotting function. Plots all hours from 1 to lead_hour (inclusive) in parallel."""
     try:
@@ -439,6 +458,7 @@ def plot_forecast_data(datetime_str: str,
 
         # Initialize plotter config (for passing to subprocesses)
         config = ForecastPlotterConfig()
+        config.zoom_extent = zoom_extent
         config_dict = config.__dict__
         
         n_workers = lead_hour_int
@@ -479,6 +499,24 @@ def parse_arguments():
     parser.add_argument("--members", nargs='+', required=True, help="List/range of member IDs (e.g., 0-2 4 6-7 pmm)")
     parser.add_argument("--forecast_dir", default="./", help="Directory containing forecast files")
     parser.add_argument("--output_dir", default="./", help="Output directory for plots")
+    parser.add_argument(
+        "--lat-range",
+        dest="lat_range",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("LAT_MIN", "LAT_MAX"),
+        help="Latitude zoom bounds for map extent (e.g., --lat-range 36 50)",
+    )
+    parser.add_argument(
+        "--lon-range",
+        dest="lon_range",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("LON_MIN", "LON_MAX"),
+        help="Longitude zoom bounds for map extent (e.g., --lon-range 259 272)",
+    )
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                        help="Logging level")
     
@@ -492,6 +530,20 @@ def main():
     logger = setup_logging(args.log_level)
 
     try:
+        try:
+            lat_bounds = _normalize_range(args.lat_range, "lat_range")
+            lon_bounds = _normalize_range(args.lon_range, "lon_range")
+        except ValueError as e:
+            logger.error(str(e))
+            sys.exit(1)
+
+        zoom_extent = None
+        if lat_bounds is not None and lon_bounds is not None:
+            zoom_extent = (lon_bounds[0], lon_bounds[1], lat_bounds[0], lat_bounds[1])
+        elif lat_bounds is not None or lon_bounds is not None:
+            logger.error("Both --lat-range and --lon-range must be provided together for zooming")
+            sys.exit(1)
+
         def expand_member_arg(m):
             result = []
             for part in m.split(","):
@@ -513,6 +565,7 @@ def main():
                 datetime_str=args.inittime,
                 lead_hour=args.lead_hour,
                 member=member,
+                zoom_extent=zoom_extent,
                 forecast_dir=args.forecast_dir,
                 output_dir=args.output_dir,
             )
