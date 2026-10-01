@@ -2,9 +2,8 @@
 """
 Ensemble Post-Processing Script for HRRR Forecasts
 
-This script processes ensemble forecast data from HRRR (High-Resolution Rapid Refresh) 
-model runs and computes post-processed ensemble products. It applies different statistical
-methods based on the variable type:
+This script processes ensemble forecast data from HRRRCast model runs and computes post-processed 
+ensemble products. It applies different statistical methods based on the variable type:
 
 - REFC (Reflectivity) and APCP (Precipitation Accumulation): Uses Probability-Matched Mean (PMM) 
   to preserve the natural distribution and spatial structure of precipitation-related fields
@@ -35,9 +34,11 @@ import numpy as np
 import xarray as xr
 import time
 import utils
+from scipy.signal import fftconvolve
+from scipy import ndimage
 
 from nc2grib import Netcdf2Grib
-from cf_attributes import get_cf_encoding, apply_cf_attributes
+from cf_attributes import get_cf_encoding, apply_cf_attributes, PROBABILITY_THRESHOLD_MAP
 
 # Configure logging
 logging.basicConfig(
@@ -45,6 +46,75 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def _format_threshold_token(threshold: float) -> str:
+    if threshold < 0:
+        return f"m{abs(threshold):g}".replace(".", "p")
+    return f"{threshold:g}".replace(".", "p")
+
+
+def _probability_var_name(base_var: str, threshold: float, operator: str) -> str:
+    suffix = "GT" if operator == "gt" else "LT"
+    return f"{base_var}_PROB_{suffix}{_format_threshold_token(threshold)}"
+
+
+def _forecast_spatial_dims(var_data: xr.DataArray) -> List[str]:
+    return [dim for dim in var_data.dims if dim in ["latitude", "lat", "y", "longitude", "lon", "x"]]
+
+
+def _transpose_forecast_dims(var_data: xr.DataArray) -> xr.DataArray:
+    if "level" in var_data.dims:
+        desired_order = ["lead_time", "time", "level", "y", "x", "latitude", "longitude", "lat", "lon"]
+    else:
+        desired_order = ["lead_time", "time", "y", "x", "latitude", "longitude", "lat", "lon"]
+    dims = [dim for dim in desired_order if dim in var_data.dims]
+    return var_data.transpose(*dims)
+
+
+def _attach_forecast_coords(var_data: xr.DataArray, init_datetime: datetime, lead_hour: int) -> xr.DataArray:
+    if "time" in var_data.dims and "lead_time" in var_data.dims:
+        return var_data.assign_coords(time=[np.datetime64(init_datetime)], lead_time=[int(lead_hour)])
+    return var_data.expand_dims({"time": [np.datetime64(init_datetime)], "lead_time": [int(lead_hour)]})
+
+
+def _get_probability_footprint(radius_km: float, dx_km: float) -> np.ndarray:
+    """Build a DESI-style circular footprint for a neighborhood radius in km."""
+    if radius_km <= 0:
+        return np.ones((1, 1), dtype=np.float32)
+
+    size = int((radius_km // dx_km) * 2 + 1)
+    footprint = np.ones((size, size), dtype=np.int32)
+    center = size // 2
+    footprint[center, center] = 0
+    dist = ndimage.distance_transform_edt(footprint, sampling=[dx_km, dx_km])
+    footprint = np.where(np.greater(dist, radius_km), 0, 1).astype(np.float32)
+    return footprint
+
+
+def _apply_probability_smoothing(probability: xr.DataArray,
+                                 valid_mask: xr.DataArray,
+                                 smoothing_radius_km: float,
+                                 grid_spacing_km: float) -> xr.DataArray:
+    """Apply DESI-style Gaussian smoothing to a probability field.
+
+    DESI smooths the final probability grid after the member hits have already
+    been converted to percentages. The Gaussian width is specified in km and
+    converted to grid-space sigma by dividing by the grid spacing.
+    """
+    if smoothing_radius_km <= 0:
+        return probability
+
+    sigma = smoothing_radius_km / grid_spacing_km
+
+    smoothed = ndimage.gaussian_filter(
+        probability.fillna(0.0).values,
+        sigma=sigma,
+        mode="constant",
+        cval=0.0,
+    )
+
+    smoothed = np.where(valid_mask.values, 0.0, smoothed).astype(np.float32)
+    return xr.DataArray(smoothed, coords=probability.coords, dims=probability.dims)
 
 def compute_PMM(fields: xr.DataArray, method=2) -> xr.DataArray:
     """ 
@@ -171,11 +241,8 @@ def process_variable_pmm(var_data: xr.DataArray, method: int = 2) -> xr.DataArra
     # Concatenate results back along time dimension
     var_processed = xr.concat(time_results, dim='time')
 
-    # Transpose to CF-compliant dimension order: (lead_time, time, [level], y, x)
-    if 'level' in var_processed.dims:
-        var_processed = var_processed.transpose('lead_time', 'time', 'level', 'y', 'x')
-    else:
-        var_processed = var_processed.transpose('lead_time', 'time', 'y', 'x')
+    # Transpose to CF-compliant dimension order.
+    var_processed = _transpose_forecast_dims(var_processed)
  
     return var_processed
 
@@ -198,6 +265,85 @@ def process_variable_spread(var_data: xr.DataArray) -> xr.DataArray:
     """
     processed_var = var_data.std(dim='member')
     return processed_var
+
+
+def process_variable_probability(var_data: xr.DataArray,
+                                 threshold: float,
+                                 operator: str = "gt",
+                                 neighborhood_radius_km: float = 0.0,
+                                 grid_spacing_km: float = 3.0,
+                                 smoothing_radius_km: float = 0.0) -> xr.DataArray:
+    """Process a variable into a point or neighborhood probability field.
+
+    This follows the DESI-style probability workflow more closely: threshold
+    each member, optionally apply a neighborhood hit test per member, then
+    convert the member hits into a percentage field.
+    """
+
+    def _probability_on_slice(slice_data: xr.DataArray) -> xr.DataArray:
+        valid_mask = slice_data.isnull()
+        if operator == "gt":
+            exceedance = (slice_data > threshold).astype(np.float32)
+        elif operator == "lt":
+            exceedance = (slice_data < threshold).astype(np.float32)
+        else:
+            raise ValueError(f"Unsupported probability operator: {operator}")
+        if neighborhood_radius_km > 0 and neighborhood_radius_km >= grid_spacing_km:
+            spatial_dims = _forecast_spatial_dims(exceedance)
+            if len(spatial_dims) < 2:
+                raise ValueError(f"Could not identify spatial dimensions for probability field. Available dims: {slice_data.dims}")
+            footprint = _get_probability_footprint(neighborhood_radius_km, grid_spacing_km)
+
+            def _convolve_spatial(values: np.ndarray) -> np.ndarray:
+                return fftconvolve(values, footprint, mode="same")
+
+            exceedance = xr.apply_ufunc(
+                _convolve_spatial,
+                exceedance,
+                input_core_dims=[spatial_dims],
+                output_core_dims=[spatial_dims],
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[np.float32],
+            )
+            exceedance = exceedance > 0.5
+
+        valid_members = (~valid_mask).sum(dim='member')
+        valid_hits = exceedance.where(~valid_mask, other=0.0).sum(dim='member')
+        probability = xr.where(valid_members > 0, valid_hits / valid_members * 100.0, np.nan)
+        probability = _apply_probability_smoothing(
+            probability,
+            valid_members == 0,
+            smoothing_radius_km,
+            grid_spacing_km,
+        )
+        return probability.astype(np.float32)
+
+    time_results = []
+
+    for t in range(var_data.sizes['time']):
+        time_slice = var_data.isel(time=t)
+        lead_time_results = []
+
+        for lt in range(time_slice.sizes['lead_time']):
+            lead_time_slice = time_slice.isel(lead_time=lt)
+
+            if 'level' in lead_time_slice.dims:
+                level_results = []
+                for lev in range(lead_time_slice.sizes['level']):
+                    level_slice = lead_time_slice.isel(level=lev)
+                    level_results.append(_probability_on_slice(level_slice))
+                lead_time_prob = xr.concat(level_results, dim='level')
+            else:
+                lead_time_prob = _probability_on_slice(lead_time_slice)
+
+            lead_time_results.append(lead_time_prob)
+
+        time_prob = xr.concat(lead_time_results, dim='lead_time')
+        time_results.append(time_prob)
+
+    var_processed = xr.concat(time_results, dim='time')
+    return _transpose_forecast_dims(var_processed)
 
 def build_member_file_list(date_str: str, forecast_dir: str, hour: int, n_ensembles: int) -> List[str]:
     """Construct expected per-member file paths for a given hour and validate existence.
@@ -301,7 +447,9 @@ def compute_ensemble_pmm(datetime_str: str,
                         forecast_dir: str = "./", 
                         output_dir: str = "./",
                         method: int = 2,
-                        n_ensembles: Optional[int] = None):
+                        n_ensembles: Optional[int] = None,
+                        prob_neighborhood_radius_km: float = 0.0,
+                        prob_smoothing_radius_km: float = 0.0):
     """Main ensemble post-processing function: loop hours 1..lead_hour and write per-hour outputs."""
     try:
         # Validate inputs
@@ -338,6 +486,7 @@ def compute_ensemble_pmm(datetime_str: str,
 
             processed_datasets: Dict[str, xr.DataArray] = {}
             spread_datasets: Dict[str, xr.DataArray] = {}
+            probability_datasets: Dict[str, xr.DataArray] = {}
 
             for var_name in ensemble_ds.data_vars:
                 # Skip CF metadata variables
@@ -363,39 +512,60 @@ def compute_ensemble_pmm(datetime_str: str,
                     spread_da = process_variable_spread(var_data)
                     spread_da.attrs['processing_method'] = 'ensemble_spread_stddev'
 
+                    if var_name in PROBABILITY_THRESHOLD_MAP:
+                        prob_config = PROBABILITY_THRESHOLD_MAP[var_name]
+                        for threshold in prob_config["thresholds"]:
+                            prob_name = _probability_var_name(var_name, threshold, prob_config["operator"])
+                            logger.info(
+                                f"Probability for {var_name} threshold {threshold:g} at f{h:02d} "
+                                f"using {prob_neighborhood_radius_km:g} km neighborhood radius"
+                            )
+                            prob_da = process_variable_probability(
+                                var_data,
+                                threshold=threshold,
+                                operator=prob_config["operator"],
+                                neighborhood_radius_km=prob_neighborhood_radius_km,
+                                smoothing_radius_km=prob_smoothing_radius_km,
+                            )
+                            prob_da = _attach_forecast_coords(prob_da, init_datetime, h)
+                            prob_da.attrs.update({
+                                'long_name': f"Probability of {var_name} {'>' if prob_config['operator'] == 'gt' else '<'} {threshold:g}",
+                                'units': '%',
+                                'processing_method': 'ensemble_neighborhood_probability'
+                                if prob_neighborhood_radius_km > 0 else 'ensemble_probability',
+                                'base_variable': var_name,
+                                'probability_threshold': threshold,
+                                'probability_operator': '>' if prob_config['operator'] == 'gt' else '<',
+                                'probability_neighborhood_radius_km': prob_neighborhood_radius_km,
+                                'probability_neighborhood_grid_spacing_km': 3.0,
+                                'probability_neighborhood_method': 'desi_footprint'
+                                if prob_neighborhood_radius_km > 0 else 'point',
+                                'probability_smoothing_radius_km': prob_smoothing_radius_km,
+                                'probability_smoothing_method': 'gaussian_filter'
+                                if prob_smoothing_radius_km > 0 else 'none',
+                            })
+                            probability_datasets[prob_name] = prob_da
+
                 # Ensure time and lead_time coords/dims exist for downstream writer
                 # If dims already exist, just set their coordinate values; else expand dims
-                if 'time' in da.dims and 'lead_time' in da.dims:
-                    da = da.assign_coords(time=[np.datetime64(init_datetime)],
-                                          lead_time=[int(h)])
-                else:
-                    da = da.expand_dims({
-                        'time': [np.datetime64(init_datetime)],
-                        'lead_time': [int(h)]
-                    })
-
-                if 'time' in spread_da.dims and 'lead_time' in spread_da.dims:
-                    spread_da = spread_da.assign_coords(time=[np.datetime64(init_datetime)],
-                                                        lead_time=[int(h)])
-                else:
-                    spread_da = spread_da.expand_dims({
-                        'time': [np.datetime64(init_datetime)],
-                        'lead_time': [int(h)]
-                    })
+                da = _attach_forecast_coords(da, init_datetime, h)
+                spread_da = _attach_forecast_coords(spread_da, init_datetime, h)
 
                 processed_datasets[var_name] = da
                 spread_datasets[var_name] = spread_da
 
             processed_ds = xr.Dataset(processed_datasets)
             spread_ds = xr.Dataset(spread_datasets)
+            probability_ds = xr.Dataset(probability_datasets)
 
             # Apply CF attributes
             processed_ds = apply_cf_attributes(processed_ds, init_datetime=init_datetime)
             spread_ds = apply_cf_attributes(spread_ds, init_datetime=init_datetime)
+            probability_ds = apply_cf_attributes(probability_ds, init_datetime=init_datetime)
 
             # Add processing-specific attributes
             processed_ds.attrs.update({
-                'postprocessing_method': 'PMM for REFC/APCP, mean for others',
+                'postprocessing_method': 'PMM for selected variables, mean for others',
                 'pmm_method': method,
                 'processed_timestamp': str(datetime.now()),
                 'source_files': [os.path.basename(f) for f in files]
@@ -406,6 +576,34 @@ def compute_ensemble_pmm(datetime_str: str,
                 'processed_timestamp': str(datetime.now()),
                 'source_files': [os.path.basename(f) for f in files]
             })
+
+            probability_ds.attrs.update({
+                'postprocessing_method': 'ensemble probabilities',
+                'probability_neighborhood_radius_km': prob_neighborhood_radius_km,
+                'probability_neighborhood_grid_spacing_km': 3.0,
+                'probability_neighborhood_method': 'desi_footprint'
+                if prob_neighborhood_radius_km > 0 else 'point',
+                'probability_smoothing_radius_km': prob_smoothing_radius_km,
+                'probability_smoothing_method': 'gaussian_filter'
+                if prob_smoothing_radius_km > 0 else 'none',
+                'ensemble_size': n_ensembles,
+                'processed_timestamp': str(datetime.now()),
+                'source_files': [os.path.basename(f) for f in files]
+            })
+            for var_name in probability_ds.data_vars:
+                if var_name == 'grid_mapping':
+                    continue
+                da = probability_ds[var_name]
+                base_var = da.attrs.get('base_variable', var_name)
+                threshold = da.attrs.get('probability_threshold')
+                operator = da.attrs.get('probability_operator', '>')
+                if threshold is not None:
+                    da.attrs['long_name'] = f"Probability of {base_var} {operator} {threshold:g}"
+                else:
+                    logger.warning(f"Probability variable {var_name} missing threshold metadata; preserving existing long_name")
+                da.attrs['units'] = '%'
+                da.attrs['grid_mapping'] = 'grid_mapping'
+                da.attrs['ensemble_size'] = n_ensembles
 
             cycle = init_datetime.hour
 
@@ -421,6 +619,11 @@ def compute_ensemble_pmm(datetime_str: str,
             spread_ds.to_netcdf(out_nc_spread, encoding=encoding)
             logger.info(f"Wrote NetCDF : {out_nc_spread}")
 
+            out_nc_prob = os.path.join(output_date_dir, f"hrrrcast_prob_f{h:02d}.nc")
+            encoding = get_cf_encoding(probability_ds, init_datetime)
+            probability_ds.to_netcdf(out_nc_prob, encoding=encoding)
+            logger.info(f"Wrote NetCDF : {out_nc_prob}")
+
             # Save per-hour GRIB2
             avg_grib2 = os.path.join(output_date_dir, f"hrrrcast.avg.t{cycle:02d}z.pgrb2.f{h:02d}")
             converter.save_grib2(init_datetime, processed_ds, avg_grib2)
@@ -430,10 +633,15 @@ def compute_ensemble_pmm(datetime_str: str,
             converter.save_grib2(init_datetime, spread_ds, spr_grib2)
             logger.info(f"Wrote GRIB2 : {spr_grib2}")
 
+            prob_grib2 = os.path.join(output_date_dir, f"hrrrcast.prob.t{cycle:02d}z.pgrb2.f{h:02d}")
+            converter.save_grib2(init_datetime, probability_ds, prob_grib2)
+            logger.info(f"Wrote GRIB2 : {prob_grib2}")
+
             # Close datasets to free memory
             ensemble_ds.close()
             processed_ds.close()
             spread_ds.close()
+            probability_ds.close()
 
         logger.info("Ensemble per-hour post-processing completed successfully")
 
@@ -454,6 +662,10 @@ def parse_arguments():
     parser.add_argument("--output_dir", default="./", help="Output directory for processed files")
     parser.add_argument("--method", type=int, default=2, choices=[1, 2],
                        help="PMM method for REFC: 1 for sorting per member, 2 for sorting all values together")
+    parser.add_argument("--prob_neighborhood_radius_km", type=float, default=float(os.environ.get("PMM_PROB_NEIGHBORHOOD_RADIUS_KM", "18")),
+                       help="Neighborhood radius in kilometers used for exceedance probabilities")
+    parser.add_argument("--prob_smoothing_radius_km", type=float, default=float(os.environ.get("PMM_PROB_SMOOTHING_RADIUS_KM", "36")),
+                       help="DESI-style Gaussian smoothing radius in kilometers applied to probability fields")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                        help="Logging level")
     parser.add_argument("--n_ensembles", type=int, default=None, help="Number of ensemble members (fallback to N_ENSEMBLES env)")
@@ -474,7 +686,9 @@ def main():
             forecast_dir=args.forecast_dir,
             output_dir=args.output_dir,
             method=args.method,
-            n_ensembles=args.n_ensembles
+            n_ensembles=args.n_ensembles,
+            prob_neighborhood_radius_km=args.prob_neighborhood_radius_km,
+            prob_smoothing_radius_km=args.prob_smoothing_radius_km,
         )
         
     except Exception as e:

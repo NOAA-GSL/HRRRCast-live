@@ -33,7 +33,7 @@ import numpy as np
 import xarray as xr
 import grib2io
 
-from cf_attributes import VARIABLE_METADATA
+from cf_attributes import VARIABLE_METADATA, PROBABILITY_THRESHOLD_MAP
 from utils import setup_logging
 
 logger = setup_logging("INFO")
@@ -46,7 +46,6 @@ GRIB_PARAM_MAP = {
     for var, meta in VARIABLE_METADATA.items()
     if "grib2" in meta
 }
-
 
 class Netcdf2Grib:
     # Class-level lock for grib2io operations (g2c library may not be thread-safe)
@@ -165,6 +164,72 @@ class Netcdf2Grib:
                 f"Error: {e}"
             )
 
+    def _apply_accumulation_metadata(
+        self,
+        msg: grib2io.Grib2Message,
+        ref_time: datetime,
+        lead_hour: int,
+        var_name: str,
+    ) -> None:
+        # GRIB2 accumulation fields are not instantaneous forecasts.
+        # APCP (hourly accumulation) spans [lead-1, lead]. APCP_TOTAL is a cumulative
+        # diagnostic from the forecast start, so it should begin at step 0.
+        start_hour = 0 if var_name == "APCP_TOTAL" else max(int(lead_hour) - 1, 0)
+        end_hour = int(lead_hour)
+        duration_hours = end_hour - start_hour
+        end_time = ref_time + timedelta(hours=end_hour)
+
+        # Product Definition Template 8 represents an interval as a forecast
+        # time at the beginning of the interval plus its duration.
+        msg.leadTime = timedelta(hours=start_hour)
+        msg.yearOfEndOfTimePeriod = end_time.year
+        msg.monthOfEndOfTimePeriod = end_time.month
+        msg.dayOfEndOfTimePeriod = end_time.day
+        msg.hourOfEndOfTimePeriod = end_time.hour
+        msg.minuteOfEndOfTimePeriod = end_time.minute
+        msg.secondOfEndOfTimePeriod = end_time.second
+        msg.numberOfTimeRanges = 1
+        msg.numberOfMissingValues = 0
+        msg.statisticalProcess = 1  # Code Table 4.10: accumulation
+        msg.typeOfTimeIncrementOfStatisticalProcess = 2  # Code Table 4.11
+        msg.unitOfTimeRangeOfStatisticalProcess = 1  # hours
+        msg.timeRangeOfStatisticalProcess = duration_hours
+        msg.unitOfTimeRangeOfSuccessiveFields = 1  # hours
+        msg.timeIncrementOfSuccessiveFields = 0
+
+    def _apply_probability_metadata(
+        self,
+        msg: grib2io.Grib2Message,
+        probability_threshold: Optional[float],
+        probability_operator: str,
+    ) -> None:
+        if probability_threshold is None:
+            return
+
+        # GRIB2 probability forecasts use product definition template 8 and encode
+        # the threshold/limit information in the message, which is what makes each
+        # probability threshold distinct in tools like wgrib2.
+        probability_type = 1 if probability_operator == ">" else 0
+        threshold_value = float(probability_threshold)
+        scaled_threshold = int(round(abs(threshold_value) * 10.0))
+
+        for attr_name, attr_value in (
+            ("typeOfProbability", probability_type),
+            ("probabilityType", probability_type),
+            ("scaleFactorOfLowerLimit", 0),
+            ("scaleFactorOfUpperLimit", 0),
+            ("scaledValueOfLowerLimit", scaled_threshold if probability_operator == ">" else 0),
+            ("scaledValueOfUpperLimit", scaled_threshold if probability_operator == "<" else 0),
+            ("scaleFactorOfLowerLimit", 0),
+            ("scaleFactorOfUpperLimit", 0),
+            ("lowerLimit", threshold_value if probability_operator == ">" else 0.0),
+            ("upperLimit", threshold_value if probability_operator == "<" else 0.0),
+        ):
+            try:
+                setattr(msg, attr_name, attr_value)
+            except Exception:
+                continue
+
     def _build_message(
         self,
         var_name: str,
@@ -174,6 +239,9 @@ class Netcdf2Grib:
         surface_value: Optional[float] = None,
         pdtn: Optional[int] = None,
         drtn: Optional[int] = None,
+        ensemble_size: Optional[int] = None,
+        probability_threshold: Optional[float] = None,
+        probability_operator: str = ">",
     ) -> grib2io.Grib2Message:
 
         # 1. Define Section 1 (Identification Section)
@@ -194,17 +262,32 @@ class Netcdf2Grib:
         ], dtype=np.int64)
 
         # 2. Construct message
+        # A lead-zero APCP record is an analysis, not a zero-length forecast
+        # accumulation. Use PDT 8 only once a forecast interval exists.
+        is_accumulation = (
+            probability_threshold is None
+            and int(lead_hour) > 0
+            and var_name in ["APCP", "APCP_TOTAL"]
+        )
+        message_pdtn = self.pdtn_default if pdtn is None else pdtn
+        if is_accumulation or probability_threshold is not None:
+            # grib2io initializes Section 4 from pdtn in the constructor. Changing
+            # productDefinitionTemplateNumber afterward can leave Section 4 using
+            # the old template and fail in some grib2io versions.
+            message_pdtn = 8
         msg = grib2io.Grib2Message(
             section1=section1,
             section3=self.section3,
-            pdtn=self.pdtn_default if pdtn is None else pdtn,
+            pdtn=message_pdtn,
             drtn=self.drtn_default if drtn is None else drtn,
         )
 
+        # Probability forecasts must be encoded with PDT 8 so that each threshold
+        # can be distinguished in downstream GRIB products such as HREF.
+        self._apply_probability_metadata(msg, probability_threshold, probability_operator)
+
         # 3. Set parameter keys
-        if var_name not in GRIB_PARAM_MAP:
-            raise ValueError(f"Unknown variable {var_name} not in GRIB_PARAM_MAP")
-        disc, cat, num, default_surface, _ = GRIB_PARAM_MAP[var_name]
+        disc, cat, num, default_surface, _ = self._get_grib_param_info(var_name)
         msg.discipline = disc
         msg.parameterCategory = cat
         msg.parameterNumber = num
@@ -237,11 +320,28 @@ class Netcdf2Grib:
 
         # 4. Time metadata
         msg.unitOfForecastTime = 1  # hours
-        msg.leadTime = timedelta(hours=int(lead_hour))
+        if is_accumulation:
+            # APCP is the previous one-hour accumulation; APCP_TOTAL spans from
+            # forecast initialization through this lead time.
+            self._apply_accumulation_metadata(msg, ref_time, lead_hour, var_name)
+        else:
+            msg.leadTime = timedelta(hours=int(lead_hour))
 
-        # 5. Statistical processing
-        msg.typeOfStatisticalProcessing = 0
-        msg.numberOfTimeRanges = 0
+        if probability_threshold is not None:
+            msg.typeOfStatisticalProcessing = 0
+            msg.numberOfTimeRanges = 0
+
+        if ensemble_size is not None:
+            for attr_name, attr_value in (
+                ("perturbationNumber", 0),
+                ("numberOfForecastsInEnsemble", int(ensemble_size)),
+                ("numberOfMembersInEnsemble", int(ensemble_size)),
+                ("totalNumberOfEnsembleForecasts", int(ensemble_size)),
+            ):
+                try:
+                    setattr(msg, attr_name, attr_value)
+                except Exception:
+                    continue
 
         # 6. Adjust decimal scale factor to improve precision for select variables
         msg.binaryScaleFactor = 0
@@ -275,11 +375,83 @@ class Netcdf2Grib:
 
         return msg
 
+    def _resolve_probability_grib_mapping(self, var_name: str, base_var: str, operator: str) -> Tuple[int, int, int, int, Optional[float]]:
+        if base_var not in GRIB_PARAM_MAP:
+            raise ValueError(f"Unknown base variable for probability field {var_name}")
+        if base_var not in PROBABILITY_THRESHOLD_MAP:
+            raise ValueError(f"Unsupported probability field {base_var}")
+
+        prob_config = PROBABILITY_THRESHOLD_MAP[base_var]
+        expected_operator = prob_config["operator"]
+        if (operator in (">", "GT") and expected_operator != "gt") or (operator in ("<", "LT") and expected_operator != "lt"):
+            raise ValueError(f"Unsupported probability operator for {var_name}")
+
+        disc, _, _, default_surface, surface_value = GRIB_PARAM_MAP[base_var]
+        return disc, GRIB_PARAM_MAP[base_var][1], GRIB_PARAM_MAP[base_var][2], default_surface, surface_value
+
+    def _parse_probability_var_name(self, var_name: str) -> Optional[Tuple[str, str, float]]:
+        if "_PROB_" not in var_name:
+            return None
+
+        base_var, suffix = var_name.split("_PROB_", 1)
+        if not base_var or not suffix:
+            return None
+
+        operator = None
+        rest = suffix
+        for token in ("GT", "LT"):
+            if suffix.startswith(token):
+                operator = token
+                rest = suffix[len(token):]
+                break
+        if operator is None:
+            return None
+
+        if not rest:
+            return None
+
+        if rest.startswith("m"):
+            threshold = -float(rest[1:].replace("p", "."))
+        else:
+            threshold = float(rest.replace("p", "."))
+
+        return base_var, operator, threshold
+
+    def _get_grib_param_info(self, var_name: str, da: Optional[xr.DataArray] = None) -> Tuple[int, int, int, int, Optional[float]]:
+        if da is not None and "base_variable" in da.attrs and "probability_threshold" in da.attrs:
+            base_var = str(da.attrs["base_variable"])
+            operator = str(da.attrs.get("probability_operator", ">"))
+            return self._resolve_probability_grib_mapping(var_name, base_var, operator)
+
+        parsed = self._parse_probability_var_name(var_name)
+        if parsed is not None:
+            base_var, operator, threshold = parsed
+            if base_var in PROBABILITY_THRESHOLD_MAP:
+                if threshold not in PROBABILITY_THRESHOLD_MAP[base_var]["thresholds"]:
+                    # Thresholds are stored as floats. Allow a small tolerance to cover
+                    # representation differences like 12.7 vs 12.700000762939453.
+                    threshold_matches = any(abs(float(th) - float(threshold)) < 1e-6 for th in PROBABILITY_THRESHOLD_MAP[base_var]["thresholds"])
+                    if not threshold_matches:
+                        raise ValueError(f"Unsupported probability threshold {threshold} for {base_var}")
+                return self._resolve_probability_grib_mapping(var_name, base_var, operator)
+
+        if var_name in GRIB_PARAM_MAP:
+            return GRIB_PARAM_MAP[var_name]
+
+        raise ValueError(f"Unknown variable {var_name} not in GRIB_PARAM_MAP")
+
     def _get_surface_type_and_value(self, var_name: str, ds: xr.Dataset, da: xr.DataArray) -> Tuple[int, Optional[float]]:
-        if var_name not in GRIB_PARAM_MAP:
-            raise ValueError(f"Unknown variable {var_name} not in GRIB_PARAM_MAP")
-        _, _, _, surface_type, surface_value = GRIB_PARAM_MAP[var_name]
+        _, _, _, surface_type, surface_value = self._get_grib_param_info(var_name, da)
         return surface_type, surface_value
+
+    def _get_ensemble_size(self, ds: xr.Dataset, da: xr.DataArray) -> Optional[int]:
+        ensemble_size = da.attrs.get("ensemble_size", ds.attrs.get("ensemble_size"))
+        if ensemble_size is None:
+            return None
+        try:
+            return int(ensemble_size)
+        except (TypeError, ValueError):
+            return None
 
     def save_grib2(self, forecast_starttime: datetime, ds_hour: xr.Dataset, output_path: str) -> None:
         """Write a single-hour GRIB2 file from an xarray.Dataset using grib2io.
@@ -298,6 +470,7 @@ class Netcdf2Grib:
         # Prepare all messages outside the lock (parallel-safe operations)
         # This includes dataset iteration, numpy operations, and message building
         messages_to_write = []
+        current_var_name = None
 
         try:
             # Ensure y,x dims exist (rename from latitude/longitude if needed)
@@ -310,12 +483,18 @@ class Netcdf2Grib:
 
             # Loop over variables in sorted order for stable output
             for var_name in sorted(ds_loc.data_vars):
+                current_var_name = var_name
                 da = ds_loc[var_name]
-                if var_name not in GRIB_PARAM_MAP:
+                try:
+                    self._get_grib_param_info(var_name, da)
+                except ValueError:
                     logger.debug(f"Skipping unknown variable {var_name}")
                     continue
 
                 surface_type, surface_value = self._get_surface_type_and_value(var_name, ds_loc, da)
+                ensemble_size = self._get_ensemble_size(ds_loc, da)
+                probability_threshold = da.attrs.get("probability_threshold")
+                probability_operator = str(da.attrs.get("probability_operator", ">"))
 
                 # Pressure-level variables
                 if "level" in da.coords:
@@ -324,7 +503,16 @@ class Netcdf2Grib:
                         plevel = float(level)
                         if plevel < 2000:  # assume provided in hPa
                             plevel *= 100.0
-                        msg = self._build_message(var_name, forecast_starttime, lead, surface_type=100, surface_value=plevel)
+                        msg = self._build_message(
+                            var_name,
+                            forecast_starttime,
+                            lead,
+                            surface_type=100,
+                            surface_value=plevel,
+                            ensemble_size=ensemble_size,
+                            probability_threshold=probability_threshold,
+                            probability_operator=probability_operator,
+                        )
                         # Expect data shape (lead_time=1, time=1, level=1, y, x) or (lead_time=1, level=1, y, x)
                         # Squeeze removes singleton dimensions regardless of order
                         vals = np.squeeze(da.sel(level=level).values)
@@ -338,7 +526,16 @@ class Netcdf2Grib:
                         msg.data = np.asarray(vals2d)
                         messages_to_write.append(msg)
                 else:
-                    msg = self._build_message(var_name, forecast_starttime, lead, surface_type=surface_type, surface_value=surface_value)
+                    msg = self._build_message(
+                        var_name,
+                        forecast_starttime,
+                        lead,
+                        surface_type=surface_type,
+                        surface_value=surface_value,
+                        ensemble_size=ensemble_size,
+                        probability_threshold=probability_threshold,
+                        probability_operator=probability_operator,
+                    )
                     vals = np.squeeze(da.values)
                     if vals.ndim == 3:
                         vals2d = vals[0, 0, :, :]
@@ -349,7 +546,12 @@ class Netcdf2Grib:
                     msg.data = np.asarray(vals2d)
                     messages_to_write.append(msg)
         except Exception as e:
-            logger.warning("Error preparing GRIB messages: %s", e)
+            logger.warning(
+                "Error preparing GRIB message for %s (%s): %r",
+                current_var_name,
+                type(e).__name__,
+                e,
+            )
             return
 
         # Now serialize the grib2io operations (g2c library may not be thread-safe)
