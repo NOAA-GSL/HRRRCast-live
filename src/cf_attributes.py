@@ -80,12 +80,14 @@ VARIABLE_METADATA = {
         "units": "dBZ",
         "cmap": "pyart_NWSRef",
         "grib2": (0, 16, 196, 10, None),
+        "probability": {"thresholds": [10, 20, 30, 40, 50], "operator": "gt"},
     },
     "T2M": {
         "long_name": "2-meter temperature",
         "units": "K",
         "cmap": "coolwarm",
         "grib2": (0, 0, 0, 103, 2.0),
+        "probability": {"thresholds": [273.15], "operator": "lt"},
     },
     "UGRD10M": {
         "long_name": "U-component of 10-meter wind",
@@ -116,6 +118,7 @@ VARIABLE_METADATA = {
         "units": "K",
         "cmap": "coolwarm",
         "grib2": (0, 0, 6, 103, 2.0),
+        "probability": {"thresholds": [283.15, 285.93, 288.71, 291.48, 294.26], "operator": "gt"},
     },
     "TCDC": {
         "long_name": "Total cloud cover",
@@ -146,8 +149,16 @@ VARIABLE_METADATA = {
         "units": "m",
         "cmap": "plasma_r",
         "grib2": (0, 19, 0, 1, None),
+        "probability": {"thresholds": [400, 800, 1600, 3200, 6400], "operator": "lt"},
     },
     "APCP": {
+        "long_name": "Total precipitation",
+        "units": "kg m-2",
+        "cmap": "Blues",
+        "grib2": (0, 1, 8, 1, None),
+        "probability": {"thresholds": [12.7, 25.4, 50.8, 76.2], "operator": "gt"},
+    },
+    "APCP_TOTAL": {
         "long_name": "Total precipitation",
         "units": "kg m-2",
         "cmap": "Blues",
@@ -158,18 +169,21 @@ VARIABLE_METADATA = {
         "units": "m",
         "cmap": "cividis",
         "grib2": (0, 3, 5, 215, None),
+        "probability": {"thresholds": [305, 610, 915, 1372, 1830, 3050], "operator": "lt"},
     },
     "CAPE": {
         "long_name": "Convective available potential energy",
         "units": "J kg-1",
         "cmap": "Spectral_r",
         "grib2": (0, 7, 6, 1, None),
+        "probability": {"thresholds": [500, 1000, 1500, 2000, 3000], "operator": "gt"},
     },
     "CIN": {
         "long_name": "Convective inhibition",
         "units": "J kg-1",
         "cmap": "PuOr",
         "grib2": (0, 7, 7, 1, None),
+        "probability": {"thresholds": [0, -50, -100, -400], "operator": "lt"},
     },
     # Constant/static fields
     "LAND": {
@@ -209,6 +223,7 @@ VARIABLE_METADATA = {
         "units": "kg m-2",
         "cmap": "YlGnBu",
         "grib2": (0, 1, 3, 10, None),
+        "probability": {"thresholds": [25, 37.5, 50], "operator": "gt"},
     },
     # Precipitation diagnostics
     "CRAIN": {
@@ -275,11 +290,13 @@ VARIABLE_METADATA = {
         "units": "m s-1",
         "cmap": "viridis",
         "grib2": (0, 2, 1, 103, 10.0),
+        "probability": {"thresholds": [10.3, 15.4, 18.01, 20.6, 25.72], "operator": "gt"},
     },
     "WIND_MAX": {
         "long_name": "Maximum wind speed in lower atmospheric column",
         "units": "m s-1",
         "cmap": "viridis",
+        "probability": {"thresholds": [10.3, 15.4, 18.01, 20.6, 25.72], "operator": "gt"},
     },
     # Convective diagnostics
     "VUCSH_0_1km": {
@@ -341,6 +358,7 @@ VARIABLE_METADATA = {
         "units": "m2 s-2",
         "cmap": "PuOr",
         "grib2": (0, 7, 8, 103, (3000.0, 0.0)),
+        "probability": {"thresholds": [100, 200, 400], "operator": "gt"},
     },
     # Diagnostic fields - updraft helicity
     "MXUPHL_max_0_2km": {
@@ -444,6 +462,15 @@ VARIABLE_METADATA = {
         "cmap": "YlGnBu",
         "grib2": (0, 1, 1, 4, None),
     },
+}
+
+
+# Shared probability thresholds for ensemble probability products.
+# Values are derived from the per-variable metadata entries above.
+PROBABILITY_THRESHOLD_MAP = {
+    var: meta["probability"]
+    for var, meta in VARIABLE_METADATA.items()
+    if "probability" in meta
 }
 
 

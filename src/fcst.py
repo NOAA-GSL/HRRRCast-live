@@ -297,6 +297,13 @@ class WeatherForecaster:
                 )
             self.member_anchors[member] = anchor
 
+        # Per-member cumulative precipitation accumulation (diagnostic-only).
+        # This is not part of the model state; it is maintained separately so we can
+        # write an APCP_TOTAL field alongside the hourly APCP output.
+        self.apcp_total_state: Dict[int, np.ndarray] = {
+            member: np.zeros((nlat, nlon), dtype=np.float32) for member in self.members
+        }
+
         logger.info("Member anchors initialized; noise will be generated on-the-fly during inference")
 
 
@@ -450,6 +457,18 @@ class WeatherForecaster:
             logger.error(f"Failed applying inverse transforms: {e}")
         return ds
 
+    def _decode_apcp_channel(self, output: tf.Tensor, channel_index: int) -> np.ndarray:
+        """Decode one APCP model channel to physical accumulation units."""
+        normalized = np.asarray(output[0, :, :, channel_index].numpy(), dtype=np.float32)
+        transformed = (
+            normalized * self.channel_stds[channel_index]
+            + self.channel_means[channel_index]
+        )
+        return np.asarray(
+            inverse_log_transform_array(transformed),
+            dtype=np.float32,
+        )
+
     def build_single_hour_dataset(
         self,
         init_datetime: datetime,
@@ -457,6 +476,7 @@ class WeatherForecaster:
         lats: np.ndarray,
         lons: np.ndarray,
         forecast_norm: np.ndarray,
+        apcp_total: Optional[np.ndarray] = None,
     ) -> xr.Dataset:
         """Build an xarray.Dataset for a single lead hour from a normalized forecast slice.
 
@@ -504,6 +524,24 @@ class WeatherForecaster:
 
         # compute diagnostics
         ds_hour = compute_diagnostics(ds_hour)
+
+        # Diagnostic-only cumulative precipitation total for each member.
+        # This is intentionally separate from the model-predicted APCP field so the
+        # archived forecast remains hourly-accumulated while the diagnostic total is
+        # cumulative over the whole forecast.
+        if apcp_total is not None:
+            apcp_total_da = xr.DataArray(
+                np.expand_dims(np.expand_dims(apcp_total, axis=0), axis=0),
+                dims=("lead_time", "time", "latitude", "longitude"),
+                coords={
+                    "lead_time": ("lead_time", [hour]),
+                    "time": ("time", [init_datetime + timedelta(hours=int(hour))]),
+                    "latitude": ds_hour["latitude"],
+                    "longitude": ds_hour["longitude"],
+                },
+                name="APCP_TOTAL",
+            )
+            ds_hour["APCP_TOTAL"] = apcp_total_da
 
         # Apply CF-compliant long_name and units to all variables
         ds_hour = apply_cf_attributes(ds_hour, init_datetime=init_datetime)
@@ -829,10 +867,17 @@ class WeatherForecaster:
             except Exception as e:
                 logger.error(f"Failed writing GRIB2 hour {hour} for member {member}: {e}")
 
-        def build_and_submit_hour_outputs(hour: int, data: np.ndarray, member: int) -> None:
+        def build_and_submit_hour_outputs(hour: int, data: np.ndarray, member: int, apcp_total: Optional[np.ndarray] = None) -> None:
             """Build the dataset in a worker, then submit both file writes."""
             try:
-                ds_hour = self.build_single_hour_dataset(init_datetime, hour, lats, lons, data)
+                ds_hour = self.build_single_hour_dataset(
+                    init_datetime,
+                    hour,
+                    lats,
+                    lons,
+                    data,
+                    apcp_total=apcp_total,
+                )
             except Exception as e:
                 logger.error(f"Failed building dataset for hour {hour} member {member}: {e}")
                 return
@@ -849,14 +894,14 @@ class WeatherForecaster:
         max_pending_builds = 8
         build_semaphore = threading.Semaphore(max_pending_builds)
         
-        def submit_with_backpressure(hour: int, data_tensor: tf.Tensor, member: int) -> None:
+        def submit_with_backpressure(hour: int, data_tensor: tf.Tensor, member: int, apcp_total: Optional[np.ndarray] = None) -> None:
             """Submit build task with semaphore-based backpressure control.
             The tensor->numpy copy happens AFTER semaphore acquisition to prevent
             memory buildup when the queue is full.
             """
             build_semaphore.acquire()  # Block if queue is full
             data = data_tensor.numpy()  # Copy from GPU to CPU only after semaphore acquired
-            future = build_executor.submit(build_and_submit_hour_outputs, hour, data, member)
+            future = build_executor.submit(build_and_submit_hour_outputs, hour, data, member, apcp_total)
             future.add_done_callback(lambda _: build_semaphore.release())  # Release when done
             build_futures.append(future)
 
@@ -950,14 +995,24 @@ class WeatherForecaster:
                 # Process outputs for each member in batch
                 for batch_idx, member in enumerate(batch_members_list):
                     y = y_batch[batch_idx:batch_idx+1]
-                    
+
+                    apcp_var_index = None
+                    if "APCP" in self.metadata["sfc_vars"]:
+                        pl_count = len(self.metadata["pl_vars"]) * len(self.metadata["levels"])
+                        apcp_var_index = pl_count + self.metadata["sfc_vars"].index("APCP")
+                    apcp_total = None
+                    if apcp_var_index is not None:
+                        apcp_hour = self._decode_apcp_channel(y, apcp_var_index)
+                        apcp_total = self.apcp_total_state[member] + apcp_hour
+                        self.apcp_total_state[member] = apcp_total
+
                     # When we reach a 6-hour boundary, update the reference 
                     # state for this member
                     if hour % rollout_hour == 0:
                         state_from_hour[member] = y
 
                     # Store the output for this hour and member, then submit write task
-                    submit_with_backpressure(hour, y, member)  # Pass tensor, not numpy array
+                    submit_with_backpressure(hour, y, member, apcp_total)
 
         # Wait for all background work to complete. Build tasks must drain first so
         # they cannot submit into executors that are already shutting down.

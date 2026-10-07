@@ -42,7 +42,7 @@ if [ -v SLURM_ARRAY_TASK_ID ]; then
     fi
     MEMBER_RANGE="${start}-${end}"
 else
-    MEMBER_RANGE="avg spr"
+    MEMBER_RANGE="avg spr prob"
 fi
 
 echo "In plot, init_time=${INIT_TIME}, lead_hour=${LEAD_HOUR}, TASK_ID=${TASK_ID}, MEMBER_RANGE=${MEMBER_RANGE}"
