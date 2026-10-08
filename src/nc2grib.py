@@ -200,35 +200,37 @@ class Netcdf2Grib:
     def _apply_probability_metadata(
         self,
         msg: grib2io.Grib2Message,
+        var_name: str,
         probability_threshold: Optional[float],
         probability_operator: str,
     ) -> None:
         if probability_threshold is None:
             return
 
-        # GRIB2 probability forecasts use product definition template 8 and encode
-        # the threshold/limit information in the message, which is what makes each
-        # probability threshold distinct in tools like wgrib2.
+        # PDT 5/9 represent probability forecasts. Code Table 4.9 uses the lower
+        # limit for "below" and the upper limit for "above".
         probability_type = 1 if probability_operator == ">" else 0
         threshold_value = float(probability_threshold)
-        scaled_threshold = int(round(abs(threshold_value) * 10.0))
+        parsed = self._parse_probability_var_name(var_name)
+        probability_number = 1
+        total_probabilities = 1
+        if parsed is not None:
+            base_var, _, _ = parsed
+            thresholds = PROBABILITY_THRESHOLD_MAP[base_var]["thresholds"]
+            total_probabilities = len(thresholds)
+            probability_number = next(
+                index
+                for index, configured_threshold in enumerate(thresholds, start=1)
+                if abs(float(configured_threshold) - threshold_value) < 1e-6
+            )
 
-        for attr_name, attr_value in (
-            ("typeOfProbability", probability_type),
-            ("probabilityType", probability_type),
-            ("scaleFactorOfLowerLimit", 0),
-            ("scaleFactorOfUpperLimit", 0),
-            ("scaledValueOfLowerLimit", scaled_threshold if probability_operator == ">" else 0),
-            ("scaledValueOfUpperLimit", scaled_threshold if probability_operator == "<" else 0),
-            ("scaleFactorOfLowerLimit", 0),
-            ("scaleFactorOfUpperLimit", 0),
-            ("lowerLimit", threshold_value if probability_operator == ">" else 0.0),
-            ("upperLimit", threshold_value if probability_operator == "<" else 0.0),
-        ):
-            try:
-                setattr(msg, attr_name, attr_value)
-            except Exception:
-                continue
+        msg.forecastProbabilityNumber = probability_number
+        msg.totalNumberOfForecastProbabilities = total_probabilities
+        msg.typeOfProbability = probability_type
+        if probability_operator == ">":
+            msg.thresholdUpperLimit = threshold_value
+        else:
+            msg.thresholdLowerLimit = threshold_value
 
     def _build_message(
         self,
@@ -269,12 +271,28 @@ class Netcdf2Grib:
             and int(lead_hour) > 0
             and var_name in ["APCP", "APCP_TOTAL"]
         )
+        parsed_probability = self._parse_probability_var_name(var_name)
+        is_probability_accumulation = (
+            probability_threshold is not None
+            and int(lead_hour) > 0
+            and parsed_probability is not None
+            and parsed_probability[0] == "APCP"
+        )
         message_pdtn = self.pdtn_default if pdtn is None else pdtn
-        if is_accumulation or probability_threshold is not None:
+        if is_accumulation:
             # grib2io initializes Section 4 from pdtn in the constructor. Changing
             # productDefinitionTemplateNumber afterward can leave Section 4 using
             # the old template and fail in some grib2io versions.
             message_pdtn = 8
+        elif is_probability_accumulation:
+            # PDT 9 is the probability counterpart to PDT 8 and includes the
+            # accumulation interval plus its statistical-processing range.
+            message_pdtn = 9
+        elif probability_threshold is not None:
+            # PDT 5 is a probability forecast at a horizontal level or layer at
+            # a point in time. PDT 8 is for statistical processing over an
+            # interval and requires at least one time-range specification.
+            message_pdtn = 5
         msg = grib2io.Grib2Message(
             section1=section1,
             section3=self.section3,
@@ -282,9 +300,12 @@ class Netcdf2Grib:
             drtn=self.drtn_default if drtn is None else drtn,
         )
 
-        # Probability forecasts must be encoded with PDT 8 so that each threshold
-        # can be distinguished in downstream GRIB products such as HREF.
-        self._apply_probability_metadata(msg, probability_threshold, probability_operator)
+        self._apply_probability_metadata(
+            msg,
+            var_name,
+            probability_threshold,
+            probability_operator,
+        )
 
         # 3. Set parameter keys
         disc, cat, num, default_surface, _ = self._get_grib_param_info(var_name)
@@ -320,16 +341,13 @@ class Netcdf2Grib:
 
         # 4. Time metadata
         msg.unitOfForecastTime = 1  # hours
-        if is_accumulation:
+        if is_accumulation or is_probability_accumulation:
             # APCP is the previous one-hour accumulation; APCP_TOTAL spans from
             # forecast initialization through this lead time.
-            self._apply_accumulation_metadata(msg, ref_time, lead_hour, var_name)
+            accumulation_var = parsed_probability[0] if is_probability_accumulation else var_name
+            self._apply_accumulation_metadata(msg, ref_time, lead_hour, accumulation_var)
         else:
             msg.leadTime = timedelta(hours=int(lead_hour))
-
-        if probability_threshold is not None:
-            msg.typeOfStatisticalProcessing = 0
-            msg.numberOfTimeRanges = 0
 
         if ensemble_size is not None:
             for attr_name, attr_value in (
@@ -546,13 +564,10 @@ class Netcdf2Grib:
                     msg.data = np.asarray(vals2d)
                     messages_to_write.append(msg)
         except Exception as e:
-            logger.warning(
-                "Error preparing GRIB message for %s (%s): %r",
-                current_var_name,
-                type(e).__name__,
-                e,
-            )
-            return
+            raise RuntimeError(
+                f"Error preparing GRIB message for {current_var_name} "
+                f"({type(e).__name__}): {e!r}"
+            ) from e
 
         # Now serialize the grib2io operations (g2c library may not be thread-safe)
         with self._grib2io_lock:
@@ -568,9 +583,12 @@ class Netcdf2Grib:
                 for msg in messages_to_write:
                     msg.pack()  # g2c packing may use global state
                     g2.write(msg)
-            except Exception as e:
-                logger.warning("Error writing GRIB messages: %s", e)
-            finally:
+            except Exception:
+                g2.close()
+                if os.path.isfile(outfile):
+                    os.remove(outfile)
+                raise
+            else:
                 g2.close()
 
         # Optionally create an index via wgrib2 if available
