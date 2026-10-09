@@ -25,6 +25,7 @@ Usage:
     python compute_pmm.py "2024-05-06T23" 18 --forecast_dir /path/to/data --n_ensembles 4
 """
 import argparse
+from collections import deque
 import logging
 import os
 import sys 
@@ -38,7 +39,12 @@ from scipy.signal import fftconvolve
 from scipy import ndimage
 
 from nc2grib import Netcdf2Grib
-from cf_attributes import get_cf_encoding, apply_cf_attributes, PROBABILITY_THRESHOLD_MAP
+from cf_attributes import (
+    get_cf_encoding,
+    apply_cf_attributes,
+    PRECIP_ACCUMULATION_THRESHOLDS,
+    PROBABILITY_THRESHOLD_MAP,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -46,6 +52,8 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+PRECIP_ACCUMULATION_HOURS = tuple(PRECIP_ACCUMULATION_THRESHOLDS)
 
 def _format_threshold_token(threshold: float) -> str:
     if threshold < 0:
@@ -56,6 +64,13 @@ def _format_threshold_token(threshold: float) -> str:
 def _probability_var_name(base_var: str, threshold: float, operator: str) -> str:
     suffix = "GT" if operator == "gt" else "LT"
     return f"{base_var}_PROB_{suffix}{_format_threshold_token(threshold)}"
+
+
+def _precip_probability_var_name(accumulation_hours: int,
+                                 threshold: float,
+                                 operator: str) -> str:
+    base_var = f"APCP_{accumulation_hours:02d}H"
+    return _probability_var_name(base_var, threshold, operator)
 
 
 def _forecast_spatial_dims(var_data: xr.DataArray) -> List[str]:
@@ -469,6 +484,12 @@ def compute_ensemble_pmm(datetime_str: str,
         min_age_seconds = int(os.environ.get("PMM_MIN_AGE_SECONDS", "90"))
         timeout_seconds = int(os.environ.get("PMM_TIMEOUT_SECONDS", "600"))
 
+        # Keep only the hourly member precipitation fields needed by the longest
+        # accumulation. Rolling sums avoid rereading earlier member files for
+        # every forecast hour and accumulation period.
+        apcp_history = deque()
+        apcp_rolling_sums: Dict[int, np.ndarray] = {}
+
         for h in range(0, int(lead_hour) + 1):
             # Wait until files are present and stable before processing this hour
             # Hour 0: wait indefinitely; subsequent hours: max timeout_seconds
@@ -512,7 +533,7 @@ def compute_ensemble_pmm(datetime_str: str,
                     spread_da = process_variable_spread(var_data)
                     spread_da.attrs['processing_method'] = 'ensemble_spread_stddev'
 
-                    if var_name in PROBABILITY_THRESHOLD_MAP:
+                    if var_name in PROBABILITY_THRESHOLD_MAP and var_name != "APCP":
                         prob_config = PROBABILITY_THRESHOLD_MAP[var_name]
                         for threshold in prob_config["thresholds"]:
                             prob_name = _probability_var_name(var_name, threshold, prob_config["operator"])
@@ -553,6 +574,92 @@ def compute_ensemble_pmm(datetime_str: str,
 
                 processed_datasets[var_name] = da
                 spread_datasets[var_name] = spread_da
+
+            # APCP is an hourly member accumulation. Build trailing member
+            # accumulations before thresholding so probabilities describe the
+            # accumulated precipitation, not sums of hourly probabilities.
+            if h > 0 and "APCP" in ensemble_ds:
+                apcp_hour = ensemble_ds["APCP"]
+                for dim in ("time", "lead_time"):
+                    if dim in apcp_hour.dims:
+                        if apcp_hour.sizes[dim] != 1:
+                            raise ValueError(
+                                f"Expected singleton {dim} for APCP at f{h:02d}; "
+                                f"found {apcp_hour.sizes[dim]}"
+                            )
+                        apcp_hour = apcp_hour.isel({dim: 0}, drop=True)
+                apcp_hour = apcp_hour.astype(np.float32).load()
+                apcp_hour_values = apcp_hour.values
+                apcp_history.append(apcp_hour_values)
+
+                for accumulation_hours in PRECIP_ACCUMULATION_HOURS:
+                    if accumulation_hours not in apcp_rolling_sums:
+                        apcp_rolling_sums[accumulation_hours] = apcp_hour_values.copy()
+                    else:
+                        apcp_rolling_sums[accumulation_hours] += apcp_hour_values
+
+                    if len(apcp_history) > accumulation_hours:
+                        apcp_rolling_sums[accumulation_hours] -= (
+                            apcp_history[-accumulation_hours - 1]
+                        )
+
+                    if len(apcp_history) < accumulation_hours:
+                        continue
+
+                    accumulated_apcp = xr.DataArray(
+                        apcp_rolling_sums[accumulation_hours],
+                        coords=apcp_hour.coords,
+                        dims=apcp_hour.dims,
+                    )
+                    accumulated_apcp = _attach_forecast_coords(
+                        accumulated_apcp,
+                        init_datetime,
+                        h,
+                    )
+                    prob_config = PROBABILITY_THRESHOLD_MAP["APCP"]
+                    thresholds = PRECIP_ACCUMULATION_THRESHOLDS[accumulation_hours]
+                    for threshold in thresholds:
+                        prob_name = _precip_probability_var_name(
+                            accumulation_hours,
+                            threshold,
+                            prob_config["operator"],
+                        )
+                        logger.info(
+                            f"Probability for {accumulation_hours}h APCP threshold "
+                            f"{threshold:g} at f{h:02d} using "
+                            f"{prob_neighborhood_radius_km:g} km neighborhood radius"
+                        )
+                        prob_da = process_variable_probability(
+                            accumulated_apcp,
+                            threshold=threshold,
+                            operator=prob_config["operator"],
+                            neighborhood_radius_km=prob_neighborhood_radius_km,
+                            smoothing_radius_km=prob_smoothing_radius_km,
+                        )
+                        prob_da.attrs.update({
+                            'long_name': (
+                                f"Probability of {accumulation_hours}h APCP "
+                                f"> {threshold:g}"
+                            ),
+                            'units': '%',
+                            'processing_method': 'ensemble_neighborhood_probability'
+                            if prob_neighborhood_radius_km > 0 else 'ensemble_probability',
+                            'base_variable': 'APCP',
+                            'accumulation_hours': accumulation_hours,
+                            'probability_threshold': threshold,
+                            'probability_operator': '>',
+                            'probability_neighborhood_radius_km': prob_neighborhood_radius_km,
+                            'probability_neighborhood_grid_spacing_km': 3.0,
+                            'probability_neighborhood_method': 'desi_footprint'
+                            if prob_neighborhood_radius_km > 0 else 'point',
+                            'probability_smoothing_radius_km': prob_smoothing_radius_km,
+                            'probability_smoothing_method': 'gaussian_filter'
+                            if prob_smoothing_radius_km > 0 else 'none',
+                        })
+                        probability_datasets[prob_name] = prob_da
+
+                if len(apcp_history) > max(PRECIP_ACCUMULATION_HOURS):
+                    apcp_history.popleft()
 
             processed_ds = xr.Dataset(processed_datasets)
             spread_ds = xr.Dataset(spread_datasets)
@@ -597,8 +704,16 @@ def compute_ensemble_pmm(datetime_str: str,
                 base_var = da.attrs.get('base_variable', var_name)
                 threshold = da.attrs.get('probability_threshold')
                 operator = da.attrs.get('probability_operator', '>')
+                accumulation_hours = da.attrs.get('accumulation_hours')
                 if threshold is not None:
-                    da.attrs['long_name'] = f"Probability of {base_var} {operator} {threshold:g}"
+                    accumulation_label = (
+                        f"{int(accumulation_hours)}h "
+                        if accumulation_hours is not None else ""
+                    )
+                    da.attrs['long_name'] = (
+                        f"Probability of {accumulation_label}{base_var} "
+                        f"{operator} {threshold:g}"
+                    )
                 else:
                     logger.warning(f"Probability variable {var_name} missing threshold metadata; preserving existing long_name")
                 da.attrs['units'] = '%'

@@ -473,6 +473,15 @@ PROBABILITY_THRESHOLD_MAP = {
     if "probability" in meta
 }
 
+# HREF neighborhood-probability thresholds (mm) by trailing APCP accumulation.
+PRECIP_ACCUMULATION_THRESHOLDS = {
+    1: (12.7, 25.4, 50.8, 76.2),
+    3: (12.7, 25.4, 50.8, 76.2, 127.0),
+    6: (12.7, 25.4, 50.8, 76.2, 127.0),
+    12: (12.7, 25.4, 50.8, 76.2, 127.0, 203.2),
+    24: (12.7, 25.4, 50.8, 76.2, 127.0, 203.2),
+}
+
 
 # Derived dictionary for backward compatibility: CF attributes only
 __CF_ATTRS = {

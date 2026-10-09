@@ -342,8 +342,34 @@ class ForecastPlotter:
         else:
             im = ax.contourf(lons, lats, data, levels=20, cmap=cmap, vmin=vmin, vmax=vmax, extend='both')
         
-        # Add colorbar
-        cbar = plt.colorbar(im, ax=ax, shrink=0.5, pad=0.02)
+        # A line-only probability ContourSet may contain just one level for
+        # sparse APCP/CIN fields. Such a set has only one colorbar boundary and
+        # Matplotlib tries to access a nonexistent second boundary. Use the full
+        # probability normalization for the colorbar instead of the contour set.
+        colorbar_mappable = im
+        if is_probability:
+            probability_boundaries = np.asarray(norm.boundaries, dtype=float)
+            colorbar_mappable = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+            # An empty array lets some Matplotlib versions autoscale from the
+            # sparse ContourSet and collapse to one boundary. Supply the fixed
+            # probability range and boundaries explicitly.
+            colorbar_mappable.set_array(
+                np.array(
+                    [probability_boundaries[0], probability_boundaries[-1]],
+                    dtype=float,
+                )
+            )
+            cbar = fig.colorbar(
+                colorbar_mappable,
+                ax=ax,
+                boundaries=probability_boundaries,
+                ticks=probability_boundaries,
+                spacing='proportional',
+                shrink=0.5,
+                pad=0.02,
+            )
+        else:
+            cbar = fig.colorbar(colorbar_mappable, ax=ax, shrink=0.5, pad=0.02)
         cbar.set_label(f'{long_name} ({units})', fontsize=10)
         
         # Set title

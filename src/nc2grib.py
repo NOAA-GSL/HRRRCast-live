@@ -33,7 +33,11 @@ import numpy as np
 import xarray as xr
 import grib2io
 
-from cf_attributes import VARIABLE_METADATA, PROBABILITY_THRESHOLD_MAP
+from cf_attributes import (
+    VARIABLE_METADATA,
+    PRECIP_ACCUMULATION_THRESHOLDS,
+    PROBABILITY_THRESHOLD_MAP,
+)
 from utils import setup_logging
 
 logger = setup_logging("INFO")
@@ -170,11 +174,15 @@ class Netcdf2Grib:
         ref_time: datetime,
         lead_hour: int,
         var_name: str,
+        accumulation_hours: Optional[int] = None,
     ) -> None:
         # GRIB2 accumulation fields are not instantaneous forecasts.
         # APCP (hourly accumulation) spans [lead-1, lead]. APCP_TOTAL is a cumulative
         # diagnostic from the forecast start, so it should begin at step 0.
-        start_hour = 0 if var_name == "APCP_TOTAL" else max(int(lead_hour) - 1, 0)
+        if accumulation_hours is not None:
+            start_hour = max(int(lead_hour) - int(accumulation_hours), 0)
+        else:
+            start_hour = 0 if var_name == "APCP_TOTAL" else max(int(lead_hour) - 1, 0)
         end_hour = int(lead_hour)
         duration_hours = end_hour - start_hour
         end_time = ref_time + timedelta(hours=end_hour)
@@ -203,6 +211,8 @@ class Netcdf2Grib:
         var_name: str,
         probability_threshold: Optional[float],
         probability_operator: str,
+        base_variable: Optional[str] = None,
+        accumulation_hours: Optional[int] = None,
     ) -> None:
         if probability_threshold is None:
             return
@@ -214,8 +224,18 @@ class Netcdf2Grib:
         parsed = self._parse_probability_var_name(var_name)
         probability_number = 1
         total_probabilities = 1
-        if parsed is not None:
-            base_var, _, _ = parsed
+        base_var = base_variable
+        if base_var is None and parsed is not None:
+            base_var = parsed[0]
+        if base_var == "APCP" and accumulation_hours in PRECIP_ACCUMULATION_THRESHOLDS:
+            thresholds = PRECIP_ACCUMULATION_THRESHOLDS[accumulation_hours]
+            total_probabilities = len(thresholds)
+            probability_number = next(
+                index
+                for index, configured_threshold in enumerate(thresholds, start=1)
+                if abs(float(configured_threshold) - threshold_value) < 1e-6
+            )
+        elif base_var in PROBABILITY_THRESHOLD_MAP:
             thresholds = PROBABILITY_THRESHOLD_MAP[base_var]["thresholds"]
             total_probabilities = len(thresholds)
             probability_number = next(
@@ -244,6 +264,8 @@ class Netcdf2Grib:
         ensemble_size: Optional[int] = None,
         probability_threshold: Optional[float] = None,
         probability_operator: str = ">",
+        base_variable: Optional[str] = None,
+        accumulation_hours: Optional[int] = None,
     ) -> grib2io.Grib2Message:
 
         # 1. Define Section 1 (Identification Section)
@@ -271,12 +293,11 @@ class Netcdf2Grib:
             and int(lead_hour) > 0
             and var_name in ["APCP", "APCP_TOTAL"]
         )
-        parsed_probability = self._parse_probability_var_name(var_name)
         is_probability_accumulation = (
             probability_threshold is not None
             and int(lead_hour) > 0
-            and parsed_probability is not None
-            and parsed_probability[0] == "APCP"
+            and base_variable == "APCP"
+            and accumulation_hours is not None
         )
         message_pdtn = self.pdtn_default if pdtn is None else pdtn
         if is_accumulation:
@@ -305,10 +326,13 @@ class Netcdf2Grib:
             var_name,
             probability_threshold,
             probability_operator,
+            base_variable,
+            accumulation_hours,
         )
 
         # 3. Set parameter keys
-        disc, cat, num, default_surface, _ = self._get_grib_param_info(var_name)
+        parameter_var_name = base_variable if base_variable is not None else var_name
+        disc, cat, num, default_surface, _ = self._get_grib_param_info(parameter_var_name)
         msg.discipline = disc
         msg.parameterCategory = cat
         msg.parameterNumber = num
@@ -344,8 +368,14 @@ class Netcdf2Grib:
         if is_accumulation or is_probability_accumulation:
             # APCP is the previous one-hour accumulation; APCP_TOTAL spans from
             # forecast initialization through this lead time.
-            accumulation_var = parsed_probability[0] if is_probability_accumulation else var_name
-            self._apply_accumulation_metadata(msg, ref_time, lead_hour, accumulation_var)
+            accumulation_var = "APCP" if is_probability_accumulation else var_name
+            self._apply_accumulation_metadata(
+                msg,
+                ref_time,
+                lead_hour,
+                accumulation_var,
+                accumulation_hours=accumulation_hours,
+            )
         else:
             msg.leadTime = timedelta(hours=int(lead_hour))
 
@@ -513,6 +543,10 @@ class Netcdf2Grib:
                 ensemble_size = self._get_ensemble_size(ds_loc, da)
                 probability_threshold = da.attrs.get("probability_threshold")
                 probability_operator = str(da.attrs.get("probability_operator", ">"))
+                base_variable = da.attrs.get("base_variable")
+                accumulation_hours = da.attrs.get("accumulation_hours")
+                if accumulation_hours is not None:
+                    accumulation_hours = int(accumulation_hours)
 
                 # Pressure-level variables
                 if "level" in da.coords:
@@ -530,6 +564,8 @@ class Netcdf2Grib:
                             ensemble_size=ensemble_size,
                             probability_threshold=probability_threshold,
                             probability_operator=probability_operator,
+                            base_variable=base_variable,
+                            accumulation_hours=accumulation_hours,
                         )
                         # Expect data shape (lead_time=1, time=1, level=1, y, x) or (lead_time=1, level=1, y, x)
                         # Squeeze removes singleton dimensions regardless of order
@@ -553,6 +589,8 @@ class Netcdf2Grib:
                         ensemble_size=ensemble_size,
                         probability_threshold=probability_threshold,
                         probability_operator=probability_operator,
+                        base_variable=base_variable,
+                        accumulation_hours=accumulation_hours,
                     )
                     vals = np.squeeze(da.values)
                     if vals.ndim == 3:
