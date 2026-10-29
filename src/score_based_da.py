@@ -1,32 +1,43 @@
 """
 Observation operators for score-based data assimilation (SDA).
 
-This module implements sparse and local observation maps H together with their
-adjoints H_adjoint for use in analytical likelihood guidance.
+This module implements observation maps H together with their adjoint/Jacobian-
+transpose actions H_adjoint for use in analytical likelihood guidance.
 
 Notation:
     - x: full model state on the grid, typically shape (batch, lat, lon, channels)
-    - y = H(x): observations in observation space
-    - H_adjoint(r): adjoint action that maps an observation-space residual r back
-      to the full state space
+    - y: observations in observation space
+    - H: observation operator that maps full state x to observation space
+    - r: residual in observation space, r = H(x) - y
+    - H_adjoint(r): linear adjoint action that maps an observation-space residual
+        r back to the full state space
+    - H_adjoint(r, x): nonlinear Jacobian-transpose action J_H(x)^T r
 
 Adjoint interpretation:
     For a general nonlinear observation map H(x), the relevant object in data
     assimilation is the transpose of the Jacobian, J_H(x)^T.
 
-    All observation operators currently implemented in this file are linear in x
-    once their indices and weights are constructed. Therefore:
+    The sparse/local stencil operators are linear in x once their indices and
+    weights are constructed. Therefore:
+        H(x) = H * x
+        J_H(x) = dH(x)/dx = H
+    And the adjoint is simply:
+        H_adjoint = J_H(x)^T = H^T
+    and the residual mapped back to full state space is:
+        H_adjoint(r) =  H^T * r = H^T * (H(x) - y)
 
-        J_H(x) = H
-        H_adjoint = H^T = (dH/dx)^T
-
-    This is why the guidance computation can use H_adjoint directly without
-    automatic differentiation.
+    Nonlinear external operators and neural emulators can instead be adapted with
+    create_nonlinear_observation_operator. Their adjoint requires the state x at
+    which the Jacobian is evaluated.
 
 Operator families in this module:
     - Index operator: direct sparse sampling at exact grid points
     - Interpolation operator: weighted off-grid sampling using fixed stencils
     - Neighborhood operator: local averaging using fixed window kernels
+    - Footprint operator: uniform averaging over a circular grid-cell footprint
+    - Finite-difference operator: centered gradients or a five-point Laplacian
+    - Linear-combination operator: fixed combinations of colocated variable blocks
+    - Nonlinear adapter: explicit external adjoint or TensorFlow automatic VJP
 
 Implementation pattern:
     Each operator factory precomputes observation-space indices and weights,
@@ -34,323 +45,906 @@ Implementation pattern:
         - H: gather -> weight -> reduce
         - H_adjoint: expand residual -> weight -> scatter
 
+    Atmospheric observation blocks may optionally provide full-column
+    ``vertical_weight_profiles``. These replace the default two-level linear
+    interpolation and are tensor-composed with the selected horizontal stencil.
+
     The returned adjoint tensors are sparse in full state space. Entries that are
     never addressed by the operator remain zero. If multiple observation terms map
     to the same grid entry, their adjoint contributions are summed.
 """
+import logging
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 import numpy as np
 import tensorflow as tf
-import logging
-
-from typing import Optional, Callable, Tuple, List
 
 from diffusion_params import ALPHA_BAR
 
-# ==== Score-Based Data Assimilation (SDA) Observation Operators ====
+_StationLocation = tuple[float, float, float]
+_StationLocations = list[_StationLocation]
+_StationGroups = dict[str, _StationLocations]
+_StationSource = _StationLocations | _StationGroups
+_HorizontalStencil = tuple[np.ndarray, np.ndarray]
+_HorizontalStencilBuilder = Callable[
+    [_StationLocations, tuple[int, int]], _HorizontalStencil
+]
+_VerticalWeightProfiles = dict[int, np.ndarray]
 
-def create_observation_operator_index(
-    grid_shape: Tuple[int, int],
-    num_variables: int,
-    variable_indices: Optional[List[int]] = None,
-    station_locations: Optional[List[Tuple[int, int]]] = None,
-    station_groups: Optional[dict[str, List[Tuple[int, int]]]] = None,
-    station_locations_per_var: Optional[dict[int, str]] = None,
-) -> Tuple[Callable, Callable]:
-    """
-    Create index-based linear observation operator H and adjoint H^T for sparse observations.
-    
-    Supports:
-    - Selecting subset of variables (e.g., last k channels)
-    - Selecting subset of spatial locations (e.g., station locations)
-    - Combined: specific variables at specific locations
-    - Variable-specific station groups (different locations per variable via named groups)
-    
-    Args:
-        grid_shape (Tuple[int, int]): Spatial grid shape (lat, lon).
-        num_variables (int): Total number of variables/channels.
-        variable_indices (List[int], optional): Indices of observed variables.
-                                               If None, observes all variables.
-                                               Example: [2, 3] for last 2 variables.
-        station_locations (List[Tuple[int, int]], optional): List of (lat_idx, lon_idx)
-                                                            for observation locations.
-                                                            Applied to all observed variables.
-                                                            If None, observes all locations.
-                                                            Ignored if station_groups is provided.
-        station_groups (dict[str, List[Tuple[int, int]]], optional): Named dictionary of station
-                                                            location groups. Each group is a list of
-                                                            (lat_idx, lon_idx). Used with
-                                                            station_locations_per_var to assign different
-                                                            groups to different variables.
-                                                            Example: {'surface': [(10,20), (30,40)],
-                                                                      'radar': [(15,25), (50,55)]}
-        station_locations_per_var (dict[int, str], optional): 
-                                                            Dictionary mapping variable index to
-                                                            station group name (from station_groups keys).
-                                                            Allows different location groups per variable.
-                                                            Requires station_groups to be provided.
-                                                            Example: {2: 'surface', 3: 'surface', 4: 'radar'}
-                                                            (variables 2,3 use surface, variable 4 uses radar)
-    
-    Returns:
-        Tuple[H, H_adjoint]:
-            - H(x): Forward operator, extracts observed components
-            - H_adjoint(residual): Adjoint operator, scatters back to full space
+# ==== Helpers for constructing obs operators ====
 
-        Notes:
-            - This operator is linear in x. Its Jacobian is H itself, so
-                H_adjoint = H^T = (dH/dx)^T.
-            - H_adjoint returns a sparse full-state tensor with zeros at all
-                unobserved variable-location entries.
-            - If duplicate indices were ever provided, adjoint contributions at the
-                same grid entry would sum.
-    
-    Examples:
-        # Example 1: Observe all variables at specific stations
-        stations = [(10, 20), (30, 40), (50, 55)]
-        H, H_adj = create_observation_operator_index(
-            grid_shape=(64, 64),
-            num_variables=5,
-            station_locations=stations
-        )
-        
-        # Example 2: Observe last 2 variables at specific stations
-        H, H_adj = create_observation_operator_index(
-            grid_shape=(64, 64),
-            num_variables=5,
-            variable_indices=[3, 4],
-            station_locations=[(10, 20), (30, 40), (50, 55)]
-        )
-        
-        # Example 3: Observe last 2 variables at 5 stations
-        H, H_adj = create_observation_operator_index(
-            grid_shape=(64, 64),
-            num_variables=5,
-            variable_indices=[3, 4],
-            station_locations=[(10, 20), (30, 40), (50, 55), (15, 45), (55, 10)]
-        )
-        
-        # Example 4: Variable-specific station groups (different groups per variable)
-        # Define named station groups first
-        groups = {
-            'dense_network': [(10, 20), (30, 40)],
-            'sparse_network': [(15, 25), (35, 45), (50, 55)],
-            'single_site': [(5, 10)]
-        }
-        # Then assign variables to groups by name
-        H, H_adj = create_observation_operator_index(
-            grid_shape=(64, 64),
-            num_variables=5,
-            station_groups=groups,
-            station_locations_per_var={
-                2: 'dense_network',   # Variable 2 uses dense_network (2 stations)
-                3: 'sparse_network',  # Variable 3 uses sparse_network (3 stations)
-                4: 'single_site'      # Variable 4 uses single_site (1 station)
-            }
-        )
-        
-        # Example 5: Multiple variables sharing the same station group
-        H, H_adj = create_observation_operator_index(
-            grid_shape=(64, 64),
-            num_variables=5,
-            station_groups={
-                'surface_stations': [(10, 20), (30, 40), (50, 55)],
-                'upper_air_stations': [(5, 10), (60, 60)]
-            },
-            station_locations_per_var={
-                0: 'surface_stations',  # Temperature uses surface stations
-                1: 'surface_stations',  # Pressure uses surface stations
-                2: 'surface_stations',  # Humidity uses surface stations
-                4: 'upper_air_stations' # Upper-air temp uses upper-air stations
-            }
-        )
-    """
-    
-    lat_size, lon_size = grid_shape
-    
-    # Build observation mask from variable_indices and station_locations or station_groups
-    mask_np = np.zeros((lat_size, lon_size, num_variables), dtype=np.float32)
-    
-    if station_groups is not None and station_locations_per_var is not None:
-        # Variable-specific station groups (using named group keys)
-        if not isinstance(station_groups, dict) or len(station_groups) == 0:
-            raise ValueError("station_groups must be a non-empty dict mapping group names to station location lists.")
-        if not isinstance(station_locations_per_var, dict) or len(station_locations_per_var) == 0:
-            raise ValueError("station_locations_per_var must be a non-empty dict when using station_groups.")
-        
-        for var_idx, group_name in station_locations_per_var.items():
-            if not (0 <= var_idx < num_variables):
-                raise ValueError(f"Variable index {var_idx} out of range [0, {num_variables}).")
-            if group_name not in station_groups:
-                raise ValueError(f"Group name '{group_name}' not found in station_groups. Available: {list(station_groups.keys())}")
-            
-            group_stations = station_groups[group_name]
-            for lat_idx, lon_idx in group_stations:
-                mask_np[lat_idx, lon_idx, var_idx] = 1.0
-    
-    elif station_locations is not None:
-        # Sparse spatial locations (same for all selected variables)
-        if variable_indices is not None:
-            # Specific variables at specific locations
-            for lat_idx, lon_idx in station_locations:
-                for var_idx in variable_indices:
-                    mask_np[lat_idx, lon_idx, var_idx] = 1.0
-        else:
-            # All variables at specific locations
-            for lat_idx, lon_idx in station_locations:
-                mask_np[lat_idx, lon_idx, :] = 1.0
-    else:
-        raise ValueError("Either station_locations or (station_groups + station_locations_per_var) must be provided.")
-        
-    selected_vars_np = np.where(np.any(mask_np > 0, axis=(0, 1)))[0].astype(np.int32)
-    if selected_vars_np.size == 0:
-        raise ValueError("Observation mask selects no variables.")
+def _normalize_station_locations(station_locations) -> _StationLocations:
+    """Normalize station locations to (lat, lon, level) triplets."""
+    if station_locations is None:
+        raise ValueError("station_locations must not be None.")
 
-    # Keep exact station count per selected variable.
-    selected_locs_linear_per_var: list[tf.Tensor] = []
-    for var_idx in selected_vars_np:
-        locs_var = np.argwhere(mask_np[:, :, var_idx] > 0).astype(np.int32)
-        if locs_var.size == 0:
-            continue
-        locs_linear = locs_var[:, 0] * lon_size + locs_var[:, 1]
-        selected_locs_linear_per_var.append(tf.constant(locs_linear, dtype=tf.int32))
+    normalized = []
+    for loc in station_locations:
+        if isinstance(loc, np.ndarray):
+            loc = loc.tolist()
 
-    # Remove variables with zero selected stations.
-    selected_vars_np = np.array(
-        [v for v in selected_vars_np if np.any(mask_np[:, :, v] > 0)], dtype=np.int32
-    )
-    for i, var_idx in enumerate(selected_vars_np):
-        logging.debug(f"Variable {var_idx}: {selected_locs_linear_per_var[i].shape[0]} observed locations.")
-
-    if selected_vars_np.size == 0:
-        raise ValueError("Observation mask selects no variable-location pairs.")
-    
-    # Precompute scatter indices for H_adjoint at creation time.
-    # Build concatenated scatter indices once, reuse at every inference call.
-    all_batch_multipliers = []
-    all_loc_ids_static = []
-    all_var_ids_static = []
-
-    for i, var_idx in enumerate(selected_vars_np):
-        locs_linear = selected_locs_linear_per_var[i]
-        # Extract static shape; locs_linear is a tf.Tensor created with tf.constant
-        locs_numpy = locs_linear.numpy()
-        n_obs_i = len(locs_numpy)
-        
-        # For this variable: location IDs (tiled across batch at inference)
-        all_loc_ids_static.append(locs_numpy)
-        
-        # Variable ID (constant for all observations of this variable)
-        all_var_ids_static.append(np.full(n_obs_i, var_idx, dtype=np.int32))
-        
-        # Batch multiplier: how many obs per batch for this variable
-        all_batch_multipliers.append(n_obs_i)
-
-    # Concatenate static indices
-    scatter_loc_ids_static = np.concatenate(all_loc_ids_static, axis=0).astype(np.int32)
-    scatter_var_ids_static = np.concatenate(all_var_ids_static, axis=0).astype(np.int32)
-    scatter_batch_multiplier = np.array(all_batch_multipliers, dtype=np.int32)  # per-variable counts
-    total_observations = int(scatter_loc_ids_static.shape[0])
-    obs_split_sizes = tuple(int(count) for count in scatter_batch_multiplier)
-    
-    # Convert to TensorFlow constants
-    scatter_loc_ids_const = tf.constant(scatter_loc_ids_static, dtype=tf.int32)
-    scatter_var_ids_const = tf.constant(scatter_var_ids_static, dtype=tf.int32)
-    scatter_batch_multiplier_const = tf.constant(scatter_batch_multiplier, dtype=tf.int32)
-    
-    def H(x: tf.Tensor) -> tf.Tensor:
-        """
-        Forward observation operator: extract observed components.
-        
-        Args:
-            x: Full state, shape (..., lat, lon, channels)
-        
-        Returns:
-            List of observed tensors, one per selected variable.
-            Each tensor has shape (batch, n_stations_for_variable).
-        """
-        x = tf.cast(x, tf.float32)
-        batch_size = tf.shape(x)[0]
-        x_flat = tf.reshape(x, [batch_size, lat_size * lon_size, num_variables])
-        x_flat = tf.transpose(x_flat, perm=[0, 2, 1])
-
-        batch_ids = tf.repeat(tf.range(batch_size, dtype=tf.int32), total_observations)
-        var_ids_all = tf.tile(scatter_var_ids_const, [batch_size])
-        loc_ids_all = tf.tile(scatter_loc_ids_const, [batch_size])
-        gather_indices = tf.stack([batch_ids, var_ids_all, loc_ids_all], axis=1)
-
-        gathered = tf.gather_nd(x_flat, gather_indices)
-        gathered = tf.reshape(gathered, [batch_size, total_observations])
-
-        return tf.split(gathered, obs_split_sizes, axis=1)
-    
-    def H_adjoint(residual: tf.Tensor) -> tf.Tensor:
-        """
-        Adjoint (transpose) of observation operator: scatter residuals back.
-        
-        Args:
-            residual: Observation-space residual as list/tuple with one tensor per selected variable.
-                     Each tensor has shape (batch, n_stations_for_variable)
-                     or (n_stations_for_variable,).
-        
-        Returns:
-            Full-space gradient, shape (..., lat, lon, channels)
-        """
-        if not isinstance(residual, (list, tuple)):
-            raise TypeError("H_adjoint expects residual as list/tuple per selected variable.")
-
-        if len(residual) != len(selected_vars_np):
+        if not isinstance(loc, (tuple, list)) or len(loc) != 3:
             raise ValueError(
-                f"H_adjoint residual length {len(residual)} does not match selected vars {len(selected_vars_np)}."
+                "Each station location must be exactly (lat, lon, level)."
             )
 
-        first = tf.cast(residual[0], tf.float32)
-        if first.shape.rank == 1:
-            batch_size = 1
-        else:
-            batch_size = tf.shape(first)[0]
+        lat = float(loc[0])
+        lon = float(loc[1])
+        level = float(loc[2])
+        if not np.isfinite(lat) or not np.isfinite(lon):
+            raise ValueError(f"Station location {loc} contains a non-finite latitude/longitude.")
+        if not np.isfinite(level):
+            raise ValueError(f"Station location {loc} contains a non-finite vertical level.")
+        normalized.append((lat, lon, level))
 
-        # Flatten all residuals into single concatenated vector
-        all_updates = []
-        for i in range(len(selected_vars_np)):
-            res_i = tf.cast(residual[i], tf.float32)
-            if res_i.shape.rank == 1:
-                res_i = tf.expand_dims(res_i, axis=0)
-            all_updates.append(tf.reshape(res_i, [-1]))
-        updates = tf.concat(all_updates, axis=0)
-        
-        # Build batch IDs using precomputed per-variable counts
-        total_obs = tf.reduce_sum(scatter_batch_multiplier_const)
-        batch_ids = tf.repeat(tf.range(batch_size, dtype=tf.int32), total_obs)
-        
-        # Tile precomputed location/variable IDs across batch
-        loc_ids_all = tf.tile(scatter_loc_ids_const, [batch_size])
-        var_ids_all = tf.tile(scatter_var_ids_const, [batch_size])
+    return normalized
 
-        # Single scatter_nd call.
-        scatter_indices = tf.stack([batch_ids, loc_ids_all, var_ids_all], axis=1)
-        full_flat = tf.scatter_nd(
+
+def _validate_and_normalize_residuals(
+    residual,
+    expected_station_counts,
+    operator_name: str,
+) -> tuple[list[tf.Tensor], tf.Tensor | int]:
+    """Validate adjoint residual structure and return rank-2 float tensors."""
+    if not isinstance(residual, (list, tuple)):
+        raise TypeError(
+            f"{operator_name} expects a list/tuple with one tensor "
+            "per selected variable."
+        )
+    if len(residual) != len(expected_station_counts):
+        raise ValueError(
+            f"{operator_name} residual length {len(residual)} does not "
+            f"match selected vars {len(expected_station_counts)}."
+        )
+
+    ranks = [tf.convert_to_tensor(value).shape.rank for value in residual]
+    if any(rank not in (1, 2) for rank in ranks):
+        raise ValueError(
+            f"{operator_name} residual tensors must have rank 1 or 2; "
+            f"got ranks {ranks}."
+        )
+    if any(rank != ranks[0] for rank in ranks[1:]):
+        raise ValueError(
+            f"{operator_name} residual tensors must all be either "
+            f"unbatched or batched; got ranks {ranks}."
+        )
+
+    normalized = []
+    for i, (value, expected_count) in enumerate(zip(residual, expected_station_counts)):
+        tensor = tf.cast(value, tf.float32)
+        if ranks[0] == 1:
+            tensor = tf.expand_dims(tensor, axis=0)
+
+        checks = [
+            tf.debugging.assert_equal(
+                tf.shape(tensor)[1],
+                expected_count,
+                message=(
+                    f"{operator_name} residual {i} has the wrong "
+                    "number of stations."
+                ),
+            )
+        ]
+        if normalized:
+            checks.append(
+                tf.debugging.assert_equal(
+                    tf.shape(tensor)[0],
+                    tf.shape(normalized[0])[0],
+                    message=(
+                        f"{operator_name} residual {i} has an "
+                        "inconsistent batch size."
+                    ),
+                )
+            )
+        with tf.control_dependencies([check for check in checks if check is not None]):
+            normalized.append(tf.identity(tensor))
+
+    return normalized, tf.shape(normalized[0])[0]
+
+
+def _validate_guidance_observations(
+    y_obs,
+    metadata,
+    expected_batch_size: tf.Tensor,
+) -> list[tf.Tensor]:
+    """Validate guidance observations and return block-aligned rank-2 tensors."""
+    normalized, observation_batch_size = _validate_and_normalize_residuals(
+        y_obs,
+        metadata.observation_counts,
+        "guidance y_obs",
+    )
+    check = tf.debugging.assert_equal(
+        observation_batch_size,
+        expected_batch_size,
+        message="Guidance observations must match the model-state batch size.",
+    )
+    with tf.control_dependencies([check] if check is not None else []):
+        return [tf.identity(block) for block in normalized]
+
+
+def _validate_state_shape(
+    x: tf.Tensor,
+    grid_shape: tuple[int, int],
+    num_variables: int,
+    operator_name: str,
+) -> tf.Tensor:
+    """Cast and validate a full state tensor before stencil gathering."""
+    x = tf.cast(x, tf.float32)
+    if x.shape.rank != 4:
+        raise ValueError(
+            f"{operator_name} H expects rank-4 state "
+            "(batch, lat, lon, channels)."
+        )
+
+    expected = (*grid_shape, num_variables)
+    for axis, (actual, wanted) in enumerate(zip(x.shape[1:], expected), start=1):
+        if actual is not None and actual != wanted:
+            raise ValueError(
+                f"{operator_name} H state axis {axis} has size {actual}; "
+                f"expected {wanted}."
+            )
+
+    check = tf.debugging.assert_equal(
+        tf.shape(x)[1:],
+        tf.constant(expected, dtype=tf.int32),
+        message=f"{operator_name} H state shape does not match its configured grid.",
+    )
+    with tf.control_dependencies([check] if check is not None else []):
+        return tf.identity(x)
+
+
+def _effective_observation_weights(H: Callable, weights) -> list[tf.Tensor]:
+    """Project per-channel weights into each observation's channel mixture."""
+    weights_f32 = tf.cast(weights, tf.float32)
+    if weights_f32.shape.rank != 1:
+        raise ValueError(
+            "Guidance weights must be a rank-1 vector with one value per channel."
+        )
+    metadata = getattr(H, "metadata", None)
+    if metadata is not None:
+        expected_count = metadata.num_variables
+        actual_count = weights_f32.shape[0]
+        if actual_count is not None and actual_count != expected_count:
+            raise ValueError(
+                f"Guidance weights contain {actual_count} channels; "
+                f"expected {expected_count}."
+            )
+        check = tf.debugging.assert_equal(
+            tf.shape(weights_f32)[0],
+            expected_count,
+            message="Guidance weights have the wrong number of channels.",
+        )
+        with tf.control_dependencies([check] if check is not None else []):
+            weights_f32 = tf.identity(weights_f32)
+
+    channel_indices = getattr(H, "observation_channel_indices", None)
+    channel_weights = getattr(H, "observation_channel_weights", None)
+    if channel_indices is None or channel_weights is None:
+        return [weights_f32[var_idx] for var_idx in H.selected_vars]
+
+    return [
+        tf.reduce_sum(
+            tf.gather(weights_f32, tf.constant(indices, dtype=tf.int32))
+            * tf.constant(mixing_weights, dtype=tf.float32),
+            axis=1,
+        )
+        for indices, mixing_weights in zip(channel_indices, channel_weights)
+    ]
+
+
+def _validate_vertical_layout(
+    num_variables: int,
+    num_levels: Optional[int],
+    num_3d_fields: Optional[int],
+    num_2d_fields: Optional[int],
+) -> bool:
+    """Validate optional field-layout metadata and report whether it is enabled."""
+    layout_args = (num_levels, num_3d_fields, num_2d_fields)
+    vertical_interp = all(value is not None for value in layout_args)
+    if any(value is not None for value in layout_args) and not vertical_interp:
+        raise ValueError(
+            "num_levels, num_3d_fields, and num_2d_fields must be provided together."
+        )
+    if not vertical_interp:
+        return False
+
+    if num_levels <= 0:
+        raise ValueError(f"num_levels must be positive; got {num_levels}.")
+    if num_3d_fields < 0 or num_2d_fields < 0:
+        raise ValueError("num_3d_fields and num_2d_fields must be non-negative.")
+
+    expected_variables = num_3d_fields * num_levels + num_2d_fields
+    if num_variables != expected_variables:
+        raise ValueError(
+            f"num_variables={num_variables} does not match the field layout "
+            f"({num_3d_fields} * {num_levels} + {num_2d_fields} = "
+            f"{expected_variables})."
+        )
+    return True
+
+
+def _validate_operator_inputs(
+    grid_shape: tuple[int, int],
+    num_variables: int,
+    variable_indices,
+    station_groups,
+    station_locations_per_var,
+) -> Optional[np.ndarray]:
+    """Validate inputs shared by all observation-operator factories."""
+    if len(grid_shape) != 2 or any(int(size) != size or size <= 0 for size in grid_shape):
+        raise ValueError(f"grid_shape must contain two positive integers; got {grid_shape}.")
+    if int(num_variables) != num_variables or num_variables <= 0:
+        raise ValueError(f"num_variables must be a positive integer; got {num_variables}.")
+
+    if (station_groups is None) != (station_locations_per_var is None):
+        raise ValueError(
+            "station_groups and station_locations_per_var must be provided together."
+        )
+
+    if station_groups is not None:
+        if not isinstance(station_groups, dict) or not station_groups:
+            raise ValueError("station_groups must be a non-empty dictionary.")
+        if not isinstance(station_locations_per_var, dict) or not station_locations_per_var:
+            raise ValueError("station_locations_per_var must be a non-empty dictionary.")
+        values = list(station_locations_per_var.keys())
+    elif variable_indices is None:
+        return None
+    else:
+        values = variable_indices
+
+    raw = np.asarray(values)
+    if raw.ndim != 1 or raw.size == 0:
+        raise ValueError("At least one variable index must be supplied as a 1D sequence.")
+    if any(
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        for value in values
+    ):
+        raise ValueError(f"Variable indices must be integers; got {values}.")
+
+    selected = raw.astype(np.int32)
+    invalid = (selected < 0) | (selected >= num_variables)
+    if np.any(invalid):
+        raise ValueError(
+            f"Variable indices must lie in [0, {num_variables}); "
+            f"got {selected[invalid].tolist()}."
+        )
+    return selected
+
+
+# ==== Data classes for compiled observation stencils ====
+
+@dataclass(frozen=True)
+class _StationAssignments:
+    """Normalized station groups and the selected variable-to-group mapping."""
+
+    selected_variables: np.ndarray
+    stations_by_group: _StationGroups
+    group_by_variable: dict[int, str]
+    source: _StationSource
+
+
+def _resolve_station_assignments(
+    num_variables: int,
+    validated_variables: Optional[np.ndarray],
+    station_locations: Optional[_StationLocations],
+    station_groups: Optional[_StationGroups],
+    station_locations_per_var: Optional[dict[int, str]],
+) -> _StationAssignments:
+    """Normalize shared or grouped stations into one operator-independent model."""
+    if station_groups is not None:
+        if validated_variables is None:
+            raise ValueError("Grouped stations must select at least one variable.")
+        selected_variables = np.sort(validated_variables)
+        group_by_variable = {
+            int(variable): group_name
+            for variable, group_name in station_locations_per_var.items()
+        }
+        used_groups = set(group_by_variable.values())
+        unknown_groups = used_groups.difference(station_groups)
+        if unknown_groups:
+            raise ValueError(
+                f"Unknown station groups {sorted(unknown_groups)}; "
+                f"available groups are {list(station_groups)}."
+            )
+
+        stations_by_group = {}
+        for group_name, group_stations in station_groups.items():
+            if group_name not in used_groups:
+                continue
+            if not group_stations:
+                raise ValueError(f"Station group '{group_name}' is empty.")
+            stations_by_group[group_name] = _normalize_station_locations(group_stations)
+
+        return _StationAssignments(
+            selected_variables=selected_variables,
+            stations_by_group=stations_by_group,
+            group_by_variable=group_by_variable,
+            source=station_groups,
+        )
+
+    if station_locations is None or len(station_locations) == 0:
+        raise ValueError(
+            "Either station_locations or grouped station configuration must be provided."
+        )
+    selected_variables = (
+        np.arange(num_variables, dtype=np.int32)
+        if validated_variables is None
+        else validated_variables
+    )
+    shared_group = "__shared__"
+    return _StationAssignments(
+        selected_variables=selected_variables,
+        stations_by_group={
+            shared_group: _normalize_station_locations(station_locations)
+        },
+        group_by_variable={
+            int(variable): shared_group for variable in selected_variables
+        },
+        source=station_locations,
+    )
+
+
+@dataclass(frozen=True)
+class _ObservationBlock:
+    """Compiled stencil data for one selected state variable.
+
+    The first three arrays are aligned flattened stencil contributions. The
+    channel-mixture arrays retain the vertical composition for guidance weights.
+    """
+
+    variable_index: int
+    state_channel_indices: np.ndarray
+    location_indices: np.ndarray
+    weights: np.ndarray
+    observation_count: int
+    points_per_observation: int
+    mixed_channel_indices: np.ndarray
+    mixed_channel_weights: np.ndarray
+    station_levels: np.ndarray
+
+    def __post_init__(self) -> None:
+        if self.observation_count <= 0 or self.points_per_observation <= 0:
+            raise ValueError(
+                "Compiled blocks require positive observation and point counts."
+            )
+        contribution_count = self.observation_count * self.points_per_observation
+        contribution_shapes = {
+            self.state_channel_indices.shape,
+            self.location_indices.shape,
+            self.weights.shape,
+        }
+        if contribution_shapes != {(contribution_count,)}:
+            raise ValueError(
+                "Compiled state channels, locations, and weights must each have "
+                f"shape ({contribution_count},); got {contribution_shapes}."
+            )
+        if (
+            self.mixed_channel_indices.ndim != 2
+            or self.mixed_channel_indices.shape != self.mixed_channel_weights.shape
+        ):
+            raise ValueError(
+                "Mixed channel indices and weights must be aligned rank-2 arrays."
+            )
+        if self.mixed_channel_indices.shape[0] != self.observation_count:
+            raise ValueError(
+                "Channel mixtures must contain one row per observation."
+            )
+        if self.station_levels.shape != (self.observation_count,):
+            raise ValueError(
+                "station_levels must contain one level per observation."
+            )
+
+
+@dataclass(frozen=True)
+class _CompiledObservationStencil:
+    """Complete linear stencil consumed by the shared forward/adjoint executor."""
+
+    blocks: tuple[_ObservationBlock, ...]
+    station_locations: _StationSource
+
+    def __post_init__(self) -> None:
+        if not self.blocks:
+            raise ValueError("A compiled observation stencil must contain a block.")
+
+    @property
+    def selected_variables(self) -> np.ndarray:
+        return np.asarray(
+            [block.variable_index for block in self.blocks], dtype=np.int32
+        )
+
+    @property
+    def observation_counts(self) -> tuple[int, ...]:
+        return tuple(block.observation_count for block in self.blocks)
+
+
+@dataclass(frozen=True)
+class _ObservationMetadata:
+    """Stable block-aligned metadata shared by a forward/adjoint operator pair."""
+
+    num_variables: int
+    selected_variables: np.ndarray
+    observation_counts: tuple[int, ...]
+    station_levels_by_block: tuple[np.ndarray, ...]
+    channel_indices_by_block: tuple[np.ndarray, ...]
+    channel_weights_by_block: tuple[np.ndarray, ...]
+    station_source: _StationSource
+
+    def __post_init__(self) -> None:
+        if self.num_variables <= 0:
+            raise ValueError("Observation metadata requires a positive channel count.")
+        block_count = len(self.observation_counts)
+        aligned_values = (
+            self.selected_variables,
+            self.station_levels_by_block,
+            self.channel_indices_by_block,
+            self.channel_weights_by_block,
+        )
+        if any(len(values) != block_count for values in aligned_values):
+            raise ValueError("Observation metadata must align one entry per block.")
+
+        for index, observation_count in enumerate(self.observation_counts):
+            if self.station_levels_by_block[index].shape != (observation_count,):
+                raise ValueError(
+                    f"Station levels for block {index} do not match its observations."
+                )
+            if (
+                self.channel_indices_by_block[index].shape
+                != self.channel_weights_by_block[index].shape
+            ):
+                raise ValueError(
+                    f"Channel indices and weights for block {index} are not aligned."
+                )
+            if self.channel_indices_by_block[index].shape[0] != observation_count:
+                raise ValueError(
+                    f"Channel mixtures for block {index} do not match its observations."
+                )
+
+
+#==== Compiled forward/adjoint executor ====
+
+def _create_compiled_linear_operator(
+    grid_shape: tuple[int, int],
+    num_variables: int,
+    stencil: _CompiledObservationStencil,
+    operator_name: str,
+) -> tuple[Callable, Callable]:
+    """Create a linear forward/adjoint pair from a compiled observation stencil."""
+    lat_size, lon_size = grid_shape
+    blocks = stencil.blocks
+    observation_counts = stencil.observation_counts
+    contribution_counts = tuple(
+        block.observation_count * block.points_per_observation for block in blocks
+    )
+
+    state_channel_indices = np.concatenate(
+        [block.state_channel_indices for block in blocks]
+    ).astype(np.int32)
+    location_indices = np.concatenate(
+        [block.location_indices for block in blocks]
+    ).astype(np.int32)
+    weights = np.concatenate([block.weights for block in blocks]).astype(np.float32)
+    total_contributions = int(weights.size)
+
+    state_channel_indices_tf = tf.constant(state_channel_indices, dtype=tf.int32)
+    location_indices_tf = tf.constant(location_indices, dtype=tf.int32)
+    weights_tf = tf.constant(weights, dtype=tf.float32)
+    block_weights_tf = tuple(
+        tf.constant(
+            block.weights.reshape(
+                block.observation_count, block.points_per_observation
+            ),
+            dtype=tf.float32,
+        )
+        for block in blocks
+    )
+
+    def H(x: tf.Tensor) -> list[tf.Tensor]:
+        """Gather and reduce compiled stencil contributions."""
+        x = _validate_state_shape(x, grid_shape, num_variables, operator_name)
+        batch_size = tf.shape(x)[0]
+        x_flat = tf.transpose(
+            tf.reshape(x, [batch_size, lat_size * lon_size, num_variables]),
+            perm=[0, 2, 1],
+        )
+
+        gather_indices = tf.stack(
+            [
+                tf.repeat(tf.range(batch_size, dtype=tf.int32), total_contributions),
+                tf.tile(state_channel_indices_tf, [batch_size]),
+                tf.tile(location_indices_tf, [batch_size]),
+            ],
+            axis=1,
+        )
+        gathered = tf.gather_nd(x_flat, gather_indices)
+        weighted = gathered * tf.tile(weights_tf, [batch_size])
+        weighted = tf.reshape(weighted, [batch_size, total_contributions])
+
+        observations = []
+        for block, values in zip(blocks, tf.split(weighted, contribution_counts, axis=1)):
+            values = tf.reshape(
+                values,
+                [batch_size, block.observation_count, block.points_per_observation],
+            )
+            observations.append(tf.reduce_sum(values, axis=2))
+        return observations
+
+    def H_adjoint(residual) -> tf.Tensor:
+        """Expand and scatter residuals using the compiled forward weights."""
+        residual, batch_size = _validate_and_normalize_residuals(
+            residual, observation_counts, f"{operator_name} H_adjoint"
+        )
+
+        updates_by_batch = []
+        for block_residual, block_weights in zip(residual, block_weights_tf):
+            weighted = block_residual[:, :, tf.newaxis] * block_weights[tf.newaxis, :, :]
+            updates_by_batch.append(tf.reshape(weighted, [batch_size, -1]))
+        updates = tf.reshape(tf.concat(updates_by_batch, axis=1), [-1])
+
+        scatter_indices = tf.stack(
+            [
+                tf.repeat(tf.range(batch_size, dtype=tf.int32), total_contributions),
+                tf.tile(location_indices_tf, [batch_size]),
+                tf.tile(state_channel_indices_tf, [batch_size]),
+            ],
+            axis=1,
+        )
+        full_state = tf.scatter_nd(
             scatter_indices,
             updates,
             [batch_size, lat_size * lon_size, num_variables],
         )
+        return tf.reshape(full_state, [batch_size, lat_size, lon_size, num_variables])
 
-        result = tf.reshape(full_flat, [batch_size, lat_size, lon_size, num_variables])
-        
-        return result
-    
-    # Attach metadata to H and H_adjoint for use in guidance computation
-    H.selected_vars = selected_vars_np
-    H_adjoint.selected_vars = selected_vars_np
-    
+    metadata = _ObservationMetadata(
+        num_variables=num_variables,
+        selected_variables=stencil.selected_variables,
+        observation_counts=observation_counts,
+        station_levels_by_block=tuple(block.station_levels for block in blocks),
+        channel_indices_by_block=tuple(
+            block.mixed_channel_indices for block in blocks
+        ),
+        channel_weights_by_block=tuple(
+            block.mixed_channel_weights for block in blocks
+        ),
+        station_source=stencil.station_locations,
+    )
+
+    # Preserve station_levels as a compatibility view. New code should use the
+    # consistently block-aligned metadata.station_levels_by_block representation.
+    if isinstance(stencil.station_locations, dict):
+        legacy_station_levels = np.concatenate(metadata.station_levels_by_block)
+    else:
+        legacy_station_levels = metadata.station_levels_by_block[0]
+
+    for operator in (H, H_adjoint):
+        operator.metadata = metadata
+        operator.selected_vars = metadata.selected_variables
+        operator.observation_channel_indices = list(
+            metadata.channel_indices_by_block
+        )
+        operator.observation_channel_weights = list(
+            metadata.channel_weights_by_block
+        )
+        operator.observation_station_levels = metadata.station_levels_by_block
+        operator.station_levels = legacy_station_levels
+        operator.station_locations = metadata.station_source
+        operator.compiled_stencil = stencil
+        operator.grid_shape = grid_shape
+        operator.num_variables = num_variables
+
     return H, H_adjoint
 
+
+def _validate_vertical_weight_profiles(
+    profiles,
+    assignments: _StationAssignments,
+    num_levels: Optional[int],
+    num_3d_fields: Optional[int],
+) -> Optional[_VerticalWeightProfiles]:
+    """Validate and broadcast optional full-column weights by observation block."""
+    if profiles is None:
+        return None
+    if not isinstance(profiles, dict) or not profiles:
+        raise ValueError("vertical_weight_profiles must be a non-empty dictionary.")
+    if num_levels is None or num_3d_fields is None:
+        raise ValueError(
+            "vertical_weight_profiles require complete vertical field-layout metadata."
+        )
+
+    selected = {int(index) for index in assignments.selected_variables}
+    normalized = {}
+    for variable_index, values in profiles.items():
+        if (
+            isinstance(variable_index, (bool, np.bool_))
+            or not isinstance(variable_index, (int, np.integer))
+        ):
+            raise ValueError("Vertical weight profile keys must be integer variable indices.")
+        variable_index = int(variable_index)
+        if variable_index not in selected:
+            raise ValueError(
+                f"Vertical weight profile variable {variable_index} is not selected."
+            )
+        if variable_index < 0 or variable_index >= num_3d_fields * num_levels:
+            raise ValueError(
+                "Vertical weight profiles can only be assigned to atmospheric "
+                f"3D variables; got variable {variable_index}."
+            )
+
+        group_name = assignments.group_by_variable[variable_index]
+        observation_count = len(assignments.stations_by_group[group_name])
+        profile = np.asarray(values, dtype=np.float32)
+        if profile.ndim == 1:
+            if profile.shape != (num_levels,):
+                raise ValueError(
+                    f"Vertical weight profile for variable {variable_index} must "
+                    f"contain {num_levels} levels; got shape {profile.shape}."
+                )
+            profile = np.broadcast_to(
+                profile[np.newaxis, :], (observation_count, num_levels)
+            ).copy()
+        elif profile.shape != (observation_count, num_levels):
+            raise ValueError(
+                f"Vertical weight profiles for variable {variable_index} must have "
+                f"shape ({observation_count}, {num_levels}); got {profile.shape}."
+            )
+        if not np.all(np.isfinite(profile)):
+            raise ValueError(
+                f"Vertical weight profiles for variable {variable_index} must be finite."
+            )
+        if np.any(np.all(profile == 0.0, axis=1)):
+            raise ValueError(
+                f"Vertical weight profiles for variable {variable_index} must have "
+                "at least one nonzero weight per observation."
+            )
+        normalized[variable_index] = profile
+
+    return normalized
+
+
+def _compose_horizontal_vertical_stencil(
+    var_idx: int,
+    station_locations: _StationLocations,
+    horizontal_locs: np.ndarray,
+    horizontal_weights: np.ndarray,
+    num_levels: Optional[int] = None,
+    num_3d_fields: Optional[int] = None,
+    vertical_weight_profile: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray, np.ndarray]:
+    """Compose a horizontal stencil with linear model-level interpolation.
+
+    The returned channel indices and weights describe both the flattened
+    full stencil and the channel-only mixture for each observation. The latter
+    is used to project per-channel guidance weights into observation space.
+    """
+    num_stations = len(station_locations)
+    if horizontal_locs.shape != horizontal_weights.shape:
+        raise ValueError("Horizontal stencil locations and weights must have equal shapes.")
+    if horizontal_locs.ndim != 2 or horizontal_locs.shape[0] != num_stations:
+        raise ValueError(
+            "Horizontal stencil must have shape (number of stations, points per station)."
+        )
+
+    is_3d_var = (
+        num_levels is not None
+        and num_3d_fields is not None
+        and var_idx < num_3d_fields * num_levels
+    )
+    if not is_3d_var:
+        points_per_station = horizontal_weights.shape[1]
+        channel_indices = np.full((num_stations, 1), var_idx, dtype=np.int32)
+        channel_weights = np.ones((num_stations, 1), dtype=np.float32)
+        return (
+            np.full(num_stations * points_per_station, var_idx, dtype=np.int32),
+            horizontal_locs.reshape(-1).astype(np.int32),
+            horizontal_weights.reshape(-1).astype(np.float32),
+            points_per_station,
+            channel_indices,
+            channel_weights,
+        )
+
+    level_values = np.asarray(
+        [level for _, _, level in station_locations], dtype=np.float32
+    )
+    invalid = (level_values < 0.0) | (level_values > float(num_levels - 1))
+    if np.any(invalid):
+        invalid_values = np.unique(level_values[invalid]).tolist()
+        raise ValueError(
+            "Atmospheric station levels must lie within the model-level range "
+            f"[0, {num_levels - 1}]; got {invalid_values}. The pseudo-level is "
+            "valid only for 2D variables."
+        )
+
+    field_idx = int(var_idx // num_levels)
+    if vertical_weight_profile is None:
+        # Default vertical interpolation is deliberately linear and independent
+        # of the horizontal stencil family or polynomial order.
+        vertical_nodes, vertical_weights = _lagrange_weights_1d(
+            level_values, num_levels, order=1
+        )
+        channel_indices = (field_idx * num_levels + vertical_nodes).astype(np.int32)
+    else:
+        if vertical_weight_profile.shape != (num_stations, num_levels):
+            raise ValueError(
+                "Compiled vertical weight profiles must align with stations and levels."
+            )
+        vertical_weights = vertical_weight_profile
+        channel_indices = np.broadcast_to(
+            field_idx * num_levels + np.arange(num_levels, dtype=np.int32),
+            (num_stations, num_levels),
+        ).copy()
+
+    horizontal_points = horizontal_weights.shape[1]
+    vertical_points = vertical_weights.shape[1]
+    shape = (num_stations, horizontal_points, vertical_points)
+    var_ids = np.broadcast_to(
+        channel_indices[:, np.newaxis, :], shape
+    ).reshape(-1)
+    loc_ids = np.broadcast_to(
+        horizontal_locs[:, :, np.newaxis], shape
+    ).reshape(-1)
+    combined_weights = (
+        horizontal_weights[:, :, np.newaxis]
+        * vertical_weights[:, np.newaxis, :]
+    ).reshape(-1)
+
+    return (
+        var_ids.astype(np.int32),
+        loc_ids.astype(np.int32),
+        combined_weights.astype(np.float32),
+        horizontal_points * vertical_points,
+        channel_indices,
+        vertical_weights.astype(np.float32),
+    )
+
+
+def _compile_horizontal_stencils(
+    assignments: _StationAssignments,
+    grid_shape: tuple[int, int],
+    stencil_builder: _HorizontalStencilBuilder,
+) -> dict[str, _HorizontalStencil]:
+    """Build one reusable horizontal stencil for each unique station group."""
+    return {
+        group_name: stencil_builder(group_stations, grid_shape)
+        for group_name, group_stations in assignments.stations_by_group.items()
+    }
+
+
+def _compile_observation_stencil(
+    assignments: _StationAssignments,
+    horizontal_stencils: dict[str, _HorizontalStencil],
+    num_levels: Optional[int] = None,
+    num_3d_fields: Optional[int] = None,
+    vertical_weight_profiles: Optional[_VerticalWeightProfiles] = None,
+) -> _CompiledObservationStencil:
+    """Compose grouped horizontal stencils with channel/vertical structure."""
+    blocks = []
+    for variable_index in assignments.selected_variables:
+        group_name = assignments.group_by_variable[int(variable_index)]
+        group_stations = assignments.stations_by_group[group_name]
+        horizontal_locations, horizontal_weights = horizontal_stencils[group_name]
+        (
+            state_channels,
+            locations,
+            weights,
+            points_per_observation,
+            mixed_channels,
+            mixed_weights,
+        ) = _compose_horizontal_vertical_stencil(
+            int(variable_index),
+            group_stations,
+            horizontal_locations,
+            horizontal_weights,
+            num_levels=num_levels,
+            num_3d_fields=num_3d_fields,
+            vertical_weight_profile=(
+                vertical_weight_profiles.get(int(variable_index))
+                if vertical_weight_profiles is not None
+                else None
+            ),
+        )
+        blocks.append(
+            _ObservationBlock(
+                variable_index=int(variable_index),
+                state_channel_indices=state_channels,
+                location_indices=locations,
+                weights=weights,
+                observation_count=len(group_stations),
+                points_per_observation=points_per_observation,
+                mixed_channel_indices=mixed_channels,
+                mixed_channel_weights=mixed_weights,
+                station_levels=np.asarray(
+                    [level for _, _, level in group_stations], dtype=np.float32
+                ),
+            )
+        )
+
+    return _CompiledObservationStencil(
+        blocks=tuple(blocks),
+        station_locations=assignments.source,
+    )
+
+
+def _create_stencil_observation_operator(
+    grid_shape: tuple[int, int],
+    num_variables: int,
+    variable_indices: Optional[list[int]],
+    station_locations: Optional[_StationLocations],
+    station_groups: Optional[_StationGroups],
+    station_locations_per_var: Optional[dict[int, str]],
+    horizontal_stencil_builder: _HorizontalStencilBuilder,
+    operator_name: str,
+    num_levels: Optional[int],
+    num_3d_fields: Optional[int],
+    num_2d_fields: Optional[int],
+    vertical_weight_profiles=None,
+) -> tuple[Callable, Callable]:
+    """Run the shared construction pipeline for a fixed linear stencil operator."""
+    validated_variables = _validate_operator_inputs(
+        grid_shape,
+        num_variables,
+        variable_indices,
+        station_groups,
+        station_locations_per_var,
+    )
+    vertical_interpolation = _validate_vertical_layout(
+        num_variables, num_levels, num_3d_fields, num_2d_fields
+    )
+    assignments = _resolve_station_assignments(
+        num_variables,
+        validated_variables,
+        station_locations,
+        station_groups,
+        station_locations_per_var,
+    )
+    validated_vertical_profiles = _validate_vertical_weight_profiles(
+        vertical_weight_profiles,
+        assignments,
+        num_levels if vertical_interpolation else None,
+        num_3d_fields if vertical_interpolation else None,
+    )
+    horizontal_stencils = _compile_horizontal_stencils(
+        assignments, grid_shape, horizontal_stencil_builder
+    )
+    stencil = _compile_observation_stencil(
+        assignments,
+        horizontal_stencils,
+        num_levels=num_levels if vertical_interpolation else None,
+        num_3d_fields=num_3d_fields if vertical_interpolation else None,
+        vertical_weight_profiles=validated_vertical_profiles,
+    )
+    return _create_compiled_linear_operator(
+        grid_shape, num_variables, stencil, operator_name=operator_name
+    )
+
+# ==== Interpolation obs operators ====
 
 def _lagrange_weights_1d(
     f: np.ndarray,
     size: int,
     order: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute 1D Lagrange interpolation node indices and weights.
 
@@ -417,7 +1011,7 @@ def _compute_interp_stencil(
     lat_size: int,
     lon_size: int,
     order: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> _HorizontalStencil:
     """
     Compute 2D tensor-product interpolation stencil via outer product of 1D Lagrange stencils.
 
@@ -452,475 +1046,144 @@ def _compute_interp_stencil(
 
 
 def create_observation_operator_interp(
-    grid_shape: Tuple[int, int],
+    grid_shape: tuple[int, int],
     num_variables: int,
-    variable_indices: Optional[List[int]] = None,
-    station_locations: Optional[List[Tuple[float, float]]] = None,
-    station_groups: Optional[dict[str, List[Tuple[float, float]]]] = None,
+    variable_indices: Optional[list[int]] = None,
+    station_locations: Optional[_StationLocations] = None,
+    station_groups: Optional[_StationGroups] = None,
     station_locations_per_var: Optional[dict[int, str]] = None,
     order: int = 1,
-) -> Tuple[Callable, Callable]:
-    """
-    Create interpolation-based linear observation operator H and adjoint H^T.
+    num_levels: Optional[int] = None,
+    num_3d_fields: Optional[int] = None,
+    num_2d_fields: Optional[int] = None,
+    vertical_weight_profiles=None,
+) -> tuple[Callable, Callable]:
+    """Create a Lagrange-interpolating observation operator and its adjoint.
 
-    Supports:
-    - Selecting subset of variables (e.g., last k channels)
-    - Off-grid station locations specified as fractional grid indices
-    - Variable-specific station groups (different location groups per variable via named groups)
-    - Bilinear (order=1), biquadratic (order=2), or bicubic (order=3) interpolation
-    - Exact adjoint H^T using the same stencil weights as H
+    Every station must be a ``(lat, lon, level)`` triplet in fractional grid
+    coordinates. ``station_locations`` supplies one shared station set for the
+    selected variables. Alternatively, ``station_groups`` and
+    ``station_locations_per_var`` assign a named station set to each variable.
 
-    Station locations are interpreted in fractional grid-index coordinates
-    (lat_idx, lon_idx), not geographic degrees. Interpolation uses a
-    (order+1) × (order+1) tensor-product Lagrange stencil. The adjoint H^T
-    distributes each station residual back to those same neighbors using
-    the same Lagrange weights.
+    Horizontal interpolation uses a tensor-product Lagrange stencil of order
+    1, 2, or 3 (respectively 2x2, 3x3, or 4x4 points). Horizontal coordinates
+    are clipped to the grid, and stencil nodes beyond an edge are clamped to
+    boundary cells; repeated boundary contributions retain their weights.
 
-    Args:
-        grid_shape (Tuple[int, int]): Spatial grid shape (lat, lon).
-        num_variables (int): Total number of variables/channels.
-        variable_indices (List[int], optional): Indices of observed variables.
-                                               If None, observes all variables.
-                                               Example: [2, 3] for last 2 variables.
-                                               Ignored if station_groups is provided.
-        station_locations (List[Tuple[float, float]], optional): List of
-                                               fractional (lat_idx, lon_idx)
-                                               observation locations.
-                                               Applied to all observed variables.
-                                               Example: [(10.25, 20.75), (30.5, 40.1)].
-                                               Ignored if station_groups is provided.
-        station_groups (dict[str, List[Tuple[float, float]]], optional): Named dictionary of
-                                               station location groups. Each group is a list of
-                                               fractional (lat_idx, lon_idx). Used with
-                                               station_locations_per_var to assign different
-                                               groups to different variables.
-                                               Example: {'dense': [(10.25, 20.75)],
-                                                         'sparse': [(30.5, 40.1), (50.0, 55.0)]}
-        station_locations_per_var (dict[int, str], optional):
-                                               Dictionary mapping variable index to
-                                               station group name (from station_groups keys).
-                                               Allows different location groups per variable.
-                                               Requires station_groups to be provided.
-                                               Example: {2: 'dense', 3: 'sparse', 4: 'sparse'}
-        order (int): Interpolation polynomial order. Must be 1, 2, or 3.
-                     1 = bilinear     (2×2 stencil, K=4  neighbors per station)
-                     2 = biquadratic  (3×3 stencil, K=9  neighbors per station)
-                     3 = bicubic      (4×4 stencil, K=16 neighbors per station)
-                     Higher orders are smoother but may produce small negative
-                     weights near grid boundaries due to clamping. Default: 1.
+    When all field-layout arguments are supplied, 3D channels are interpolated
+    linearly between adjacent model levels. Levels outside the 3D range are
+    rejected. Appended 2D channels use the same horizontal stencil without
+    vertical mixing; their station level is metadata only.
+
+    ``vertical_weight_profiles`` may map a selected atmospheric variable index
+    to either one ``(num_levels,)`` profile shared by its observations or an
+    ``(num_observations, num_levels)`` array of observation-specific profiles.
+    Profiles are applied as supplied and are not automatically normalized.
+
+    The horizontal and vertical weights are compiled once and delegated to the
+    shared linear-stencil executor used by both the forward and adjoint paths.
 
     Returns:
-        Tuple[H, H_adjoint]:
-            - H(x): Forward operator, interpolates observations
-                    at station locations
-            - H_adjoint(residual): Adjoint operator, scatters weighted
-                    residuals back to full space
-
-    Notes:
-        - This operator is linear in x once interpolation stencils are fixed.
-            Therefore H_adjoint = H^T = (dH/dx)^T.
-        - Out-of-bounds station indices are clipped to valid grid range.
-        - If a station lies exactly on a grid point, interpolation reduces
-          to direct point sampling at that location.
-        - For order >= 2, stencil nodes that fall outside the grid are clamped,
-          which reduces effective polynomial order at boundaries.
-        - Biquadratic and bicubic weights can be negative (Runge phenomenon
-          suppression near boundaries); this is mathematically correct.
-
-    Examples:
-        # Example 1: Bilinear (default) — observe last 2 variables at off-grid stations
-        H, H_adj = create_observation_operator_interp(
-            grid_shape=(64, 64),
-            num_variables=5,
-            variable_indices=[3, 4],
-            station_locations=[(10.25, 20.75), (30.5, 40.1), (50.0, 55.0)]
-        )
-
-        # Example 2: Biquadratic — smoother gradients
-        H, H_adj = create_observation_operator_interp(
-            grid_shape=(64, 64),
-            num_variables=5,
-            station_locations=[(12.1, 8.9), (31.3, 44.7)],
-            order=2
-        )
-
-        # Example 3: Bicubic — highest-order interpolation
-        H, H_adj = create_observation_operator_interp(
-            grid_shape=(64, 64),
-            num_variables=5,
-            variable_indices=[3, 4],
-            station_locations=[(10.25, 20.75), (30.5, 40.1)],
-            order=3
-        )
-        
-        # Example 4: Variable-specific station groups
-        groups = {
-            'main_network': [(10.25, 20.75), (30.5, 40.1)],
-            'auxiliary': [(12.1, 8.9)],
-            'extended': [(50.0, 55.0), (31.3, 44.7), (5.5, 10.2)]
-        }
-        H, H_adj = create_observation_operator_interp(
-            grid_shape=(64, 64),
-            num_variables=5,
-            station_groups=groups,
-            station_locations_per_var={
-                2: 'main_network',  # Variable 2 uses main_network
-                3: 'auxiliary',     # Variable 3 uses auxiliary
-                4: 'extended'       # Variable 4 uses extended
-            },
-            order=1
-        )
+        ``(H, H_adjoint)``. ``H(x)`` returns one observation tensor per selected
+        variable, and ``H_adjoint(residual)`` applies the exact transpose of the
+        same compiled stencil to a matching residual sequence.
     """
-    lat_size, lon_size = grid_shape
-
     if order not in (1, 2, 3):
         raise ValueError(f"order must be 1, 2, or 3; got {order}.")
 
-    # Determine which variables to observe and their locations
-    if station_groups is not None and station_locations_per_var is not None:
-        # Variable-specific station groups (using named group keys)
-        if not isinstance(station_groups, dict) or len(station_groups) == 0:
-            raise ValueError("station_groups must be a non-empty dict mapping group names to station location lists.")
-        if not isinstance(station_locations_per_var, dict) or len(station_locations_per_var) == 0:
-            raise ValueError("station_locations_per_var must be a non-empty dict when using station_groups.")
-        
-        selected_vars_np = np.array(sorted(station_locations_per_var.keys()), dtype=np.int32)
-        
-        # Validate station groups and build group-to-variable mapping
-        group_to_vars = {}
-        for var_idx, group_name in station_locations_per_var.items():
-            if not (0 <= var_idx < num_variables):
-                raise ValueError(f"Variable index {var_idx} out of range [0, {num_variables}).")
-            if group_name not in station_groups:
-                raise ValueError(f"Group name '{group_name}' not found in station_groups. Available: {list(station_groups.keys())}")
-            
-            if group_name not in group_to_vars:
-                group_to_vars[group_name] = []
-            group_to_vars[group_name].append(var_idx)
-        
-        # Compute interpolation stencils once per unique station group
-        stencils_per_group = {}
-        for group_name, group_stations in station_groups.items():
-            if group_name not in group_to_vars:
-                # Skip unused groups
-                continue
-            
-            if not group_stations:
-                raise ValueError(f"Station group '{group_name}' is empty.")
-            
-            locs_np = np.asarray(group_stations, dtype=np.float32)
-            if locs_np.ndim != 2 or locs_np.shape[1] != 2:
-                raise ValueError(f"Station group '{group_name}' must be a list of (lat_idx, lon_idx).")
-            
-            # Clamp stations to valid index range
-            lat_f = np.clip(locs_np[:, 0], 0.0, float(lat_size - 1))
-            lon_f = np.clip(locs_np[:, 1], 0.0, float(lon_size - 1))
-            
-            # Compute stencil once for this group
-            neigh_locs, neigh_w = _compute_interp_stencil(lat_f, lon_f, lat_size, lon_size, order)
-            stencils_per_group[group_name] = (neigh_locs, neigh_w, len(group_stations))
-        
-        # Build per-variable data by referencing precomputed group stencils
-        use_groups = True
-    else:
-        # All selected variables share the same station locations
-        if station_locations is None or len(station_locations) == 0:
-            raise ValueError("Either station_locations or (station_groups + station_locations_per_var) must be provided.")
-        
-        if variable_indices is None:
-            selected_vars_np = np.arange(num_variables, dtype=np.int32)
-        else:
-            selected_vars_np = np.asarray(variable_indices, dtype=np.int32)
-
-        if selected_vars_np.size == 0:
-            raise ValueError("No variables selected for interpolation operator.")
-
-        stations_np = np.asarray(station_locations, dtype=np.float32)
-        if stations_np.ndim != 2 or stations_np.shape[1] != 2:
-            raise ValueError("station_locations must be a list of (lat_idx, lon_idx).")
-        
-        # Clamp stations to valid index range
-        lat_f = np.clip(stations_np[:, 0], 0.0, float(lat_size - 1))
-        lon_f = np.clip(stations_np[:, 1], 0.0, float(lon_size - 1))
-        
-        # Compute stencil once for the shared stations
-        neigh_locs, neigh_w = _compute_interp_stencil(lat_f, lon_f, lat_size, lon_size, order)
-        shared_stencil = (neigh_locs, neigh_w, len(stations_np))
-        use_groups = False
-
-    # Build per-variable stencil data
-    num_sel_vars = len(selected_vars_np)
-    neighbors_per_station = (order + 1) ** 2
-    
-    var_ids_points_list = []
-    loc_ids_points_list = []
-    w_points_list = []
-    obs_split_sizes_list = []
-    
-    for var_idx in selected_vars_np:
-        if use_groups:
-            # Get precomputed stencil for this variable's group
-            group_name = station_locations_per_var[int(var_idx)]
-            neigh_locs, neigh_w, num_stations_var = stencils_per_group[group_name]
-        else:
-            # Use shared stencil
-            neigh_locs, neigh_w, num_stations_var = shared_stencil
-        
-        # Store for this variable
-        total_points_var = num_stations_var * neighbors_per_station
-        var_ids_points_list.append(np.full(total_points_var, var_idx, dtype=np.int32))
-        loc_ids_points_list.append(neigh_locs.reshape(-1).astype(np.int32))
-        w_points_list.append(neigh_w.reshape(-1).astype(np.float32))
-        obs_split_sizes_list.append(num_stations_var)
-    
-    # Concatenate all variables
-    var_ids_points = np.concatenate(var_ids_points_list, axis=0)
-    loc_ids_points = np.concatenate(loc_ids_points_list, axis=0)
-    w_points = np.concatenate(w_points_list, axis=0)
-    total_points_all_vars = len(var_ids_points)
-    obs_split_sizes = tuple(obs_split_sizes_list)
-
-    var_ids_points_const = tf.constant(var_ids_points, dtype=tf.int32)
-    loc_ids_points_const = tf.constant(loc_ids_points, dtype=tf.int32)
-    w_points_const = tf.constant(w_points, dtype=tf.float32)
-    
-    # Store per-variable point counts for reshaping
-    points_per_var = [n_stations * neighbors_per_station for n_stations in obs_split_sizes_list]
-
-    def H(x: tf.Tensor) -> tf.Tensor:
-        """
-        Forward observation operator: interpolate observed values at station locations.
-
-        For each station, the value is a weighted sum of (order+1)^2 surrounding grid
-        points using precomputed tensor-product Lagrange weights.
-
-        Args:
-            x: Full model state, shape (batch, lat, lon, channels).
-
-        Returns:
-            List of interpolated observation tensors, one per selected variable.
-            Each tensor has shape (batch, n_stations_for_variable).
-        """
-        x = tf.cast(x, tf.float32)
-        batch_size = tf.shape(x)[0]
-
-        # [B, V, L] for indexed gather on (batch, var, location)
-        x_flat = tf.reshape(x, [batch_size, lat_size * lon_size, num_variables])
-        x_flat = tf.transpose(x_flat, perm=[0, 2, 1])
-
-        batch_ids = tf.repeat(tf.range(batch_size, dtype=tf.int32), total_points_all_vars)
-        var_ids_all = tf.tile(var_ids_points_const, [batch_size])
-        loc_ids_all = tf.tile(loc_ids_points_const, [batch_size])
-
-        gather_indices = tf.stack([batch_ids, var_ids_all, loc_ids_all], axis=1)
-        gathered = tf.gather_nd(x_flat, gather_indices)
-
-        w_all = tf.tile(w_points_const, [batch_size])
-        weighted = gathered * w_all
-        
-        # Reshape and sum per variable (each variable may have different number of stations)
-        weighted = tf.reshape(weighted, [batch_size, total_points_all_vars])
-        
-        # Split by per-variable point counts, then reduce over neighbors
-        weighted_split = tf.split(weighted, points_per_var, axis=1)
-        obs_list = []
-        for i, w_var in enumerate(weighted_split):
-            # Reshape to (batch, n_stations_var, neighbors_per_station)
-            n_stations_var = obs_split_sizes_list[i]
-            w_var_reshaped = tf.reshape(w_var, [batch_size, n_stations_var, neighbors_per_station])
-            # Sum over neighbors to get observations
-            obs_var = tf.reduce_sum(w_var_reshaped, axis=2)  # (batch, n_stations_var)
-            obs_list.append(obs_var)
-        
-        return obs_list
-
-    def H_adjoint(residual: tf.Tensor) -> tf.Tensor:
-        """
-        Adjoint (transpose) of interpolation operator: scatter weighted residuals back to grid.
-
-        Distributes each station residual to its (order+1)^2 neighboring grid points using
-        the same Lagrange weights used in H, ensuring H^T is the exact mathematical
-        transpose of H (i.e., <H x, r> = <x, H^T r> for all x, r).
-
-        Args:
-            residual: Observation-space residual as list/tuple with one tensor per selected
-                     variable. Each tensor has shape (batch, n_stations_for_variable) or (n_stations_for_variable,).
-
-        Returns:
-            Full-space gradient, shape (batch, lat, lon, channels).
-        """
-        if not isinstance(residual, (list, tuple)):
-            raise TypeError("H_adjoint expects residual as list/tuple per selected variable.")
-
-        if len(residual) != num_sel_vars:
-            raise ValueError(
-                f"H_adjoint residual length {len(residual)} does not match selected vars {num_sel_vars}."
-            )
-
-        first = tf.cast(residual[0], tf.float32)
-        if first.shape.rank == 1:
-            batch_size = 1
-        else:
-            batch_size = tf.shape(first)[0]
-
-        # Process each variable's residual and expand to neighbor points
-        all_updates = []
-        for i in range(num_sel_vars):
-            res_i = tf.cast(residual[i], tf.float32)
-            if res_i.shape.rank == 1:
-                res_i = tf.expand_dims(res_i, axis=0)  # (batch, n_stations_var)
-            
-            n_stations_var = obs_split_sizes_list[i]
-            # Reshape residual: (batch, n_stations_var, 1)
-            res_expanded = tf.expand_dims(res_i, axis=2)
-            
-            # Get weights for this variable: extract from concatenated weights
-            start_idx = sum(points_per_var[:i])
-            end_idx = start_idx + points_per_var[i]
-            w_var = w_points[start_idx:end_idx]
-            w_var_reshaped = tf.reshape(w_var, [n_stations_var, neighbors_per_station])
-            
-            # Weight residuals: (batch, n_stations_var, neighbors_per_station)
-            weighted = res_expanded * w_var_reshaped[tf.newaxis, :, :]
-            # Flatten to (batch * n_stations_var * neighbors_per_station)
-            all_updates.append(tf.reshape(weighted, [-1]))
-        
-        updates = tf.concat(all_updates, axis=0)
-
-        batch_ids = tf.repeat(tf.range(batch_size, dtype=tf.int32), total_points_all_vars)
-        loc_ids_all = tf.tile(loc_ids_points_const, [batch_size])
-        var_ids_all = tf.tile(var_ids_points_const, [batch_size])
-
-        scatter_indices = tf.stack([batch_ids, loc_ids_all, var_ids_all], axis=1)
-        full_flat = tf.scatter_nd(
-            scatter_indices,
-            updates,
-            [batch_size, lat_size * lon_size, num_variables],
+    def build_horizontal_stencil(group_stations, builder_grid_shape):
+        lat_size, lon_size = builder_grid_shape
+        coordinates = np.asarray(
+            [(lat, lon) for lat, lon, _ in group_stations], dtype=np.float32
         )
+        lat_f = np.clip(coordinates[:, 0], 0.0, float(lat_size - 1))
+        lon_f = np.clip(coordinates[:, 1], 0.0, float(lon_size - 1))
+        return _compute_interp_stencil(lat_f, lon_f, lat_size, lon_size, order)
 
-        return tf.reshape(full_flat, [batch_size, lat_size, lon_size, num_variables])
+    return _create_stencil_observation_operator(
+        grid_shape=grid_shape,
+        num_variables=num_variables,
+        variable_indices=variable_indices,
+        station_locations=station_locations,
+        station_groups=station_groups,
+        station_locations_per_var=station_locations_per_var,
+        horizontal_stencil_builder=build_horizontal_stencil,
+        operator_name="interp",
+        num_levels=num_levels,
+        num_3d_fields=num_3d_fields,
+        num_2d_fields=num_2d_fields,
+        vertical_weight_profiles=vertical_weight_profiles,
+    )
 
-    H.selected_vars = selected_vars_np
-    H_adjoint.selected_vars = selected_vars_np
+# ==== Neighborhood obs operators ====
 
-    return H, H_adjoint
+def _compute_neighborhood_stencil(
+    station_locations: _StationLocations,
+    grid_shape: tuple[int, int],
+    dlat: np.ndarray,
+    dlon: np.ndarray,
+    base_weights: np.ndarray,
+) -> _HorizontalStencil:
+    """Build a clipped horizontal neighborhood stencil for normalized stations."""
+    lat_size, lon_size = grid_shape
+    coordinates = np.asarray(
+        [(lat, lon) for lat, lon, _ in station_locations], dtype=np.float32
+    )
+    center_lat = np.clip(np.rint(coordinates[:, 0]), 0, lat_size - 1).astype(np.int32)
+    center_lon = np.clip(np.rint(coordinates[:, 1]), 0, lon_size - 1).astype(np.int32)
+
+    neighbor_lat = np.clip(
+        center_lat[:, np.newaxis] + dlat[np.newaxis, :], 0, lat_size - 1
+    )
+    neighbor_lon = np.clip(
+        center_lon[:, np.newaxis] + dlon[np.newaxis, :], 0, lon_size - 1
+    )
+    locations = (neighbor_lat * lon_size + neighbor_lon).astype(np.int32)
+    weights = np.broadcast_to(base_weights, locations.shape).astype(np.float32).copy()
+    return locations, weights
 
 
 def create_observation_operator_neighborhood(
-    grid_shape: Tuple[int, int],
+    grid_shape: tuple[int, int],
     num_variables: int,
-    variable_indices: Optional[List[int]] = None,
-    station_locations: Optional[List[Tuple[float, float]]] = None,
-    station_groups: Optional[dict[str, List[Tuple[float, float]]]] = None,
+    variable_indices: Optional[list[int]] = None,
+    station_locations: Optional[_StationLocations] = None,
+    station_groups: Optional[_StationGroups] = None,
     station_locations_per_var: Optional[dict[int, str]] = None,
     window_size: int = 3,
     kernel: str = "uniform",
     sigma: float = 1.0,
-) -> Tuple[Callable, Callable]:
-    """
-    Create neighborhood-averaging linear observation operator H and adjoint H^T.
+    num_levels: Optional[int] = None,
+    num_3d_fields: Optional[int] = None,
+    num_2d_fields: Optional[int] = None,
+    vertical_weight_profiles=None,
+) -> tuple[Callable, Callable]:
+    """Create a neighborhood-averaging observation operator and its adjoint.
 
-    This operator observes local neighborhood aggregates around each station instead
-    of point values. It supports both box averaging (uniform kernel) and Gaussian-
-    weighted averaging over an odd-sized square window.
+    Every station must be a ``(lat, lon, level)`` triplet in fractional grid
+    coordinates. ``station_locations`` supplies one shared station set for the
+    selected variables. Alternatively, ``station_groups`` and
+    ``station_locations_per_var`` assign a named station set to each variable.
 
-    Supports:
-    - Selecting subset of variables (e.g., last k channels)
-    - Variable-specific station groups (different location groups per variable via named groups)
-    - Uniform or Gaussian neighborhood kernels
+    Each horizontal center is rounded to the nearest grid index and clipped to
+    the grid. An odd ``window_size`` defines a square neighborhood with either
+    normalized uniform weights or normalized Gaussian weights using ``sigma``.
+    Window nodes beyond an edge are clipped to boundary cells, so their repeated
+    contributions implement replicate-boundary behavior.
 
-    Args:
-        grid_shape (Tuple[int, int]): Spatial grid shape (lat, lon).
-        num_variables (int): Total number of variables/channels.
-        variable_indices (List[int], optional): Indices of observed variables.
-                                               If None, observes all variables.
-                                               Example: [2, 3] for last 2 variables.
-                                               Ignored if station_groups is provided.
-        station_locations (List[Tuple[float, float]], optional): Station centers in
-                                               grid-index coordinates. Fractional values
-                                               are rounded to nearest grid index.
-                                               Applied to all observed variables.
-                                               Example: [(10.5, 20.5), (30.2, 40.8)].
-                                               Ignored if station_groups is provided.
-        station_groups (dict[str, List[Tuple[float, float]]], optional): Named dictionary of
-                                               station location groups. Each group is a list of
-                                               station centers (fractional grid indices). Used with
-                                               station_locations_per_var to assign different
-                                               groups to different variables.
-                                               Example: {'surface': [(10.5, 20.5)],
-                                                         'radar': [(30.2, 40.8), (50.0, 55.0)]}
-        station_locations_per_var (dict[int, str], optional):
-                                               Dictionary mapping variable index to
-                                               station group name (from station_groups keys).
-                                               Allows different location groups per variable.
-                                               Requires station_groups to be provided.
-                                               Example: {2: 'surface', 3: 'radar', 4: 'radar'}
-        window_size (int): Odd neighborhood width/height. 3 means 3x3, 5 means 5x5.
-                          Must be >= 1 and odd. Default: 3.
-        kernel (str): Neighborhood kernel type:
-                     - "uniform": equal weights over the full window
-                     - "gaussian": Gaussian weights using sigma
-                     Default: "uniform".
-        sigma (float): Gaussian stddev in grid-index units when kernel="gaussian".
-                      Must be > 0. Default: 1.0.
+    When all field-layout arguments are supplied, 3D channels are interpolated
+    linearly between adjacent model levels. Levels outside the 3D range are
+    rejected. Appended 2D channels are averaged horizontally without vertical
+    mixing; their station level is metadata only.
+
+    The horizontal and vertical weights are compiled once and delegated to the
+    shared linear-stencil executor used by both the forward and adjoint paths.
 
     Returns:
-        Tuple[H, H_adjoint]:
-            - H(x): Forward operator, returns neighborhood-aggregated observations
-            - H_adjoint(residual): Adjoint operator, scatters weighted residuals
-              back to the full grid.
-
-    Notes:
-        - This operator is linear in x once station centers and kernel weights are
-            fixed. Therefore H_adjoint = H^T = (dH/dx)^T.
-        - Out-of-bounds neighborhood nodes are clipped to the nearest valid grid cell
-          (replicate boundary condition).
-        - The adjoint is exact for this boundary treatment because it uses the same
-          clipped neighbor locations and identical kernel weights.
-    
-    Examples:
-        # Example 1: Uniform kernel — all variables use same stations
-        H, H_adj = create_observation_operator_neighborhood(
-            grid_shape=(64, 64),
-            num_variables=5,
-            variable_indices=[2, 3, 4],
-            station_locations=[(10.5, 20.5), (30.2, 40.8)],
-            window_size=3,
-            kernel="uniform"
-        )
-        
-        # Example 2: Gaussian kernel — smoother weighting
-        H, H_adj = create_observation_operator_neighborhood(
-            grid_shape=(64, 64),
-            num_variables=5,
-            station_locations=[(10.5, 20.5), (30.2, 40.8)],
-            window_size=5,
-            kernel="gaussian",
-            sigma=1.5
-        )
-        
-        # Example 3: Variable-specific station groups
-        groups = {
-            'surface_network': [(10.5, 20.5), (30.2, 40.8)],
-            'radar_sites': [(15.0, 25.0)],
-            'extended_network': [(5.0, 10.0), (50.0, 55.0), (32.0, 48.0)]
-        }
-        H, H_adj = create_observation_operator_neighborhood(
-            grid_shape=(64, 64),
-            num_variables=5,
-            station_groups=groups,
-            station_locations_per_var={
-                2: 'surface_network',  # Variable 2 uses surface_network
-                3: 'radar_sites',      # Variable 3 uses radar_sites
-                4: 'extended_network'  # Variable 4 uses extended_network
-            },
-            window_size=3,
-            kernel="gaussian",
-            sigma=1.0
-        )
+        ``(H, H_adjoint)``. ``H(x)`` returns one observation tensor per selected
+        variable, and ``H_adjoint(residual)`` applies the exact transpose of the
+        same compiled stencil to a matching residual sequence.
     """
-    lat_size, lon_size = grid_shape
-
     if window_size < 1 or window_size % 2 == 0:
         raise ValueError(f"window_size must be odd and >= 1; got {window_size}.")
 
@@ -931,7 +1194,6 @@ def create_observation_operator_neighborhood(
     if kernel == "gaussian" and sigma <= 0:
         raise ValueError(f"sigma must be > 0 for gaussian kernel; got {sigma}.")
 
-    # Compute base kernel weights (same for all stations)
     radius = window_size // 2
     offsets = np.arange(-radius, radius + 1, dtype=np.int32)
     dlat_grid, dlon_grid = np.meshgrid(offsets, offsets, indexing="ij")
@@ -946,389 +1208,612 @@ def create_observation_operator_neighborhood(
         base_w = np.exp(-0.5 * dist2 / (float(sigma) ** 2)).astype(np.float32)
     base_w = base_w / np.sum(base_w)
 
-    # Determine which variables to observe and their station locations
-    if station_groups is not None and station_locations_per_var is not None:
-        # Variable-specific station groups
-        selected_vars_np = np.array(sorted(station_locations_per_var.keys()), dtype=np.int32)
-        if selected_vars_np.size == 0:
-            raise ValueError("station_locations_per_var must specify at least one variable.")
-        
-        # Validate station groups and build group-to-variable mapping
-        group_to_vars = {}
-        for var_idx, group_name in station_locations_per_var.items():
-            if group_name not in station_groups:
-                available = list(station_groups.keys())
-                raise ValueError(
-                    f"Group '{group_name}' for variable {var_idx} not found in station_groups. "
-                    f"Available groups: {available}"
-                )
-            if group_name not in group_to_vars:
-                group_to_vars[group_name] = []
-            group_to_vars[group_name].append(var_idx)
-        
-        # Compute neighborhoods once per unique station group
-        neighborhoods_per_group = {}
-        for group_name, group_stations in station_groups.items():
-            if group_name not in group_to_vars:
-                # Skip unused groups
-                continue
-            
-            stations_np = np.array(group_stations, dtype=np.float32)
-            if stations_np.ndim != 2 or stations_np.shape[1] != 2:
-                raise ValueError(
-                    f"Station group '{group_name}' must be a list of (lat_idx, lon_idx) tuples."
-                )
-            
-            num_stations = len(group_stations)
-            
-            # Round to nearest grid index and clip
-            center_lat = np.rint(stations_np[:, 0]).astype(np.int32)
-            center_lon = np.rint(stations_np[:, 1]).astype(np.int32)
-            center_lat = np.clip(center_lat, 0, lat_size - 1)
-            center_lon = np.clip(center_lon, 0, lon_size - 1)
-            
-            # Build neighborhoods
-            neigh_lat = np.clip(center_lat[:, np.newaxis] + dlat[np.newaxis, :], 0, lat_size - 1)
-            neigh_lon = np.clip(center_lon[:, np.newaxis] + dlon[np.newaxis, :], 0, lon_size - 1)
-            neigh_locs = (neigh_lat * lon_size + neigh_lon).astype(np.int32)
-            neigh_w = np.tile(base_w[np.newaxis, :], [num_stations, 1]).astype(np.float32)
-            
-            neighborhoods_per_group[group_name] = (neigh_locs, neigh_w, num_stations)
-        
-        use_groups = True
-    else:
-        # Traditional: same stations for all selected variables
-        if station_locations is None or len(station_locations) == 0:
-            raise ValueError(
-                "Either (station_groups + station_locations_per_var) or station_locations must be provided."
-            )
-        
-        if variable_indices is None:
-            selected_vars_np = np.arange(num_variables, dtype=np.int32)
-        else:
-            selected_vars_np = np.asarray(variable_indices, dtype=np.int32)
-        
-        if selected_vars_np.size == 0:
-            raise ValueError("No variables selected for neighborhood operator.")
-        
-        stations_np = np.asarray(station_locations, dtype=np.float32)
-        if stations_np.ndim != 2 or stations_np.shape[1] != 2:
-            raise ValueError("station_locations must be a list of (lat_idx, lon_idx).")
-        
-        num_stations = len(stations_np)
-        
-        # Round to nearest grid index and clip
-        center_lat = np.rint(stations_np[:, 0]).astype(np.int32)
-        center_lon = np.rint(stations_np[:, 1]).astype(np.int32)
-        center_lat = np.clip(center_lat, 0, lat_size - 1)
-        center_lon = np.clip(center_lon, 0, lon_size - 1)
-        
-        # Build neighborhoods
-        neigh_lat = np.clip(center_lat[:, np.newaxis] + dlat[np.newaxis, :], 0, lat_size - 1)
-        neigh_lon = np.clip(center_lon[:, np.newaxis] + dlon[np.newaxis, :], 0, lon_size - 1)
-        neigh_locs = (neigh_lat * lon_size + neigh_lon).astype(np.int32)
-        neigh_w = np.tile(base_w[np.newaxis, :], [num_stations, 1]).astype(np.float32)
-        
-        shared_neighborhood = (neigh_locs, neigh_w, num_stations)
-        use_groups = False
-
-    # Build per-variable neighborhood data
-    num_sel_vars = len(selected_vars_np)
-    var_ids_points_list = []
-    loc_ids_points_list = []
-    w_points_list = []
-    obs_split_sizes_list = []
-    
-    for var_idx in selected_vars_np:
-        if use_groups:
-            # Get precomputed neighborhood for this variable's group
-            group_name = station_locations_per_var[int(var_idx)]
-            neigh_locs, neigh_w, num_stations_var = neighborhoods_per_group[group_name]
-        else:
-            # Use shared neighborhood
-            neigh_locs, neigh_w, num_stations_var = shared_neighborhood
-        
-        # Store for this variable
-        total_points_var = num_stations_var * neighbors_per_station
-        var_ids_points_list.append(np.full(total_points_var, var_idx, dtype=np.int32))
-        loc_ids_points_list.append(neigh_locs.reshape(-1).astype(np.int32))
-        w_points_list.append(neigh_w.reshape(-1).astype(np.float32))
-        obs_split_sizes_list.append(num_stations_var)
-    
-    # Concatenate all variables
-    var_ids_points = np.concatenate(var_ids_points_list, axis=0)
-    loc_ids_points = np.concatenate(loc_ids_points_list, axis=0)
-    w_points = np.concatenate(w_points_list, axis=0)
-    total_points_all_vars = len(var_ids_points)
-    obs_split_sizes = tuple(obs_split_sizes_list)
-
-    var_ids_points_const = tf.constant(var_ids_points, dtype=tf.int32)
-    loc_ids_points_const = tf.constant(loc_ids_points, dtype=tf.int32)
-    w_points_const = tf.constant(w_points, dtype=tf.float32)
-    
-    # Store per-variable point counts for reshaping
-    points_per_var = [n_stations * neighbors_per_station for n_stations in obs_split_sizes_list]
-
-    def H(x: tf.Tensor) -> tf.Tensor:
-        """
-        Forward observation operator: neighborhood-averaged observations.
-
-        For each station and selected variable, computes a weighted average over
-        an odd-sized local window centered at the rounded station index.
-        
-        Args:
-            x: Full model state, shape (batch, lat, lon, channels).
-        
-        Returns:
-            List of neighborhood-averaged observation tensors, one per selected variable.
-            Each tensor has shape (batch, n_stations_for_variable).
-        """
-        x = tf.cast(x, tf.float32)
-        batch_size = tf.shape(x)[0]
-
-        x_flat = tf.reshape(x, [batch_size, lat_size * lon_size, num_variables])
-        x_flat = tf.transpose(x_flat, perm=[0, 2, 1])
-
-        batch_ids = tf.repeat(tf.range(batch_size, dtype=tf.int32), total_points_all_vars)
-        var_ids_all = tf.tile(var_ids_points_const, [batch_size])
-        loc_ids_all = tf.tile(loc_ids_points_const, [batch_size])
-
-        gather_indices = tf.stack([batch_ids, var_ids_all, loc_ids_all], axis=1)
-        gathered = tf.gather_nd(x_flat, gather_indices)
-
-        w_all = tf.tile(w_points_const, [batch_size])
-        weighted = gathered * w_all
-        
-        # Reshape and sum per variable (each variable may have different number of stations)
-        weighted = tf.reshape(weighted, [batch_size, total_points_all_vars])
-        
-        # Split by per-variable point counts, then reduce over neighbors
-        weighted_split = tf.split(weighted, points_per_var, axis=1)
-        obs_list = []
-        for i, w_var in enumerate(weighted_split):
-            n_stations = obs_split_sizes_list[i]
-            w_var = tf.reshape(w_var, [batch_size, n_stations, neighbors_per_station])
-            obs_var = tf.reduce_sum(w_var, axis=2)  # Sum over neighbors
-            obs_list.append(obs_var)
-        
-        return obs_list
-
-    def H_adjoint(residual: tf.Tensor) -> tf.Tensor:
-        """
-        Adjoint of neighborhood operator: scatter weighted residuals to neighborhoods.
-
-        Uses the same neighborhood kernel and clipped locations as H, ensuring exact
-        transpose consistency under the replicate-boundary convention.
-        
-        Args:
-            residual: Observation-space residual as list/tuple with one tensor per selected
-                     variable. Each tensor has shape (batch, n_stations_for_variable) or (n_stations_for_variable,).
-        
-        Returns:
-            Full-space gradient, shape (batch, lat, lon, channels).
-        """
-        if not isinstance(residual, (list, tuple)):
-            raise TypeError("H_adjoint expects residual as list/tuple per selected variable.")
-
-        if len(residual) != num_sel_vars:
-            raise ValueError(
-                f"H_adjoint residual length {len(residual)} does not match selected vars {num_sel_vars}."
-            )
-
-        first = tf.cast(residual[0], tf.float32)
-        if first.shape.rank == 1:
-            batch_size = 1
-        else:
-            batch_size = tf.shape(first)[0]
-
-        # Process each variable's residual and expand to neighbor points
-        all_updates = []
-        offset = 0
-        for i in range(num_sel_vars):
-            res_i = tf.cast(residual[i], tf.float32)
-            if res_i.shape.rank == 1:
-                res_i = tf.expand_dims(res_i, axis=0)
-            
-            n_stations = obs_split_sizes_list[i]
-            n_points = points_per_var[i]
-            
-            # Get weights for this variable's neighborhoods
-            w_var = w_points[offset:offset + n_points]
-            w_var = tf.constant(w_var, dtype=tf.float32)
-            w_var = tf.reshape(w_var, [n_stations, neighbors_per_station])
-            
-            # Expand residual to neighborhoods: (batch, n_stations) -> (batch, n_stations, neighbors)
-            res_expanded = tf.expand_dims(res_i, axis=2)  # (batch, n_stations, 1)
-            weighted = res_expanded * w_var[tf.newaxis, :, :]  # (batch, n_stations, neighbors)
-            
-            # Flatten to (batch * n_stations * neighbors_per_station)
-            all_updates.append(tf.reshape(weighted, [-1]))
-            offset += n_points
-        
-        updates = tf.concat(all_updates, axis=0)
-
-        batch_ids = tf.repeat(tf.range(batch_size, dtype=tf.int32), total_points_all_vars)
-        loc_ids_all = tf.tile(loc_ids_points_const, [batch_size])
-        var_ids_all = tf.tile(var_ids_points_const, [batch_size])
-
-        scatter_indices = tf.stack([batch_ids, loc_ids_all, var_ids_all], axis=1)
-        full_flat = tf.scatter_nd(
-            scatter_indices,
-            updates,
-            [batch_size, lat_size * lon_size, num_variables],
+    def build_horizontal_stencil(group_stations, builder_grid_shape):
+        return _compute_neighborhood_stencil(
+            group_stations, builder_grid_shape, dlat, dlon, base_w
         )
 
-        return tf.reshape(full_flat, [batch_size, lat_size, lon_size, num_variables])
+    return _create_stencil_observation_operator(
+        grid_shape=grid_shape,
+        num_variables=num_variables,
+        variable_indices=variable_indices,
+        station_locations=station_locations,
+        station_groups=station_groups,
+        station_locations_per_var=station_locations_per_var,
+        horizontal_stencil_builder=build_horizontal_stencil,
+        operator_name="neighborhood",
+        num_levels=num_levels,
+        num_3d_fields=num_3d_fields,
+        num_2d_fields=num_2d_fields,
+        vertical_weight_profiles=vertical_weight_profiles,
+    )
 
-    H.selected_vars = selected_vars_np
-    H_adjoint.selected_vars = selected_vars_np
+
+def create_observation_operator_footprint(
+    grid_shape: tuple[int, int],
+    num_variables: int,
+    variable_indices: Optional[list[int]] = None,
+    station_locations: Optional[_StationLocations] = None,
+    station_groups: Optional[_StationGroups] = None,
+    station_locations_per_var: Optional[dict[int, str]] = None,
+    radius: float = 1.0,
+    num_levels: Optional[int] = None,
+    num_3d_fields: Optional[int] = None,
+    num_2d_fields: Optional[int] = None,
+    vertical_weight_profiles=None,
+) -> tuple[Callable, Callable]:
+    """Create a uniform circular-footprint operator and its exact adjoint.
+
+    ``radius`` is measured in grid cells around the nearest grid point. Integer
+    offsets whose Euclidean distance does not exceed the radius receive equal
+    normalized weights. At grid boundaries, out-of-domain points are clipped
+    to boundary cells, matching the neighborhood operator's replicate-boundary
+    behavior. Vertical interpolation and grouped station assignment use the
+    shared fixed-stencil pipeline.
+    """
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError(f"radius must be finite and > 0; got {radius}.")
+
+    offset_limit = int(np.ceil(radius))
+    offsets = np.arange(-offset_limit, offset_limit + 1, dtype=np.int32)
+    dlat_grid, dlon_grid = np.meshgrid(offsets, offsets, indexing="ij")
+    inside = dlat_grid.astype(np.float64) ** 2 + dlon_grid.astype(np.float64) ** 2
+    inside = inside <= float(radius) ** 2
+    dlat = dlat_grid[inside].reshape(-1)
+    dlon = dlon_grid[inside].reshape(-1)
+    base_weights = np.full(dlat.size, 1.0 / dlat.size, dtype=np.float32)
+
+    def build_horizontal_stencil(group_stations, builder_grid_shape):
+        return _compute_neighborhood_stencil(
+            group_stations, builder_grid_shape, dlat, dlon, base_weights
+        )
+
+    return _create_stencil_observation_operator(
+        grid_shape=grid_shape,
+        num_variables=num_variables,
+        variable_indices=variable_indices,
+        station_locations=station_locations,
+        station_groups=station_groups,
+        station_locations_per_var=station_locations_per_var,
+        horizontal_stencil_builder=build_horizontal_stencil,
+        operator_name="footprint",
+        num_levels=num_levels,
+        num_3d_fields=num_3d_fields,
+        num_2d_fields=num_2d_fields,
+        vertical_weight_profiles=vertical_weight_profiles,
+    )
+
+
+def create_observation_operator_finite_difference(
+    grid_shape: tuple[int, int],
+    num_variables: int,
+    variable_indices: Optional[list[int]] = None,
+    station_locations: Optional[_StationLocations] = None,
+    station_groups: Optional[_StationGroups] = None,
+    station_locations_per_var: Optional[dict[int, str]] = None,
+    difference: str = "lat",
+    grid_spacing=1.0,
+    num_levels: Optional[int] = None,
+    num_3d_fields: Optional[int] = None,
+    num_2d_fields: Optional[int] = None,
+    vertical_weight_profiles=None,
+) -> tuple[Callable, Callable]:
+    """Create a centered first derivative or five-point Laplacian operator.
+
+    ``difference`` is ``"lat"``, ``"lon"``, or ``"laplacian"``.
+    ``grid_spacing`` is either one positive scalar or ``(lat, lon)``. Stencils
+    are centered on the nearest grid point. At boundaries, offsets are clipped
+    to boundary cells; repeated contributions preserve zero response to a
+    constant field and the compiled scatter remains the exact adjoint.
+    """
+    difference = str(difference).lower()
+    if difference not in ("lat", "lon", "laplacian"):
+        raise ValueError(
+            "difference must be 'lat', 'lon', or 'laplacian'; "
+            f"got {difference}."
+        )
+
+    spacing = np.asarray(grid_spacing, dtype=np.float64)
+    if spacing.ndim == 0:
+        lat_spacing = lon_spacing = float(spacing)
+    elif spacing.shape == (2,):
+        lat_spacing, lon_spacing = map(float, spacing)
+    else:
+        raise ValueError("grid_spacing must be a scalar or a (lat, lon) pair.")
+    if (
+        not np.isfinite(lat_spacing)
+        or not np.isfinite(lon_spacing)
+        or lat_spacing <= 0
+        or lon_spacing <= 0
+    ):
+        raise ValueError("grid_spacing values must be finite and positive.")
+
+    if difference == "lat":
+        dlat = np.array([-1, 1], dtype=np.int32)
+        dlon = np.array([0, 0], dtype=np.int32)
+        base_weights = np.array(
+            [-0.5 / lat_spacing, 0.5 / lat_spacing], dtype=np.float32
+        )
+    elif difference == "lon":
+        dlat = np.array([0, 0], dtype=np.int32)
+        dlon = np.array([-1, 1], dtype=np.int32)
+        base_weights = np.array(
+            [-0.5 / lon_spacing, 0.5 / lon_spacing], dtype=np.float32
+        )
+    else:
+        inv_lat2 = 1.0 / lat_spacing**2
+        inv_lon2 = 1.0 / lon_spacing**2
+        dlat = np.array([0, -1, 1, 0, 0], dtype=np.int32)
+        dlon = np.array([0, 0, 0, -1, 1], dtype=np.int32)
+        base_weights = np.array(
+            [
+                -2.0 * inv_lat2 - 2.0 * inv_lon2,
+                inv_lat2,
+                inv_lat2,
+                inv_lon2,
+                inv_lon2,
+            ],
+            dtype=np.float32,
+        )
+
+    def build_horizontal_stencil(group_stations, builder_grid_shape):
+        return _compute_neighborhood_stencil(
+            group_stations, builder_grid_shape, dlat, dlon, base_weights
+        )
+
+    return _create_stencil_observation_operator(
+        grid_shape=grid_shape,
+        num_variables=num_variables,
+        variable_indices=variable_indices,
+        station_locations=station_locations,
+        station_groups=station_groups,
+        station_locations_per_var=station_locations_per_var,
+        horizontal_stencil_builder=build_horizontal_stencil,
+        operator_name=f"finite difference ({difference})",
+        num_levels=num_levels,
+        num_3d_fields=num_3d_fields,
+        num_2d_fields=num_2d_fields,
+        vertical_weight_profiles=vertical_weight_profiles,
+    )
+
+
+def create_observation_operator_index(
+    grid_shape: tuple[int, int],
+    num_variables: int,
+    variable_indices: Optional[list[int]] = None,
+    station_locations: Optional[_StationLocations] = None,
+    station_groups: Optional[_StationGroups] = None,
+    station_locations_per_var: Optional[dict[int, str]] = None,
+    num_levels: Optional[int] = None,
+    num_3d_fields: Optional[int] = None,
+    num_2d_fields: Optional[int] = None,
+    vertical_weight_profiles=None,
+) -> tuple[Callable, Callable]:
+    """Create exact-point observations using a one-point neighborhood stencil.
+
+    This wrapper delegates to ``create_observation_operator_neighborhood`` with
+    ``window_size=1`` and a uniform kernel. All station selection, vertical
+    interpolation, adjoint, validation, and metadata behavior is shared with
+    that operator.
+
+    Station coordinates are ``(lat, lon, level)`` triplets. The optional layout
+    arguments must be supplied together to enable vertical interpolation.
+
+    Returns:
+        The shared ``(H, H_adjoint)`` operator pair.
+    """
+
+    # Exact index sampling is the one-point special case of a neighborhood
+    # stencil. The neighborhood implementation therefore supplies the complete
+    # forward, adjoint, vertical interpolation, validation, and metadata path.
+    return create_observation_operator_neighborhood(
+        grid_shape=grid_shape,
+        num_variables=num_variables,
+        variable_indices=variable_indices,
+        station_locations=station_locations,
+        station_groups=station_groups,
+        station_locations_per_var=station_locations_per_var,
+        window_size=1,
+        kernel="uniform",
+        num_levels=num_levels,
+        num_3d_fields=num_3d_fields,
+        num_2d_fields=num_2d_fields,
+        vertical_weight_profiles=vertical_weight_profiles,
+    )
+
+# ==== Linear combination of obs operators ====
+
+def create_observation_operator_linear_combination(
+    base_operator: Callable,
+    coefficients,
+) -> tuple[Callable, Callable]:
+    """Combine all blocks of a compiled operator into one colocated observation.
+
+    ``coefficients`` supplies one scalar per base observation block. The base
+    operator must use one shared station list, ensuring its variable blocks are
+    colocated and have equal observation counts. Horizontal and vertical
+    stencils may differ between blocks; their weighted contributions are merged
+    into one compiled block with an exact scatter adjoint.
+    """
+    stencil = getattr(base_operator, "compiled_stencil", None)
+    grid_shape = getattr(base_operator, "grid_shape", None)
+    num_variables = getattr(base_operator, "num_variables", None)
+    if stencil is None or grid_shape is None or num_variables is None:
+        raise ValueError("base_operator must be a compiled observation operator.")
+    if isinstance(stencil.station_locations, dict):
+        raise ValueError(
+            "Linear combinations require a shared station list so all variable "
+            "blocks are colocated."
+        )
+
+    coefficients = np.asarray(coefficients, dtype=np.float32)
+    block_count = len(stencil.blocks)
+    if coefficients.shape != (block_count,):
+        raise ValueError(
+            f"coefficients must contain one value for each of the {block_count} "
+            f"base blocks; got shape {coefficients.shape}."
+        )
+    if not np.all(np.isfinite(coefficients)):
+        raise ValueError("Linear-combination coefficients must be finite.")
+    if np.all(coefficients == 0.0):
+        raise ValueError("At least one linear-combination coefficient must be nonzero.")
+
+    blocks = stencil.blocks
+    observation_count = blocks[0].observation_count
+    station_levels = blocks[0].station_levels
+    for block in blocks[1:]:
+        if block.observation_count != observation_count:
+            raise ValueError(
+                "Linear-combination blocks must have equal observation counts."
+            )
+        if not np.array_equal(block.station_levels, station_levels):
+            raise ValueError(
+                "Linear-combination blocks must have aligned station levels."
+            )
+
+    state_channels = np.concatenate(
+        [
+            block.state_channel_indices.reshape(
+                observation_count, block.points_per_observation
+            )
+            for block in blocks
+        ],
+        axis=1,
+    )
+    locations = np.concatenate(
+        [
+            block.location_indices.reshape(
+                observation_count, block.points_per_observation
+            )
+            for block in blocks
+        ],
+        axis=1,
+    )
+    combined_weights = np.concatenate(
+        [
+            coefficient
+            * block.weights.reshape(observation_count, block.points_per_observation)
+            for coefficient, block in zip(coefficients, blocks)
+        ],
+        axis=1,
+    )
+    mixed_channels = np.concatenate(
+        [block.mixed_channel_indices for block in blocks], axis=1
+    )
+    mixed_weights = np.concatenate(
+        [
+            coefficient * block.mixed_channel_weights
+            for coefficient, block in zip(coefficients, blocks)
+        ],
+        axis=1,
+    )
+    combined_block = _ObservationBlock(
+        variable_index=-1,
+        state_channel_indices=state_channels.reshape(-1).astype(np.int32),
+        location_indices=locations.reshape(-1).astype(np.int32),
+        weights=combined_weights.reshape(-1).astype(np.float32),
+        observation_count=observation_count,
+        points_per_observation=combined_weights.shape[1],
+        mixed_channel_indices=mixed_channels.astype(np.int32),
+        mixed_channel_weights=mixed_weights.astype(np.float32),
+        station_levels=station_levels.copy(),
+    )
+    combined_stencil = _CompiledObservationStencil(
+        blocks=(combined_block,),
+        station_locations=stencil.station_locations,
+    )
+    return _create_compiled_linear_operator(
+        grid_shape,
+        num_variables,
+        combined_stencil,
+        operator_name="linear combination",
+    )
+
+
+def create_nonlinear_observation_operator(
+    forward_operator: Callable[[tf.Tensor], tf.Tensor],
+    state_shape: tuple[int, int, int],
+    observation_count: int,
+    adjoint_operator: Optional[Callable[[tf.Tensor, tf.Tensor], tf.Tensor]] = None,
+    operator_name: str = "nonlinear observation operator",
+) -> tuple[Callable, Callable]:
+    """Adapt a nonlinear forward model to the SDA ``(H, H_adjoint)`` contract.
+
+    ``forward_operator(x)`` must return one rank-2 tensor with shape
+    ``(batch, observation_count)``. If supplied, ``adjoint_operator(x, r)`` must
+    return the Jacobian-transpose product ``J_H(x)^T r`` with the same shape as
+    ``x``. This is the appropriate hook for CRTM's tangent-linear/adjoint or
+    K-matrix interface.
+
+    When ``adjoint_operator`` is omitted, TensorFlow computes the vector-Jacobian
+    product with ``GradientTape``. That path is intended for a differentiable
+    TensorFlow neural-network emulator; it cannot differentiate through
+    ``tf.numpy_function`` or an external CRTM library.
+
+    The adapter exposes one observation block. Per-state-channel ``weights`` in
+    ``compute_likelihood_gradient`` are deliberately unsupported because radiance
+    channels do not have a one-to-one mapping to state channels.
+    """
+    if (
+        len(state_shape) != 3
+        or any(isinstance(size, (bool, np.bool_)) for size in state_shape)
+        or any(int(size) != size or size <= 0 for size in state_shape)
+    ):
+        raise ValueError(
+            "state_shape must be three positive integers (lat, lon, channels)."
+        )
+    if (
+        isinstance(observation_count, (bool, np.bool_))
+        or int(observation_count) != observation_count
+        or observation_count <= 0
+    ):
+        raise ValueError("observation_count must be a positive integer.")
+
+    lat_size, lon_size, num_variables = (int(size) for size in state_shape)
+    observation_count = int(observation_count)
+
+    def _forward_tensor(x: tf.Tensor) -> tf.Tensor:
+        values = tf.cast(forward_operator(x), tf.float32)
+        if values.shape.rank != 2:
+            raise ValueError(
+                f"{operator_name} must return rank-2 observations "
+                "(batch, observations)."
+            )
+        static_count = values.shape[1]
+        if static_count is not None and static_count != observation_count:
+            raise ValueError(
+                f"{operator_name} returned {static_count} observations; "
+                f"expected {observation_count}."
+            )
+        checks = [
+            tf.debugging.assert_equal(
+                tf.shape(values)[0],
+                tf.shape(x)[0],
+                message=f"{operator_name} changed the batch size.",
+            ),
+            tf.debugging.assert_equal(
+                tf.shape(values)[1],
+                observation_count,
+                message=f"{operator_name} returned the wrong observation count.",
+            ),
+        ]
+        with tf.control_dependencies([check for check in checks if check is not None]):
+            return tf.identity(values)
+
+    def H(x: tf.Tensor) -> list[tf.Tensor]:
+        x = _validate_state_shape(
+            x, (lat_size, lon_size), num_variables, operator_name
+        )
+        return [_forward_tensor(x)]
+
+    def H_adjoint(residual, x: tf.Tensor) -> tf.Tensor:
+        """Evaluate the state-dependent vector-Jacobian product J_H(x)^T r."""
+        x = _validate_state_shape(
+            x, (lat_size, lon_size), num_variables, operator_name
+        )
+        residual, batch_size = _validate_and_normalize_residuals(
+            residual, (observation_count,), f"{operator_name} H_adjoint"
+        )
+        batch_check = tf.debugging.assert_equal(
+            batch_size,
+            tf.shape(x)[0],
+            message=f"{operator_name} residual batch size does not match the state.",
+        )
+        with tf.control_dependencies([batch_check] if batch_check is not None else []):
+            residual_tensor = tf.identity(residual[0])
+
+        if adjoint_operator is None:
+            with tf.GradientTape() as tape:
+                tape.watch(x)
+                observations = _forward_tensor(x)
+                objective = tf.reduce_sum(observations * residual_tensor)
+            result = tape.gradient(objective, x)
+            if result is None:
+                raise ValueError(
+                    f"{operator_name} is not differentiable by TensorFlow; provide "
+                    "an explicit adjoint_operator."
+                )
+        else:
+            result = tf.cast(adjoint_operator(x, residual_tensor), tf.float32)
+
+        result = tf.convert_to_tensor(result)
+        shape_check = tf.debugging.assert_equal(
+            tf.shape(result),
+            tf.shape(x),
+            message=f"{operator_name} adjoint must return the full state shape.",
+        )
+        with tf.control_dependencies([shape_check] if shape_check is not None else []):
+            return tf.identity(result)
+
+    metadata = _ObservationMetadata(
+        num_variables=num_variables,
+        selected_variables=np.array([-1], dtype=np.int32),
+        observation_counts=(observation_count,),
+        station_levels_by_block=(np.zeros(observation_count, dtype=np.float32),),
+        channel_indices_by_block=(
+            np.zeros((observation_count, 1), dtype=np.int32),
+        ),
+        channel_weights_by_block=(
+            np.ones((observation_count, 1), dtype=np.float32),
+        ),
+        station_source=[],
+    )
+    for operator in (H, H_adjoint):
+        operator.metadata = metadata
+        operator.selected_vars = metadata.selected_variables
+        operator.grid_shape = (lat_size, lon_size)
+        operator.num_variables = num_variables
+        operator.requires_state = True
+        operator.supports_channel_weights = False
 
     return H, H_adjoint
 
 # ==== Compute SDA guidance using observation operators ====
 
-def compute_sda_guidance(
+def compute_likelihood_gradient(
     x_0: tf.Tensor,
-    y_obs: tf.Tensor | list[tf.Tensor] | tuple[tf.Tensor, ...],
+    y_obs: list[tf.Tensor] | tuple[tf.Tensor, ...],
     H: Callable,
     H_adjoint: Callable,
     t: tf.Tensor,
     weights: tf.Tensor | list | np.ndarray | None = None,  # Per-variable weights
-    R_obs: float = 0.01, # [0.02, 0.2]
-    gamma: float = 0.01, # [0.005, 0.05]
-    guidance_scale: float = 0.3, # [0.05, 0.3]
-    
+    R_obs: float = 0.01,
+    gamma: float = 0.01,
+    guidance_scale: float = 0.3,
 ) -> tf.Tensor:
-    """
-    Compute score-based data assimilation (SDA) guidance using observation operators.
-    
-    Computes the observation likelihood gradient with noise-aware variance scaling:
-        σ²_t  = 1 − ᾱ_t
-        V     = R_obs + γ·σ²_t / (γ·ᾱ_t + σ²_t)   (bounded posterior variance)
-        ∇_{x_0} log p(y | x_0) = −H^T W·(H x_0 − y) / V
+    """Compute the clean-state factor of the SDA likelihood score.
 
-    where W are per-variable weights (optional). V is the posterior variance of x̂_0 given x_t 
-    assuming x_0 ~ N(0, γI). It is bounded in [R_obs, R_obs + γ] for all t, ensuring guidance 
-    is active throughout the full reverse trajectory (unlike the (1−ᾱ)/ᾱ·γ formula, which 
-    diverges to ∞ at high-noise steps and kills guidance).
-    
-    This is the "guidance" signal that steers the diffusion reverse process
-    toward being consistent with observations. No GradientTape is needed for the
-    current operators in this module because they are linear in x_0 and expose
-    their exact adjoints directly.
-    
-    Args:
-        x_0 (tf.Tensor): Predicted x_0 from diffusion model.
-                        Shape: (batch, lat, lon, channels) or (batch, ...)
-        y_obs (tf.Tensor | list[tf.Tensor]): Observations in observation space.
-                  For per-variable operator, pass list with one tensor
-                  per selected variable.
-        H (Callable): Forward observation operator H(x).
-                     Extracts observed components from full state.
-        H_adjoint (Callable): Adjoint (transpose) of H.
-                     For the linear operators in this module,
-                     H_adjoint = H^T = (dH/dx)^T and maps
-                     observation-space residuals back to full state.
-        t (tf.Tensor or int): Timestep index in the diffusion process.
-                             Used to compute ALPHA_BAR_t = tf.gather(ALPHA_BAR, t).
-        R_obs (float): Observation error variance.
-                      Controls measurement uncertainty.
-                      Default: 1.0
-        gamma (float): Prior/model error variance scaling factor.
-                      Controls relative weight of diffusion model uncertainty.
-                      Default: 1.0
-        guidance_scale (float): Multiplicative scaling for final guidance.
-                               < 1.0: weaker constraint
-                               = 1.0: theory-optimal
-                               > 1.0: stronger constraint
-                               Default: 1.0
-        weights (tf.Tensor | list | np.ndarray, optional): Per-variable weights.
-                      Shape: (num_channels,) or compatible with residual shape.
-                      Used for consistent weighting with training loss.
-                      If None, uniform weighting (all weights = 1.0).
-                      Default: None
-    
-    Returns:
-        tf.Tensor: Likelihood gradient in full state space.
-                  Shape: same as x_0.
-                  
-                  The returned value is guidance in x_0 space.
-                  Usage in posterior sampling:
-                      score = compute_sda_guidance(x_0, y_obs, H, H_adjoint, t, 
-                                                  R_obs=1.0, gamma=1.0)
-    
-    Examples:
-        # Example 1: Sparse observations with H and H_adjoint
-        H, H_adj = create_observation_operator(
-            grid_shape=(64, 64),
-            num_variables=5,
-            variable_indices=[3, 4],
-            station_locations=[(10, 20), (30, 40), (50, 55)]
-        )
-        
-        score = compute_sda_guidance(
-            x_0=model_prediction,
-            y_obs=observations,
-            H=H,
-            H_adjoint=H_adj,
-            t=timestep,
-            R_obs=0.1,
-            gamma=1.0,
-            guidance_scale=1.0
-        )
-        
-        # Example 2: With per-variable weights (consistent with training)
-        weights = tf.constant([1.0, 1.0, 2.0, 2.0, 1.5])  # 5 variables
-        score = compute_sda_guidance(
-            x_0=model_prediction,
-            y_obs=observations,
-            H=H,
-            H_adjoint=H_adj,
-            t=timestep,
-            R_obs=0.1,
-            gamma=1.0,
-            guidance_scale=1.0,
-            weights=weights
-        )
+    The paper approximates ``p(y | x_t)`` by a Gaussian centered on
+    ``H(x_0_hat)`` with VP-coordinate variance
+
+        V_t = R_obs + gamma * (1 - alpha_bar_t) / alpha_bar_t.
+
+    This function returns ``∇_{x_0} log p(y | x_t)``. It does not apply the
+    denoiser Jacobian transpose; use ``compute_sda_posterior_guidance`` for the
+    complete paper-style noisy-state likelihood score.
     """
-    
+
+    if not isinstance(y_obs, (list, tuple)):
+        raise TypeError("y_obs must be a list/tuple with one tensor per observation block.")
+    metadata = getattr(H, "metadata", None)
+    expected_blocks = (
+        len(metadata.observation_counts)
+        if metadata is not None
+        else len(getattr(H, "selected_vars", ()))
+    )
+    if len(y_obs) != expected_blocks:
+        raise ValueError(
+            f"y_obs contains {len(y_obs)} blocks; expected {expected_blocks}."
+        )
+    if not np.isfinite(R_obs) or R_obs < 0:
+        raise ValueError(f"R_obs must be finite and non-negative; got {R_obs}.")
+    if not np.isfinite(gamma) or gamma < 0:
+        raise ValueError(f"gamma must be finite and non-negative; got {gamma}.")
+    if not np.isfinite(guidance_scale):
+        raise ValueError(f"guidance_scale must be finite; got {guidance_scale}.")
+    if weights is not None and not getattr(H, "supports_channel_weights", True):
+        raise ValueError(
+            "Per-state-channel guidance weights are not supported by this "
+            "observation operator. Apply observation-space weights inside H or "
+            "its adjoint instead."
+        )
+
     # Get cumulative alpha at timestep t
     ALPHA_BAR_t = tf.gather(ALPHA_BAR, t)
 
-    # Posterior variance of x̂_0 given x_t with Gaussian prior x_0 ~ N(0, γI):
-    #   Σ_t = γ(1−ᾱ_t) / (γᾱ_t + (1−ᾱ_t))
-    # This is bounded in [0, γ] for all t. Using (1−ᾱ_t)/ᾱ_t instead (the
-    # γ→∞ limit) diverges when ᾱ_t≈0 (early reverse steps), making V enormous
-    # and guidance ≈ 0 for most of the trajectory when gamma != 0.
+    # Paper likelihood variance: V = R + (sigma_t / mu_t)^2 Gamma.
     sigma_sq = 1.0 - ALPHA_BAR_t
-    posterior_var = gamma * sigma_sq / (gamma * ALPHA_BAR_t + sigma_sq + 1e-12)
-
-    # Total variance: V = R_obs + Σ_t  (bounded in [R_obs, R_obs + gamma])
-    V = tf.cast(R_obs + posterior_var, tf.float32)
+    diffusion_obs_var = gamma * sigma_sq / (ALPHA_BAR_t + 1e-12)
+    V = tf.cast(R_obs + diffusion_obs_var, tf.float32)
     
     # Forward observation operator
     y_hat = H(x_0)
+    if metadata is not None:
+        y_obs = _validate_guidance_observations(
+            y_obs, metadata, tf.shape(y_hat[0])[0]
+        )
+    else:
+        y_obs = [tf.cast(block, tf.float32) for block in y_obs]
 
-    # Residual in observation space
+    # Residual in observation space with optional per-variable weighting.
     residual = []
-    selected_vars = H.selected_vars
+    observation_weights = (
+        _effective_observation_weights(H, weights) if weights is not None else None
+    )
     for i, (y_hat_i, y_obs_i) in enumerate(zip(y_hat, y_obs)):
         res_i = y_hat_i - y_obs_i
-        if weights is not None:
-            weights_f32 = tf.cast(weights, tf.float32)
-            w_i = weights_f32[selected_vars[i]]
-            res_i = res_i * w_i
-        residual.append(res_i)
+        if observation_weights is not None:
+            res_i = res_i * observation_weights[i]
+
+        residual.append(res_i * guidance_scale)
+
     weighted_residual = [res_i / V for res_i in residual]
 
-    # Adjoint: map residual back to full state space
-    # Divide by V for noise-aware scaling: H^T (H x_0 - y) / V
-    score = -H_adjoint(weighted_residual)
- 
-    # Apply guidance scaling
-    score = guidance_scale * score * tf.sqrt(sigma_sq)
-    
+    # Adjoint: map residual back to full state space.
+    # Divide by V for noise-aware scaling: H^T (H x_0 - y) / V.
+    if getattr(H_adjoint, "requires_state", False):
+        score = -H_adjoint(weighted_residual, x_0)
+    else:
+        score = -H_adjoint(weighted_residual)
+
     return score
+
+
+def compute_sda_posterior_guidance(
+    x_t: tf.Tensor,
+    denoise_fn: Callable[[tf.Tensor], tf.Tensor],
+    y_obs: list[tf.Tensor] | tuple[tf.Tensor, ...],
+    H: Callable,
+    H_adjoint: Callable,
+    t: tf.Tensor,
+    weights: tf.Tensor | list | np.ndarray | None = None,
+    R_obs: float = 0.01,
+    gamma: float = 0.01,
+    guidance_scale: float = 0.3,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Propagate the existing DDPM likelihood guidance through the denoiser.
+
+    ``compute_likelihood_gradient`` supplies the clean-state guidance using the
+    paper likelihood variance. This function then computes
+    ``J_D(x_t)^T g_0`` and converts that noisy-state score to the equivalent VP
+    clean-prediction correction
+    ``delta_x_0 = (sigma_t^2 / mu_t) * likelihood_score``.
+
+    Returns ``(guided_x_0, likelihood_score)``.
+    """
+    x_t = tf.cast(x_t, tf.float32)
+    with tf.GradientTape() as tape:
+        tape.watch(x_t)
+        x_0 = tf.cast(denoise_fn(x_t), tf.float32)
+
+    clean_likelihood_gradient = compute_likelihood_gradient(
+        x_0=x_0,
+        y_obs=y_obs,
+        H=H,
+        H_adjoint=H_adjoint,
+        t=t,
+        weights=weights,
+        R_obs=R_obs,
+        gamma=gamma,
+        guidance_scale=guidance_scale,
+    )
+    likelihood_score = tape.gradient(
+        x_0,
+        x_t,
+        output_gradients=tf.stop_gradient(clean_likelihood_gradient),
+    )
+    if likelihood_score is None:
+        raise ValueError(
+            "The denoiser output is not differentiable with respect to x_t; "
+            "paper-style SDA guidance requires the denoiser vector-Jacobian product."
+        )
+
+    alpha_bar_t = tf.cast(tf.gather(ALPHA_BAR, t), tf.float32)
+    clean_correction_scale = (1.0 - alpha_bar_t) / tf.sqrt(
+        alpha_bar_t + 1e-12
+    )
+    guided_x_0 = x_0 + clean_correction_scale * likelihood_score
+    return guided_x_0, likelihood_score
 
 # ==== Create station locations for observation operators ====
 
@@ -1339,41 +1824,114 @@ def create_station_locations(
     layout: str,
     operator_type: str,
     random_seed: int,
-) -> list[tuple[float, float]]:
-    """Create station locations with either uniform or random layout."""
+    level_size: int,
+) -> _StationLocations:
+    """Create station locations as (lat, lon, level) triplets.
+
+    The vertical coordinate is generated as a fractional level index within the
+    model's vertical extent, matching the lat/lon generation pattern.
+    """
+    if lat_size <= 0 or lon_size <= 0:
+        raise ValueError(
+            f"lat_size and lon_size must be positive; got {(lat_size, lon_size)}."
+        )
     if subsampling_factor < 1:
         raise ValueError(f"subsampling_factor must be >= 1; got {subsampling_factor}.")
+    if level_size <= 0:
+        raise ValueError(f"level_size must be positive; got {level_size}.")
+    if operator_type not in (
+        "index",
+        "interp",
+        "neighborhood",
+        "footprint",
+        "finite_difference",
+    ):
+        raise ValueError(f"Unsupported observation operator type: {operator_type}.")
+    if layout not in ("uniform", "random"):
+        raise ValueError(f"layout must be 'uniform' or 'random'; got {layout}.")
 
     if layout == "uniform":
-        # interp and neighborhood both benefit from cell-centre positions (offset 0.5);
+        # Interpolating and footprint operators benefit from cell-centre positions;
         # index uses exact grid-point indices (offset 0.0).
-        offset = 0.0 if operator_type == "index" else 0.5
+        offset = 0.0 if operator_type in ("index", "finite_difference") else 0.5
         lat_stations = np.arange(offset, lat_size, subsampling_factor, dtype=np.float32)
         lon_stations = np.arange(offset, lon_size, subsampling_factor, dtype=np.float32)
-        return [(lat, lon) for lat in lat_stations for lon in lon_stations]
-
-    # Random layout: match nominal count from a regular subsampled grid.
-    n_stations = len(range(0, lat_size, subsampling_factor)) * len(range(0, lon_size, subsampling_factor))
-    rng = np.random.default_rng(seed=random_seed)
-
-    if operator_type == "index":
-        lat_rand = rng.integers(0, lat_size, n_stations, dtype=np.int32).astype(np.float32)
-        lon_rand = rng.integers(0, lon_size, n_stations, dtype=np.int32).astype(np.float32)
+        base = [(lat, lon) for lat in lat_stations for lon in lon_stations]
     else:
-        lat_rand = rng.uniform(0.0, lat_size - 1, n_stations).astype(np.float32)
-        lon_rand = rng.uniform(0.0, lon_size - 1, n_stations).astype(np.float32)
+        # Random layout: match nominal count from a regular subsampled grid.
+        n_stations = len(range(0, lat_size, subsampling_factor)) * len(range(0, lon_size, subsampling_factor))
+        rng = np.random.default_rng(seed=random_seed)
 
-    return list(zip(lat_rand.tolist(), lon_rand.tolist()))
+        if operator_type == "index":
+            lat_rand = rng.integers(0, lat_size, n_stations, dtype=np.int32).astype(np.float32)
+            lon_rand = rng.integers(0, lon_size, n_stations, dtype=np.int32).astype(np.float32)
+        else:
+            lat_rand = rng.uniform(0.0, lat_size - 1, n_stations).astype(np.float32)
+            lon_rand = rng.uniform(0.0, lon_size - 1, n_stations).astype(np.float32)
+
+        base = list(zip(lat_rand.tolist(), lon_rand.tolist()))
+
+    # Preserve the original horizontal observation density at every level.
+    # Atmospheric stations lie halfway toward the next level so vertical
+    # interpolation is active. The final coordinate is either the reserved 2D
+    # pseudo-level or the exact top atmospheric level, depending on the layout.
+    num_atmospheric_levels = level_size - 1
+    level_values = [
+        min(float(level_idx) + 0.5, float(num_atmospheric_levels - 1))
+        for level_idx in range(num_atmospheric_levels)
+    ]
+    level_values.append(float(level_size - 1))
+    return [
+        (lat, lon, level)
+        for level in level_values
+        for lat, lon in base
+    ]
 
 # ==== Build observation operator from runtime configuration ====
+
+def _group_station_locations_by_level(
+    station_locations,
+    level_size: int,
+) -> _StationGroups:
+    """Group stations by their lower-bracketing discrete model level.
+
+    This lets each variable subscribe only to the subset of stations that match its
+    vertical level, while still keeping the full station catalog available for all
+    variables and the extra pseudo-level for 2D / integrated variables.
+    """
+    if level_size <= 0:
+        raise ValueError(f"level_size must be positive; got {level_size}.")
+
+    groups = {f"level_{level_idx}": [] for level_idx in range(level_size)}
+    normalized = _normalize_station_locations(station_locations)
+    for lat, lon, level in normalized:
+        # Fractional atmospheric observations belong to their lower bracketing
+        # level; the interpolation stencil also includes the upper level. The
+        # final integer level is reserved for 2D / integrated fields.
+        lower_level = int(np.clip(np.floor(level), 0, level_size - 1))
+        groups[f"level_{lower_level}"].append((lat, lon, float(level)))
+    return groups
+
 
 def build_pseudo_observation_operator(
     args,
     lat_size: int,
     lon_size: int,
     num_variables: int,
+    level_size: int,
+    num_3d_fields: int,
+    num_2d_fields: int,
 ) -> tuple[Callable, Callable]:
-    """Build H and H_adjoint from runtime configuration."""
+    """Build H and H_adjoint from runtime configuration.
+
+    num_3d_fields / num_2d_fields encode the actual model layout: 3D fields are
+    stored as blocks of NUM_LEVELS channels, while 2D fields are appended as a
+    single pseudo-level block after the 3D stack. This lets each channel map to
+    the correct vertical subset rather than flattening everything into a single
+    variable index space.
+    """
+    num_levels = level_size - 1 if num_2d_fields > 0 else level_size
+
     station_locs = create_station_locations(
         lat_size=lat_size,
         lon_size=lon_size,
@@ -1381,28 +1939,41 @@ def build_pseudo_observation_operator(
         layout=args.station_layout,
         operator_type=args.obs_operator,
         random_seed=args.obs_random_seed,
+        level_size=level_size,
     )
 
     if len(station_locs) == 0:
         raise ValueError("No station locations were generated.")
 
+    station_groups = _group_station_locations_by_level(station_locs, level_size)
+    station_locations_per_var = {}
+    for var_idx in range(num_variables):
+        if var_idx < num_3d_fields * num_levels:
+            level_idx = var_idx % num_levels
+            group_name = f"level_{level_idx}"
+        else:
+            group_name = f"level_{num_levels}"
+        station_locations_per_var[var_idx] = group_name
+
+    common_operator_kwargs = {
+        "grid_shape": (lat_size, lon_size),
+        "num_variables": num_variables,
+        "station_groups": station_groups,
+        "station_locations_per_var": station_locations_per_var,
+        "num_levels": num_levels,
+        "num_3d_fields": num_3d_fields,
+        "num_2d_fields": num_2d_fields,
+    }
+
     if args.obs_operator == "index":
-        # Convert float station locations to integer indices for index operator
-        station_locs_int = [
-            (int(np.clip(np.rint(lat), 0, lat_size - 1)),
-             int(np.clip(np.rint(lon), 0, lon_size - 1)))
-            for lat, lon in station_locs
-        ]
         logging.info(
             "Using index observation operator with %d %s stations (subsampling_factor=%d).",
-            len(station_locs_int),
+            len(station_locs),
             args.station_layout,
             args.subsampling_factor,
         )
         return create_observation_operator_index(
-            grid_shape=(lat_size, lon_size),
-            num_variables=num_variables,
-            station_locations=station_locs_int,
+            **common_operator_kwargs,
         )
 
     if args.obs_operator == "interp":
@@ -1414,10 +1985,38 @@ def build_pseudo_observation_operator(
             args.subsampling_factor,
         )
         return create_observation_operator_interp(
-            grid_shape=(lat_size, lon_size),
-            num_variables=num_variables,
-            station_locations=station_locs,
             order=args.interp_order,
+            **common_operator_kwargs,
+        )
+
+    if args.obs_operator == "footprint":
+        logging.info(
+            "Using circular footprint observation operator with %d %s stations (radius=%.3f grid cells).",
+            len(station_locs),
+            args.station_layout,
+            args.footprint_radius,
+        )
+        return create_observation_operator_footprint(
+            radius=args.footprint_radius,
+            **common_operator_kwargs,
+        )
+
+    if args.obs_operator == "finite_difference":
+        spacing = (
+            args.finite_difference_lat_spacing,
+            args.finite_difference_lon_spacing,
+        )
+        logging.info(
+            "Using %s finite-difference observation operator with %d %s stations (spacing=%s).",
+            args.finite_difference_kind,
+            len(station_locs),
+            args.station_layout,
+            spacing,
+        )
+        return create_observation_operator_finite_difference(
+            difference=args.finite_difference_kind,
+            grid_spacing=spacing,
+            **common_operator_kwargs,
         )
 
     # neighborhood
@@ -1441,10 +2040,8 @@ def build_pseudo_observation_operator(
         sigma,
     )
     return create_observation_operator_neighborhood(
-        grid_shape=(lat_size, lon_size),
-        num_variables=num_variables,
-        station_locations=station_locs,
         window_size=window_size,
         kernel=args.neighborhood_kernel,
         sigma=sigma,
+        **common_operator_kwargs,
     )

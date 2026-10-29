@@ -48,10 +48,7 @@ from transform import (
     inverse_neg_log_transform_array,
 )
 from score_based_da import (
-    create_observation_operator_index,
-    create_observation_operator_interp,
-    create_observation_operator_neighborhood,
-    compute_sda_guidance,
+    compute_sda_posterior_guidance,
     build_pseudo_observation_operator,
 )
 import utils
@@ -975,24 +972,25 @@ class WeatherForecaster:
             X_noisy: tf.Tensor,
             step_t: tf.Tensor,
         ) -> tuple[tf.Tensor, tf.Tensor]:
-            X_model = build_diffusion_input(X_in, X_noisy, step_t)
-            x_0_pred = model.predict(X_model)
+            def denoise_fn(noisy_state: tf.Tensor) -> tf.Tensor:
+                X_model = build_diffusion_input(
+                    X_in, noisy_state, step_t
+                )
+                return model.predict(X_model)
 
-            # compute SDA guidance (gradient in x_0 space)
-            grad_likelihood = compute_sda_guidance(
-                x_0=x_0_pred,
+            # Apply SDA guidance
+            x_0_pred, _ = compute_sda_posterior_guidance(
+                x_t=X_noisy,
+                denoise_fn=denoise_fn,
                 y_obs=y_obs,
                 H=H,
                 H_adjoint=H_adjoint,
-                t=t,
+                t=step_t,
                 weights=None,
-                R_obs = 0.01,
-                gamma = 0.001,
-                guidance_scale = 0.2,
+                R_obs=0.1,
+                gamma=0.01,
+                guidance_scale=1.0,
             )
-
-            # compute guided x_0
-            x_0_pred = x_0_pred + grad_likelihood
 
             eps = compute_epsilon(X_noisy, x_0_pred, step_t)
             return x_0_pred, eps
@@ -1306,6 +1304,9 @@ class WeatherForecaster:
             nlat, nlon = self.input_shape[1], self.input_shape[2]
             nlat_sda, nlon_sda = 530, 900
 
+            # turn off jit
+            tf.config.optimizer.set_jit(False)
+
             # Construct date encoding tensor
             init_datetime = self.data_loader_hrrr.get_init_datetime()
             date_encoding = self.date_encoding_tensor(init_datetime, 0)
@@ -1325,22 +1326,33 @@ class WeatherForecaster:
                 model_input_tf = tf.image.resize(model_input_tf, size=[nlat_sda, nlon_sda], method='bilinear')
 
             # Create observation operator from configuration
+            logger.info("Building SDA observation operator.")
             H, H_adjoint = build_pseudo_observation_operator(
                 args=args,
                 lat_size=nlat_sda,
                 lon_size=nlon_sda,
                 num_variables=self.predicted_channels,
+                level_size=len(self.metadata['levels']) + 1,
+                num_3d_fields=len(self.metadata['pl_vars']),
+                num_2d_fields=len(self.metadata['sfc_vars']),
             )
 
             # Apply observation operator to downsampled data
+            logger.info("Applying observation operator to downsampled model input for SDA...")
             y_obs = H(model_input_tf)
 
             # Call SDA model and then change the model_input to the SDA output
+            logger.info("Running data assimilation using SDA model...")
             y_analyses = self.predict_sda(
                 model, X_static, H=H, H_adjoint=H_adjoint, y_obs=y_obs, member=0)
+            logger.info("Data assimilation completed, updating model input with SDA analyses...")
             model_input[:, :, :, :self.predicted_channels] = y_analyses.numpy()
 
             logger.info("Data assimilation completed successfully")
+
+            # turn jit back on
+            tf.config.optimizer.set_jit(True)
+
         except Exception as e:
             logger.error(f"Data assimilation failed : {e}")
             raise
