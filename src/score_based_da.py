@@ -14,17 +14,35 @@ Notation:
     - H_adjoint(r, x): nonlinear Jacobian-transpose action J_H(x)^T r
 
 Adjoint interpretation:
-    For a general nonlinear observation map H(x), the relevant object in data
-    assimilation is the transpose of the Jacobian, J_H(x)^T.
+    For a general nonlinear observation map H(x), the relevant Jacobian object
+    is J_H(x), and the data-assimilation update is based on the covariance-
+    weighted residual:
+        delta_x = J_H(x)^T R^{-1} (H(x) - y).
 
-    The sparse/local stencil operators are linear in x once their indices and
-    weights are constructed. Therefore:
-        H(x) = H * x
-        J_H(x) = dH(x)/dx = H
-    And the adjoint is simply:
-        H_adjoint = J_H(x)^T = H^T
-    and the residual mapped back to full state space is:
-        H_adjoint(r) =  H^T * r = H^T * (H(x) - y)
+    The equivalent Kalman-gain term is therefore
+        K_eff(x) = J_H(x)^T R^{-1},
+    so the update can be written as
+        delta_x = K_eff(x) (H(x) - y).
+
+    In the diagonal-Gaussian approximation used here, R is represented by the
+    observation variance V_t, so the update reduces to
+        delta_x = J_H(x)^T (H(x) - y) / V_t.
+
+    For the sparse/local stencil operators implemented in this file, the stencil
+    geometry is fixed once the indices and weights are constructed, so the
+    operator is effectively linear with respect to x within that fixed geometry:
+        H(x) = H * x,
+        J_H(x) = H,
+        delta_x = H^T R^{-1} (H(x) - y).
+
+    In the scalar-variance case used by this module, this becomes
+        delta_x = H^T * (H(x) - y) / V_t,
+    with
+        V_t = R_obs + gamma * (1 - alpha_bar_t) / alpha_bar_t.
+
+    The nonlinear adapter in this module follows the same pattern, but the
+    transpose action is evaluated at the current state x via the operator's
+    Jacobian or an explicit adjoint implementation.
 
     Nonlinear external operators and neural emulators can instead be adapted with
     create_nonlinear_observation_operator. Their adjoint requires the state x at
@@ -37,6 +55,7 @@ Operator families in this module:
     - Footprint operator: uniform averaging over a circular grid-cell footprint
     - Finite-difference operator: centered gradients or a five-point Laplacian
     - Linear-combination operator: fixed combinations of colocated variable blocks
+    - Composition adapter: chain a state-to-local operator with an observation transform
     - Nonlinear adapter: explicit external adjoint or TensorFlow automatic VJP
 
 Implementation pattern:
@@ -98,6 +117,9 @@ def _normalize_station_locations(station_locations) -> _StationLocations:
             raise ValueError(f"Station location {loc} contains a non-finite vertical level.")
         normalized.append((lat, lon, level))
 
+    # All downstream stencil builders assume a consistent (lat, lon, level)
+    # triplet format; this conversion makes grouped and shared station inputs
+    # interchangeable.
     return normalized
 
 
@@ -160,6 +182,8 @@ def _validate_and_normalize_residuals(
         with tf.control_dependencies([check for check in checks if check is not None]):
             normalized.append(tf.identity(tensor))
 
+    # Residuals are expected to be block-aligned: one tensor per selected
+    # variable, with a shared batch dimension and one observation per station.
     return normalized, tf.shape(normalized[0])[0]
 
 
@@ -241,8 +265,13 @@ def _effective_observation_weights(H: Callable, weights) -> list[tf.Tensor]:
     channel_indices = getattr(H, "observation_channel_indices", None)
     channel_weights = getattr(H, "observation_channel_weights", None)
     if channel_indices is None or channel_weights is None:
+        # For a plain state-channel operator, the guidance weight is just the
+        # one associated with the selected variable itself.
         return [weights_f32[var_idx] for var_idx in H.selected_vars]
 
+    # For mixed-channel operators, a single guidance weight vector must be
+    # projected through the observation-specific channel mixture before it can be
+    # compared to the observation residuals.
     return [
         tf.reduce_sum(
             tf.gather(weights_f32, tf.constant(indices, dtype=tf.int32))
@@ -267,6 +296,8 @@ def _validate_vertical_layout(
             "num_levels, num_3d_fields, and num_2d_fields must be provided together."
         )
     if not vertical_interp:
+        # Only 3D+2D field layouts that specify all three metadata values trigger
+        # the vertical-interpolation code path.
         return False
 
     if num_levels <= 0:
@@ -302,6 +333,9 @@ def _validate_operator_inputs(
             "station_groups and station_locations_per_var must be provided together."
         )
 
+    # Shared-station operators and grouped-station operators share the same
+    # validation path: the only difference is whether variables are mapped to a
+    # common station set or to named station groups.
     if station_groups is not None:
         if not isinstance(station_groups, dict) or not station_groups:
             raise ValueError("station_groups must be a non-empty dictionary.")
@@ -334,10 +368,27 @@ def _validate_operator_inputs(
 
 
 # ==== Data classes for compiled observation stencils ====
+# The remaining objects in this file convert the validated operator geometry into
+# a compact, block-structured stencil representation that can be reused by both
+# the forward map H and its adjoint H_adjoint.
 
 @dataclass(frozen=True)
 class _StationAssignments:
-    """Normalized station groups and the selected variable-to-group mapping."""
+    """Normalized station configuration used by compiled observation stencils.
+
+    This object converts raw station input into a single internal model so all
+    observation operators can reason about the same layout:
+
+    - which state variables are selected,
+    - which station groups exist,
+    - which group each variable uses,
+    - and the original source data used to build the configuration.
+
+    The main purpose is to hide whether the caller supplied a single shared list
+    of stations or a per-variable grouped configuration. Both cases are reduced
+    to the same dictionary-based representation before any stencil or adjoint
+    logic is built.
+    """
 
     selected_variables: np.ndarray
     stations_by_group: _StationGroups
@@ -352,7 +403,20 @@ def _resolve_station_assignments(
     station_groups: Optional[_StationGroups],
     station_locations_per_var: Optional[dict[int, str]],
 ) -> _StationAssignments:
-    """Normalize shared or grouped stations into one operator-independent model."""
+    """Normalize station inputs into a single grouped assignment model.
+
+    The observation operators in this module support two input styles:
+
+    1. one shared list of station locations used for every selected variable, or
+    2. multiple station groups, where each variable may reference a different set
+       of locations.
+
+    This function validates the user configuration, checks that all referenced
+    groups exist, converts all locations to a consistent `(lat, lon, level)` form,
+    and returns a `_StationAssignments` object. The returned structure is the
+    canonical format consumed by later stencil-building code, making the layout
+    independent of the original input form.
+    """
     if station_groups is not None:
         if validated_variables is None:
             raise ValueError("Grouped stations must select at least one variable.")
@@ -408,10 +472,17 @@ def _resolve_station_assignments(
 
 @dataclass(frozen=True)
 class _ObservationBlock:
-    """Compiled stencil data for one selected state variable.
+    """Compiled numerical stencil data for one selected state variable.
 
-    The first three arrays are aligned flattened stencil contributions. The
-    channel-mixture arrays retain the vertical composition for guidance weights.
+    This object stores the tensorized contribution pattern for a single model
+    variable in the observation operator. Each entry represents one local stencil
+    contribution at a given station and point within that station's footprint.
+
+    The arrays are intentionally flattened and aligned so the shared executor can
+    apply the same gather/scatter logic to all blocks. The `mixed_channel_*`
+    arrays preserve any channel mixing implied by the operator (for example,
+    vertical interpolation or profile-based weighting), which is later used to
+    project guidance weights into observation space.
     """
 
     variable_index: int
@@ -459,7 +530,18 @@ class _ObservationBlock:
 
 @dataclass(frozen=True)
 class _CompiledObservationStencil:
-    """Complete linear stencil consumed by the shared forward/adjoint executor."""
+    """The complete compiled linear stencil for one observation operator.
+
+    This container aggregates all per-variable observation blocks into a single
+    reusable stencil object. The forward operator `H` and its adjoint
+    `H_adjoint` consume the same compiled representation, so the operator is
+    defined once in a block-split way and then executed through a shared
+    gather/scatter implementation.
+
+    The object also keeps the original station source so downstream code can
+    still trace whether the operator was built from a shared station list or a
+    variable-specific station grouping.
+    """
 
     blocks: tuple[_ObservationBlock, ...]
     station_locations: _StationSource
@@ -481,7 +563,18 @@ class _CompiledObservationStencil:
 
 @dataclass(frozen=True)
 class _ObservationMetadata:
-    """Stable block-aligned metadata shared by a forward/adjoint operator pair."""
+    """Stable block-aligned metadata for a forward/adjoint observation pair.
+
+    This metadata object records the shape and alignment information needed to
+    validate residual tensors and guidance weights without re-deriving the block
+    structure from scratch. It keeps the selected variable set, block-wise
+    observation counts, station-level information, and the channel-mixture
+    structure used by the operator.
+
+    The purpose is to ensure that the list of residuals passed to `H_adjoint`
+    and the list of guidance weights passed to the likelihood term remain
+    consistent with the compiled stencil layout.
+    """
 
     num_variables: int
     selected_variables: np.ndarray
@@ -530,7 +623,22 @@ def _create_compiled_linear_operator(
     stencil: _CompiledObservationStencil,
     operator_name: str,
 ) -> tuple[Callable, Callable]:
-    """Create a linear forward/adjoint pair from a compiled observation stencil."""
+    """Build the shared forward and adjoint operators for a compiled stencil.
+
+    The compiled stencil contains all required station, state-channel, and weight
+    metadata. This function turns that abstract representation into the actual
+    TensorFlow operator pair used in the SDA likelihood:
+
+    - `H(x)` gathers the relevant state values, multiplies by stencil weights,
+      and returns one observation vector per selected variable block.
+    - `H_adjoint(residual)` expands the residual back into full-grid state space
+      by scattering each weighted contribution to the matching location and
+      channel index.
+
+    The implementation is intentionally block-structured and vectorized so the
+    same logic works for all operator families after their geometry is compiled
+    into a common stencil format.
+    """
     lat_size, lon_size = grid_shape
     blocks = stencil.blocks
     observation_counts = stencil.observation_counts
@@ -564,6 +672,8 @@ def _create_compiled_linear_operator(
         """Gather and reduce compiled stencil contributions."""
         x = _validate_state_shape(x, grid_shape, num_variables, operator_name)
         batch_size = tf.shape(x)[0]
+        # Flatten the state into [batch, grid_cell, channel] so the stencil can
+        # be applied by a single gather-and-weight step per contribution.
         x_flat = tf.transpose(
             tf.reshape(x, [batch_size, lat_size * lon_size, num_variables]),
             perm=[0, 2, 1],
@@ -598,6 +708,9 @@ def _create_compiled_linear_operator(
 
         updates_by_batch = []
         for block_residual, block_weights in zip(residual, block_weights_tf):
+            # Each residual contribution is weighted by the same stencil weights
+            # used in the forward pass, then flattened so it can be scattered back
+            # to the state tensor at the matching (location, channel) index.
             weighted = block_residual[:, :, tf.newaxis] * block_weights[tf.newaxis, :, :]
             updates_by_batch.append(tf.reshape(weighted, [batch_size, -1]))
         updates = tf.reshape(tf.concat(updates_by_batch, axis=1), [-1])
@@ -663,7 +776,17 @@ def _validate_vertical_weight_profiles(
     num_levels: Optional[int],
     num_3d_fields: Optional[int],
 ) -> Optional[_VerticalWeightProfiles]:
-    """Validate and broadcast optional full-column weights by observation block."""
+    """Validate and broadcast optional full-column vertical profiles.
+
+    Some atmospheric observations use a full vertical weighting profile instead
+    of the default linear interpolation between adjacent model levels. This
+    function ensures those custom profiles are valid, align with the selected
+    variables and station groups, and are broadcast into the same shape expected
+    by the compiled stencil.
+
+    The output is a per-variable dictionary keyed by variable index, where each
+    value is a station-by-level matrix of finite, nonzero vertical weights.
+    """
     if profiles is None:
         return None
     if not isinstance(profiles, dict) or not profiles:
@@ -732,11 +855,18 @@ def _compose_horizontal_vertical_stencil(
     num_3d_fields: Optional[int] = None,
     vertical_weight_profile: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray, np.ndarray]:
-    """Compose a horizontal stencil with linear model-level interpolation.
+    """Combine horizontal geometry with vertical weights into one stencil.
 
-    The returned channel indices and weights describe both the flattened
-    full stencil and the channel-only mixture for each observation. The latter
-    is used to project per-channel guidance weights into observation space.
+    This is the function that turns a local horizontal stencil into the actual
+    full observation stencil for a variable. It combines each horizontal point
+    with its corresponding vertical contribution, producing the flattened
+    `state_channel_indices`, `location_indices`, and `weights` used by the
+    compiled operator.
+
+    For 2D variables, the result is a simple horizontal stencil. For 3D
+    atmospheric variables, the function builds a tensor product of the
+    horizontal stencil and the vertical interpolation/profile weights, so each
+    observation uses all relevant horizontal and vertical neighbors.
     """
     num_stations = len(station_locations)
     if horizontal_locs.shape != horizontal_weights.shape:
@@ -797,6 +927,10 @@ def _compose_horizontal_vertical_stencil(
 
     horizontal_points = horizontal_weights.shape[1]
     vertical_points = vertical_weights.shape[1]
+    # A 3D observation stencil is the tensor product of the horizontal stencil
+    # and the vertical weighting profile. The flattening below turns that
+    # product into the same linear form consumed by the generic gather/scatter
+    # executor.
     shape = (num_stations, horizontal_points, vertical_points)
     var_ids = np.broadcast_to(
         channel_indices[:, np.newaxis, :], shape
@@ -824,7 +958,13 @@ def _compile_horizontal_stencils(
     grid_shape: tuple[int, int],
     stencil_builder: _HorizontalStencilBuilder,
 ) -> dict[str, _HorizontalStencil]:
-    """Build one reusable horizontal stencil for each unique station group."""
+    """Precompute one reusable horizontal stencil per station group.
+
+    Many variables may share the same station group and therefore the same
+    geometric neighborhood structure. This function builds that geometry once per
+    group and caches it, avoiding redundant work while keeping the compiled
+    stencil consistent across variables.
+    """
     return {
         group_name: stencil_builder(group_stations, grid_shape)
         for group_name, group_stations in assignments.stations_by_group.items()
@@ -838,7 +978,15 @@ def _compile_observation_stencil(
     num_3d_fields: Optional[int] = None,
     vertical_weight_profiles: Optional[_VerticalWeightProfiles] = None,
 ) -> _CompiledObservationStencil:
-    """Compose grouped horizontal stencils with channel/vertical structure."""
+    """Assemble the final compiled observation stencil for all selected variables.
+
+    This function loops over every selected variable, identifies the station
+    group it belongs to, combines its geometric stencil with the correct
+    vertical weights, and converts the result into a `_ObservationBlock`.
+
+    The output is a full `_CompiledObservationStencil`, which is the canonical
+    representation consumed by the shared `H`/`H_adjoint` executor.
+    """
     blocks = []
     for variable_index in assignments.selected_variables:
         group_name = assignments.group_by_variable[int(variable_index)]
@@ -900,7 +1048,15 @@ def _create_stencil_observation_operator(
     num_2d_fields: Optional[int],
     vertical_weight_profiles=None,
 ) -> tuple[Callable, Callable]:
-    """Run the shared construction pipeline for a fixed linear stencil operator."""
+    """Run the full stencil-construction pipeline for a fixed linear operator.
+
+    This is the top-level factory used by concrete observation operators such as
+    index or interpolation operators. It validates the user configuration,
+    normalizes station group assignments, validates any optional vertical
+    weighting profiles, builds the geometric stencils, and converts the final
+    data into the shared forward/adjoint operator pair returned by
+    `_create_compiled_linear_operator`.
+    """
     validated_variables = _validate_operator_inputs(
         grid_shape,
         num_variables,
@@ -957,6 +1113,11 @@ def _lagrange_weights_1d(
         nodes:   Integer node indices, shape (N, order+1), clamped to [0, size-1].
         weights: Lagrange basis weights, shape (N, order+1). Partition of unity.
     """
+    # The station location is expressed in fractional grid coordinates, so we
+    # first identify the enclosing lower-index node and the local offset within
+    # that cell. The weights are then built from the Lagrange basis evaluated at
+    # that offset. This yields a local interpolation stencil that is exact for the
+    # chosen polynomial order.
     i0 = np.floor(f).astype(np.int32)
     t = (f - i0).astype(np.float32)  # fractional offset in [0, 1)
 
@@ -1033,7 +1194,9 @@ def _compute_interp_stencil(
     N = lat_f.shape[0]
     K = (order + 1) ** 2
 
-    # Outer product over lat and lon stencil nodes
+    # A 2D interpolation stencil is the tensor product of the 1D lat and lon
+    # stencils. Each station gets a local neighborhood of size K whose weights
+    # factorize into the product of the two 1D Lagrange basis weights.
     lat_n  = lat_nodes[:, :, np.newaxis]  # (N, S, 1)
     lon_n  = lon_nodes[:, np.newaxis, :]  # (N, 1, S)
     lat_ww = lat_w[:, :, np.newaxis]      # (N, S, 1)
@@ -1129,6 +1292,10 @@ def _compute_neighborhood_stencil(
     coordinates = np.asarray(
         [(lat, lon) for lat, lon, _ in station_locations], dtype=np.float32
     )
+    # Neighborhood operators work on integer grid centers: round the station's
+    # fractional position to the nearest grid cell, then offset it by each local
+    # neighborhood displacement. Out-of-range offsets are clipped to the boundary,
+    # which creates the replicate-boundary behavior used throughout the file.
     center_lat = np.clip(np.rint(coordinates[:, 0]), 0, lat_size - 1).astype(np.int32)
     center_lon = np.clip(np.rint(coordinates[:, 1]), 0, lon_size - 1).astype(np.int32)
 
@@ -1202,8 +1369,10 @@ def create_observation_operator_neighborhood(
     neighbors_per_station = int(dlat.shape[0])
 
     if kernel == "uniform":
+        # A uniform neighborhood is just a constant kernel normalized to sum to 1.
         base_w = np.ones(neighbors_per_station, dtype=np.float32)
     else:
+        # A Gaussian neighborhood gives more weight to points close to the center.
         dist2 = dlat.astype(np.float32) ** 2 + dlon.astype(np.float32) ** 2
         base_w = np.exp(-0.5 * dist2 / (float(sigma) ** 2)).astype(np.float32)
     base_w = base_w / np.sum(base_w)
@@ -1254,6 +1423,10 @@ def create_observation_operator_footprint(
     if not np.isfinite(radius) or radius <= 0:
         raise ValueError(f"radius must be finite and > 0; got {radius}.")
 
+    # A circular footprint is just the set of integer offsets whose Euclidean
+    # distance to the center is within the requested radius. The resulting kernel
+    # is uniform across all included cells, which makes the footprint operator a
+    # local area average over a disk.
     offset_limit = int(np.ceil(radius))
     offsets = np.arange(-offset_limit, offset_limit + 1, dtype=np.int32)
     dlat_grid, dlon_grid = np.meshgrid(offsets, offsets, indexing="ij")
@@ -1329,18 +1502,22 @@ def create_observation_operator_finite_difference(
         raise ValueError("grid_spacing values must be finite and positive.")
 
     if difference == "lat":
+        # Central difference in latitude: f(lat + 1) - f(lat - 1) over 2*dy.
         dlat = np.array([-1, 1], dtype=np.int32)
         dlon = np.array([0, 0], dtype=np.int32)
         base_weights = np.array(
             [-0.5 / lat_spacing, 0.5 / lat_spacing], dtype=np.float32
         )
     elif difference == "lon":
+        # Central difference in longitude: f(lon + 1) - f(lon - 1) over 2*dx.
         dlat = np.array([0, 0], dtype=np.int32)
         dlon = np.array([-1, 1], dtype=np.int32)
         base_weights = np.array(
             [-0.5 / lon_spacing, 0.5 / lon_spacing], dtype=np.float32
         )
     else:
+        # Five-point Laplacian: second derivative in both directions with a
+        # standard second-order stencil centered at the target cell.
         inv_lat2 = 1.0 / lat_spacing**2
         inv_lon2 = 1.0 / lon_spacing**2
         dlat = np.array([0, -1, 1, 0, 0], dtype=np.int32)
@@ -1406,6 +1583,8 @@ def create_observation_operator_index(
     # Exact index sampling is the one-point special case of a neighborhood
     # stencil. The neighborhood implementation therefore supplies the complete
     # forward, adjoint, vertical interpolation, validation, and metadata path.
+    # This is just a convenience wrapper so callers can request exact points
+    # without constructing a custom stencil themselves.
     return create_observation_operator_neighborhood(
         grid_shape=grid_shape,
         num_variables=num_variables,
@@ -1427,13 +1606,32 @@ def create_observation_operator_linear_combination(
     base_operator: Callable,
     coefficients,
 ) -> tuple[Callable, Callable]:
-    """Combine all blocks of a compiled operator into one colocated observation.
+    """Create a new observation operator as a weighted linear combination.
 
-    ``coefficients`` supplies one scalar per base observation block. The base
-    operator must use one shared station list, ensuring its variable blocks are
-    colocated and have equal observation counts. Horizontal and vertical
-    stencils may differ between blocks; their weighted contributions are merged
-    into one compiled block with an exact scatter adjoint.
+    This helper takes a compiled observation operator whose internal stencil has
+    multiple per-variable blocks and produces a single new operator
+    representing:
+
+        H_combo(x) = sum_k c_k * H_k(x)
+
+    where each ``c_k`` is the scalar coefficient associated with one base block.
+    The returned operator keeps the same SDA contract: forward evaluation and an
+    exact adjoint via the shared compiled linear executor.
+
+    Important requirements:
+
+    - The base operator must be built from a single shared station list, not a
+      grouped per-variable station configuration.
+    - All blocks must be colocated at the same station locations and must have
+      the same observation count and station-level alignment.
+    - Different blocks may have different horizontal or vertical stencils; their
+      contributions are simply scaled and concatenated into one merged stencil.
+
+    This is useful when a single observation term is defined as a weighted sum of
+    several colocated observation sources, such as a combined scalar product or
+    a blended multi-variable measurement. Because the merged result is compiled
+    back into a valid `_ObservationBlock`, the adjoint remains exact and matches
+    the combined forward map.
     """
     stencil = getattr(base_operator, "compiled_stencil", None)
     grid_shape = getattr(base_operator, "grid_shape", None)
@@ -1489,6 +1687,9 @@ def create_observation_operator_linear_combination(
         ],
         axis=1,
     )
+    # Each block contributes to the same station locations, so we can stack its
+    # contributions side-by-side and scale each one by its coefficient before
+    # collapsing them into a single stencil block.
     combined_weights = np.concatenate(
         [
             coefficient
@@ -1529,6 +1730,7 @@ def create_observation_operator_linear_combination(
         operator_name="linear combination",
     )
 
+# ==== Nonlinear obs operator ====
 
 def create_nonlinear_observation_operator(
     forward_operator: Callable[[tf.Tensor], tf.Tensor],
@@ -1668,7 +1870,224 @@ def create_nonlinear_observation_operator(
 
     return H, H_adjoint
 
-# ==== Compute SDA guidance using observation operators ====
+
+# ==== Composable obs operators through chaining ====
+
+def create_composed_observation_operator(
+    base_operator: Callable,
+    base_adjoint: Callable,
+    transform_operator: Callable[[list[tf.Tensor]], tf.Tensor],
+    observation_count: int,
+    transform_adjoint: Optional[
+        Callable[[list[tf.Tensor], tf.Tensor], list[tf.Tensor]]
+    ] = None,
+    operator_name: str = "composed observation operator",
+) -> tuple[Callable, Callable]:
+    """Compose a state-to-local operator with an observation-space transform.
+
+    The returned forward map is
+
+        ``H(x) = transform_operator(base_operator(x))``.
+
+    ``base_operator`` must follow this module's block-list contract. The
+    transform receives that list and returns one rank-2 tensor with shape
+    ``(batch, observation_count)``. It may be linear or nonlinear.
+
+    This general composition can reproduce the linear-combination operator when
+    ``transform_operator`` computes a fixed weighted sum of colocated base
+    blocks. The dedicated linear-combination factory remains useful because it
+    merges the weights into one compiled stencil and therefore avoids evaluating
+    a separate transform and VJP at runtime.
+
+    It can also represent a nonlinear observation operator whenever that map
+    factors through the base operator:
+
+        ``H_nonlinear(x) = F(base_operator(x))``.
+
+    This condition is important. Composition cannot reproduce a full-state
+    nonlinear operator if the base operator discards information needed by
+    ``F``. The standalone nonlinear adapter remains appropriate when the
+    nonlinear model consumes the full grid directly or already supplies a
+    model-space adjoint.
+
+    A primary use case is separating geometric sampling from observation
+    physics, for example
+
+        ``model state -> interpolated atmospheric profiles -> CRTM radiances``.
+
+    In that case the base blocks must retain and consistently align every
+    profile, surface, cloud, aerosol, and geometry input required by the
+    radiative-transfer transform.
+
+    The adjoint applies the chain rule in reverse. TensorFlow computes the
+    transform VJP by default, after which ``base_adjoint`` maps the resulting
+    block residuals back to model space. For an external transform such as CRTM,
+    ``transform_adjoint(local_state, residual)`` may instead provide the VJP and
+    must return one residual tensor per base observation block. Thus the reverse
+    action is
+
+        ``J_base(x)^T J_transform(base_operator(x))^T residual``.
+
+    Unlike the standalone nonlinear adapter's explicit adjoint, which returns a
+    full model-state tensor, ``transform_adjoint`` returns residuals in the
+    intermediate block space; this wrapper then invokes ``base_adjoint``.
+
+    Composition is recursive: because the returned pair follows the same SDA
+    contract, it can be supplied as the base pair of another composition to
+    construct chains containing more than two stages.
+    """
+    metadata = getattr(base_operator, "metadata", None)
+    grid_shape = getattr(base_operator, "grid_shape", None)
+    num_variables = getattr(base_operator, "num_variables", None)
+    if metadata is None or grid_shape is None or num_variables is None:
+        raise ValueError(
+            "base_operator must expose observation metadata, grid_shape, and "
+            "num_variables."
+        )
+    if not callable(base_adjoint) or not callable(transform_operator):
+        raise TypeError(
+            "base_adjoint and transform_operator must both be callable."
+        )
+    if transform_adjoint is not None and not callable(transform_adjoint):
+        raise TypeError("transform_adjoint must be callable when provided.")
+    if (
+        isinstance(observation_count, (bool, np.bool_))
+        or int(observation_count) != observation_count
+        or observation_count <= 0
+    ):
+        raise ValueError("observation_count must be a positive integer.")
+
+    lat_size, lon_size = (int(size) for size in grid_shape)
+    num_variables = int(num_variables)
+    observation_count = int(observation_count)
+    base_observation_counts = metadata.observation_counts
+
+    def _local_state(x: tf.Tensor) -> list[tf.Tensor]:
+        values = base_operator(x)
+        values, batch_size = _validate_and_normalize_residuals(
+            values, base_observation_counts, f"{operator_name} base operator"
+        )
+        batch_check = tf.debugging.assert_equal(
+            batch_size,
+            tf.shape(x)[0],
+            message=f"{operator_name} base operator changed the batch size.",
+        )
+        with tf.control_dependencies(
+            [batch_check] if batch_check is not None else []
+        ):
+            return [tf.identity(value) for value in values]
+
+    def _transform(local_state: list[tf.Tensor]) -> tf.Tensor:
+        values = tf.cast(transform_operator(local_state), tf.float32)
+        if values.shape.rank != 2:
+            raise ValueError(
+                f"{operator_name} transform must return rank-2 observations "
+                "(batch, observations)."
+            )
+        static_count = values.shape[1]
+        if static_count is not None and static_count != observation_count:
+            raise ValueError(
+                f"{operator_name} transform returned {static_count} observations; "
+                f"expected {observation_count}."
+            )
+        checks = [
+            tf.debugging.assert_equal(
+                tf.shape(values)[0],
+                tf.shape(local_state[0])[0],
+                message=f"{operator_name} transform changed the batch size.",
+            ),
+            tf.debugging.assert_equal(
+                tf.shape(values)[1],
+                observation_count,
+                message=f"{operator_name} transform returned the wrong observation count.",
+            ),
+        ]
+        with tf.control_dependencies([check for check in checks if check is not None]):
+            return tf.identity(values)
+
+    def H(x: tf.Tensor) -> list[tf.Tensor]:
+        x = _validate_state_shape(
+            x, (lat_size, lon_size), num_variables, operator_name
+        )
+        return [_transform(_local_state(x))]
+
+    def H_adjoint(residual, x: tf.Tensor) -> tf.Tensor:
+        """Apply the chained VJP J_base(x)^T J_transform(local)^T residual."""
+        x = _validate_state_shape(
+            x, (lat_size, lon_size), num_variables, operator_name
+        )
+        residual, batch_size = _validate_and_normalize_residuals(
+            residual, (observation_count,), f"{operator_name} H_adjoint"
+        )
+        batch_check = tf.debugging.assert_equal(
+            batch_size,
+            tf.shape(x)[0],
+            message=f"{operator_name} residual batch size does not match the state.",
+        )
+        with tf.control_dependencies([batch_check] if batch_check is not None else []):
+            residual_tensor = tf.identity(residual[0])
+
+        local_state = _local_state(x)
+        if transform_adjoint is None:
+            with tf.GradientTape() as tape:
+                tape.watch(local_state)
+                observations = _transform(local_state)
+                objective = tf.reduce_sum(observations * residual_tensor)
+            local_residual = tape.gradient(
+                objective,
+                local_state,
+                unconnected_gradients=tf.UnconnectedGradients.ZERO,
+            )
+        else:
+            local_residual = transform_adjoint(local_state, residual_tensor)
+
+        local_residual, local_batch_size = _validate_and_normalize_residuals(
+            local_residual,
+            base_observation_counts,
+            f"{operator_name} transform adjoint",
+        )
+        local_batch_check = tf.debugging.assert_equal(
+            local_batch_size,
+            tf.shape(x)[0],
+            message=f"{operator_name} transform adjoint changed the batch size.",
+        )
+        with tf.control_dependencies(
+            [local_batch_check] if local_batch_check is not None else []
+        ):
+            local_residual = [tf.identity(value) for value in local_residual]
+
+        if getattr(base_adjoint, "requires_state", False):
+            return base_adjoint(local_residual, x)
+        return base_adjoint(local_residual)
+
+    composed_metadata = _ObservationMetadata(
+        num_variables=num_variables,
+        selected_variables=np.array([-1], dtype=np.int32),
+        observation_counts=(observation_count,),
+        station_levels_by_block=(
+            np.zeros(observation_count, dtype=np.float32),
+        ),
+        channel_indices_by_block=(
+            np.zeros((observation_count, 1), dtype=np.int32),
+        ),
+        channel_weights_by_block=(
+            np.ones((observation_count, 1), dtype=np.float32),
+        ),
+        station_source=[],
+    )
+    for operator in (H, H_adjoint):
+        operator.metadata = composed_metadata
+        operator.selected_vars = composed_metadata.selected_variables
+        operator.grid_shape = (lat_size, lon_size)
+        operator.num_variables = num_variables
+        operator.requires_state = True
+        operator.supports_channel_weights = False
+        operator.base_operator = base_operator
+        operator.transform_operator = transform_operator
+
+    return H, H_adjoint
+
+# ==== Compute likelihood guidance in the clean state ====
 
 def compute_likelihood_gradient(
     x_0: tf.Tensor,
@@ -1677,9 +2096,9 @@ def compute_likelihood_gradient(
     H_adjoint: Callable,
     t: tf.Tensor,
     weights: tf.Tensor | list | np.ndarray | None = None,  # Per-variable weights
-    R_obs: float = 0.01,
+    R_obs: float = 0.1,
     gamma: float = 0.01,
-    guidance_scale: float = 0.3,
+    guidance_scale: float = 1.0,
 ) -> tf.Tensor:
     """Compute the clean-state factor of the SDA likelihood score.
 
@@ -1726,7 +2145,8 @@ def compute_likelihood_gradient(
     diffusion_obs_var = gamma * sigma_sq / (ALPHA_BAR_t + 1e-12)
     V = tf.cast(R_obs + diffusion_obs_var, tf.float32)
     
-    # Forward observation operator
+    # Forward observation operator: this is the current model prediction at the
+    # state x_0, which is compared to the observed values in observation space.
     y_hat = H(x_0)
     if metadata is not None:
         y_obs = _validate_guidance_observations(
@@ -1736,6 +2156,7 @@ def compute_likelihood_gradient(
         y_obs = [tf.cast(block, tf.float32) for block in y_obs]
 
     # Residual in observation space with optional per-variable weighting.
+    # This is the Gaussian mismatch term driving the guidance update.
     residual = []
     observation_weights = (
         _effective_observation_weights(H, weights) if weights is not None else None
@@ -1758,6 +2179,60 @@ def compute_likelihood_gradient(
 
     return score
 
+# ==== Compute background guidance in the clean state ====
+
+def compute_background_gradient(
+    x_0: tf.Tensor,
+    x_b: tf.Tensor,
+    t: tf.Tensor,
+    R_bck: tf.Tensor | float = 0.1,
+    background_gamma: tf.Tensor | float = 0.01,
+    background_guidance_scale: float = 1.0,
+) -> tf.Tensor:
+    """Compute the clean-state gradient of a Gaussian background factor.
+
+    The background is centered at ``x_b`` with diagonal covariance
+    ``R_bck``. As with the observation likelihood, uncertainty in the clean
+    prediction is represented in VP coordinates by the predictive variance
+
+        V_b,t = R_bck + background_gamma * (1 - alpha_bar_t) / alpha_bar_t.
+
+    ``R_bck`` and ``background_gamma`` may be scalars or positive tensors
+    broadcastable to the state shape. This returns the closed-form plug-in
+    gradient ``background_guidance_scale * (x_b - x_0) / V_b,t``.
+    """
+    if not np.isfinite(background_guidance_scale):
+        raise ValueError(f"background_guidance_scale must be finite; got {background_guidance_scale}.")
+
+    x_b = tf.cast(x_b, tf.float32)
+    x_b = tf.stop_gradient(tf.identity(x_b))
+    R_bck = tf.cast(R_bck, tf.float32)
+    background_gamma = tf.cast(background_gamma, tf.float32)
+    checks = [
+        tf.debugging.assert_all_finite(R_bck, "R_bck must be finite."),
+        tf.debugging.assert_positive(R_bck, "R_bck must be positive."),
+        tf.debugging.assert_all_finite(
+            background_gamma, "background_gamma must be finite."
+        ),
+        tf.debugging.assert_non_negative(
+            background_gamma, "background_gamma must be non-negative."
+        ),
+    ]
+    with tf.control_dependencies([check for check in checks if check is not None]):
+        alpha_bar_t = tf.cast(tf.gather(ALPHA_BAR, t), tf.float32)
+        diffusion_background_var = (
+            background_gamma
+            * (1.0 - alpha_bar_t)
+            / (alpha_bar_t + 1e-12)
+        )
+        V_b = tf.stop_gradient(tf.identity(R_bck + diffusion_background_var))
+    return (
+        tf.cast(background_guidance_scale, tf.float32)
+        * (x_b - x_0) / V_b
+    )
+
+
+# ==== Compute SDA guidance through the denoiser ====
 
 def compute_sda_posterior_guidance(
     x_t: tf.Tensor,
@@ -1767,19 +2242,29 @@ def compute_sda_posterior_guidance(
     H_adjoint: Callable,
     t: tf.Tensor,
     weights: tf.Tensor | list | np.ndarray | None = None,
-    R_obs: float = 0.01,
+    R_obs: float = 0.1,
     gamma: float = 0.01,
-    guidance_scale: float = 0.3,
+    guidance_scale: float = 1.0,
+    x_b: tf.Tensor | None = None,
+    R_bck: tf.Tensor | float = 0.1,
+    background_gamma: tf.Tensor | float = 0.01,
+    background_guidance_scale: float = 1.0,
 ) -> tuple[tf.Tensor, tf.Tensor]:
-    """Propagate the existing DDPM likelihood guidance through the denoiser.
+    """Propagate clean-state likelihood and background guidance through the denoiser.
 
     ``compute_likelihood_gradient`` supplies the clean-state guidance using the
-    paper likelihood variance. This function then computes
+    paper likelihood variance. When ``x_b`` is supplied, it defines an
+    additional Gaussian background factor centered at ``x_b`` with predictive
+    variance ``R_bck + background_gamma * sigma_t^2 / mu_t^2``. Its
+    clean-state log-density gradient,
+    scaled by ``background_guidance_scale``, is added to the likelihood
+    gradient. This function then computes
     ``J_D(x_t)^T g_0`` and converts that noisy-state score to the equivalent VP
     clean-prediction correction
     ``delta_x_0 = (sigma_t^2 / mu_t) * likelihood_score``.
 
-    Returns ``(guided_x_0, likelihood_score)``.
+    Returns ``(guided_x_0, posterior_guidance_score)``. Without ``x_b``, the
+    second value is the likelihood score used previously.
     """
     x_t = tf.cast(x_t, tf.float32)
     with tf.GradientTape() as tape:
@@ -1797,12 +2282,26 @@ def compute_sda_posterior_guidance(
         gamma=gamma,
         guidance_scale=guidance_scale,
     )
-    likelihood_score = tape.gradient(
+    clean_posterior_gradient = clean_likelihood_gradient
+    if x_b is not None:
+        clean_background_gradient = compute_background_gradient(
+            x_0=x_0,
+            x_b=x_b,
+            t=t,
+            R_bck=R_bck,
+            background_gamma=background_gamma,
+            background_guidance_scale=background_guidance_scale,
+        )
+        clean_posterior_gradient = (
+            clean_posterior_gradient + clean_background_gradient
+        )
+
+    posterior_guidance_score = tape.gradient(
         x_0,
         x_t,
-        output_gradients=tf.stop_gradient(clean_likelihood_gradient),
+        output_gradients=tf.stop_gradient(clean_posterior_gradient),
     )
-    if likelihood_score is None:
+    if posterior_guidance_score is None:
         raise ValueError(
             "The denoiser output is not differentiable with respect to x_t; "
             "paper-style SDA guidance requires the denoiser vector-Jacobian product."
@@ -1812,8 +2311,8 @@ def compute_sda_posterior_guidance(
     clean_correction_scale = (1.0 - alpha_bar_t) / tf.sqrt(
         alpha_bar_t + 1e-12
     )
-    guided_x_0 = x_0 + clean_correction_scale * likelihood_score
-    return guided_x_0, likelihood_score
+    guided_x_0 = x_0 + clean_correction_scale * posterior_guidance_score
+    return guided_x_0, posterior_guidance_score
 
 # ==== Create station locations for observation operators ====
 
