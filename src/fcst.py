@@ -49,7 +49,10 @@ from transform import (
 )
 from score_based_da import (
     compute_sda_posterior_guidance,
-    build_pseudo_observation_operator,
+    build_observation_operator,
+    create_pseudo_station_locations,
+    load_real_station_locations,
+    load_real_observation_data,
 )
 import utils
 from utils import setup_logging
@@ -932,7 +935,7 @@ class WeatherForecaster:
         x_b: tf.Tensor,
         H: Callable | None,
         H_adjoint: Callable | None,
-        y_obs: tf.Tensor | None,
+        y_obs: list[tf.Tensor] | tuple[tf.Tensor, ...] | None,
         member: int = 0,
     ) -> tf.Tensor:
         """
@@ -985,7 +988,17 @@ class WeatherForecaster:
                     X_in, noisy_state, step_t
                 )
                 return model.predict(X_model)
-
+            # construct SDA params
+            kwargs = {
+                # observation guidance parameters
+                "R_obs": 0.1,
+                "gamma": 0.01,
+                "guidance_scale": 1.0,
+                # background guidance parameters
+                "R_bck": 0.3,
+                "background_gamma": 0.01,
+                "background_guidance_scale": 1.0,
+            }
             # Apply SDA guidance
             x_0_pred, _ = compute_sda_posterior_guidance(
                 x_t=X_noisy,
@@ -994,13 +1007,8 @@ class WeatherForecaster:
                 H=H,
                 H_adjoint=H_adjoint,
                 t=step_t,
-                weights=None,
-                R_obs=0.1,
-                gamma=0.01,
-                guidance_scale=1.0,
                 x_b=x_b,
-                R_bck=1.0, # downweight background guidance by 10x compared to observations
-                background_guidance_scale=1.0,
+                **kwargs,
             )
 
             eps = compute_epsilon(X_noisy, x_0_pred, step_t)
@@ -1337,14 +1345,69 @@ class WeatherForecaster:
             if nlat_sda != nlat or nlon_sda != nlon:
                 x_b = tf.image.resize(x_b, size=[nlat_sda, nlon_sda], method='bilinear')
 
-            # By default no observations, use only background HRRR forecast
-            y_obs, H, H_adjoint = None, None, None
+            # Load real data
+            init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(args.inittime)
+            date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
+            stations_preprocessed_file = f"{args.base_dir}/{date_str}/stat_locs.npz"
+            obs_preprocessed_file = f"{args.base_dir}/{date_str}/stat_obs.npz"
+            has_obs = os.path.exists(stations_preprocessed_file) and os.path.exists(obs_preprocessed_file)
+
+            if has_obs:
+                logger.info(f"Loading preprocessed station locations from {stations_preprocessed_file}")
+                station_groups, station_locations_per_var = load_real_station_locations(stations_preprocessed_file)
+                logger.info(f"Loading preprocessed observation data from {obs_preprocessed_file}")
+                y_obs_dict = load_real_observation_data(obs_preprocessed_file)
+                y_obs = list(y_obs_dict.values()) if isinstance(y_obs_dict, dict) else y_obs_dict
+            else:
+                logger.warning(f"Using pseudo-observations.")
+                if True:
+                    station_groups, station_locations_per_var = create_pseudo_station_locations(
+                        lat_size=nlat_sda,
+                        lon_size=nlon_sda,
+                        subsampling_factor=args.subsampling_factor,
+                        layout=args.station_layout,
+                        operator_type=args.obs_operator,
+                        random_seed=args.obs_random_seed,
+                        num_variables=self.predicted_channels,
+                        level_size=len(self.metadata['levels']) + 1,
+                        num_3d_fields=len(self.metadata['pl_vars']),
+                        num_2d_fields=len(self.metadata['sfc_vars']),
+                    )
+                else:
+                    y_obs, station_groups, station_locations_per_var = None, {}, {}
+
+            # Build observation operator and its adjoint for SDA guidance
+            H, H_adjoint = build_observation_operator(
+                args=args,
+                station_groups=station_groups,
+                station_locations_per_var=station_locations_per_var,
+                lat_size=nlat_sda,
+                lon_size=nlon_sda,
+                num_variables=self.predicted_channels,
+                level_size=len(self.metadata['levels']) + 1,
+                num_3d_fields=len(self.metadata['pl_vars']),
+                num_2d_fields=len(self.metadata['sfc_vars']),
+            )
+
+            # pseudo observations
+            if has_obs:
+                x_b = None
+            elif H is not None:
+                y_obs = H(x_b)
+                x_b = None
 
             # Call SDA model and then change the model_input to the SDA output
             logger.info("Running data assimilation using SDA model...")
             y_analyses = self.predict_sda(
-                model, X_static, x_b=x_b, H=H, H_adjoint=H_adjoint,
-                y_obs=y_obs, member=0)
+                model, X_static, x_b=x_b,
+                H=H, H_adjoint=H_adjoint,
+                y_obs=y_obs, member=0
+            )
+            y_analyses = tf.clip_by_value(
+                y_analyses,
+                self.channel_mins[:y_analyses.shape[-1]],
+                self.channel_maxs[:y_analyses.shape[-1]]
+            )
             logger.info("Data assimilation completed, updating model input with SDA analyses...")
             model_input[:, :, :, :self.predicted_channels] = y_analyses.numpy()
 

@@ -341,7 +341,11 @@ def _validate_operator_inputs(
             raise ValueError("station_groups must be a non-empty dictionary.")
         if not isinstance(station_locations_per_var, dict) or not station_locations_per_var:
             raise ValueError("station_locations_per_var must be a non-empty dictionary.")
-        values = list(station_locations_per_var.keys())
+        values = (
+            list(station_locations_per_var.keys())
+            if variable_indices is None
+            else variable_indices
+        )
     elif variable_indices is None:
         return None
     else:
@@ -364,6 +368,17 @@ def _validate_operator_inputs(
             f"Variable indices must lie in [0, {num_variables}); "
             f"got {selected[invalid].tolist()}."
         )
+    if station_groups is not None:
+        unmapped = [
+            int(variable)
+            for variable in selected
+            if int(variable) not in station_locations_per_var
+        ]
+        if unmapped:
+            raise ValueError(
+                "Selected variable indices must have station-group mappings; "
+                f"missing mappings for {unmapped}."
+            )
     return selected
 
 
@@ -422,8 +437,8 @@ def _resolve_station_assignments(
             raise ValueError("Grouped stations must select at least one variable.")
         selected_variables = np.sort(validated_variables)
         group_by_variable = {
-            int(variable): group_name
-            for variable, group_name in station_locations_per_var.items()
+            int(variable): station_locations_per_var[int(variable)]
+            for variable in selected_variables
         }
         used_groups = set(group_by_variable.values())
         unknown_groups = used_groups.difference(station_groups)
@@ -2314,9 +2329,9 @@ def compute_sda_posterior_guidance(
     guided_x_0 = x_0 + clean_correction_scale * posterior_guidance_score
     return guided_x_0, posterior_guidance_score
 
-# ==== Create station locations for observation operators ====
+# ==== Create station locations for pseudo-observations ====
 
-def create_station_locations(
+def create_pseudo_station_locations(
     lat_size: int,
     lon_size: int,
     subsampling_factor: int,
@@ -2324,11 +2339,17 @@ def create_station_locations(
     operator_type: str,
     random_seed: int,
     level_size: int,
-) -> _StationLocations:
-    """Create station locations as (lat, lon, level) triplets.
+    num_variables: int,
+    num_3d_fields: int,
+    num_2d_fields: int,
+) -> tuple[_StationGroups, dict[int, str]]:
+    """Create pseudo-station groups and assign them to model variables.
 
-    The vertical coordinate is generated as a fractional level index within the
-    model's vertical extent, matching the lat/lon generation pattern.
+    Station locations are generated as ``(lat, lon, level)`` triplets. Their
+    vertical coordinates are fractional model-level indices. Locations are then
+    grouped by their lower-bracketing level, and each model variable is assigned
+    to the group corresponding to its channel level. Appended 2D fields use the
+    final pseudo-level group.
     """
     if lat_size <= 0 or lon_size <= 0:
         raise ValueError(
@@ -2376,75 +2397,31 @@ def create_station_locations(
     # pseudo-level or the exact top atmospheric level, depending on the layout.
     num_atmospheric_levels = level_size - 1
     level_values = [
-        min(float(level_idx) + 0.5, float(num_atmospheric_levels - 1))
+        min(float(level_idx), float(num_atmospheric_levels - 1))
         for level_idx in range(num_atmospheric_levels)
     ]
     level_values.append(float(level_size - 1))
-    return [
+    station_locations = [
         (lat, lon, level)
         for level in level_values
         for lat, lon in base
     ]
+    if not station_locations:
+        raise ValueError("No station locations were generated.")
 
-# ==== Build observation operator from runtime configuration ====
-
-def _group_station_locations_by_level(
-    station_locations,
-    level_size: int,
-) -> _StationGroups:
-    """Group stations by their lower-bracketing discrete model level.
-
-    This lets each variable subscribe only to the subset of stations that match its
-    vertical level, while still keeping the full station catalog available for all
-    variables and the extra pseudo-level for 2D / integrated variables.
-    """
-    if level_size <= 0:
-        raise ValueError(f"level_size must be positive; got {level_size}.")
-
-    groups = {f"level_{level_idx}": [] for level_idx in range(level_size)}
-    normalized = _normalize_station_locations(station_locations)
-    for lat, lon, level in normalized:
+    station_groups = {
+        f"level_{level_idx}": [] for level_idx in range(level_size)
+    }
+    for lat, lon, level in _normalize_station_locations(station_locations):
         # Fractional atmospheric observations belong to their lower bracketing
         # level; the interpolation stencil also includes the upper level. The
         # final integer level is reserved for 2D / integrated fields.
         lower_level = int(np.clip(np.floor(level), 0, level_size - 1))
-        groups[f"level_{lower_level}"].append((lat, lon, float(level)))
-    return groups
+        station_groups[f"level_{lower_level}"].append(
+            (lat, lon, float(level))
+        )
 
-
-def build_pseudo_observation_operator(
-    args,
-    lat_size: int,
-    lon_size: int,
-    num_variables: int,
-    level_size: int,
-    num_3d_fields: int,
-    num_2d_fields: int,
-) -> tuple[Callable, Callable]:
-    """Build H and H_adjoint from runtime configuration.
-
-    num_3d_fields / num_2d_fields encode the actual model layout: 3D fields are
-    stored as blocks of NUM_LEVELS channels, while 2D fields are appended as a
-    single pseudo-level block after the 3D stack. This lets each channel map to
-    the correct vertical subset rather than flattening everything into a single
-    variable index space.
-    """
     num_levels = level_size - 1 if num_2d_fields > 0 else level_size
-
-    station_locs = create_station_locations(
-        lat_size=lat_size,
-        lon_size=lon_size,
-        subsampling_factor=args.subsampling_factor,
-        layout=args.station_layout,
-        operator_type=args.obs_operator,
-        random_seed=args.obs_random_seed,
-        level_size=level_size,
-    )
-
-    if len(station_locs) == 0:
-        raise ValueError("No station locations were generated.")
-
-    station_groups = _group_station_locations_by_level(station_locs, level_size)
     station_locations_per_var = {}
     for var_idx in range(num_variables):
         if var_idx < num_3d_fields * num_levels:
@@ -2453,6 +2430,165 @@ def build_pseudo_observation_operator(
         else:
             group_name = f"level_{num_levels}"
         station_locations_per_var[var_idx] = group_name
+
+    return station_groups, station_locations_per_var
+
+# ==== Load station locations and data from file for real observations according to Evan's files ====
+
+def load_real_station_locations(
+    station_locations_path: str,
+) -> tuple[_StationGroups, dict[int, str]]:
+    """Load real-observation station locations indexed by model variable.
+
+    ``station_locations_path`` must be a NumPy ``.npz`` archive whose entry
+    names are model channel indices. Each entry stores a ``(station, 3)`` array
+    of ``(lat, lon, level)`` coordinates in model-grid coordinates.
+
+    Returns the same ``(station_groups, station_locations_per_var)`` pair as
+    :func:`create_pseudo_station_locations`, ready for
+    :func:`build_observation_operator`. The group assignments are derived from
+    the NPZ entry names; no separate mapping file is required.
+    """
+    archive = np.load(station_locations_path, allow_pickle=False)
+    if not isinstance(archive, np.lib.npyio.NpzFile):
+        raise ValueError(
+            f"station_locations_path must contain a NumPy .npz archive; "
+            f"got {station_locations_path}."
+        )
+
+    try:
+        if not archive.files:
+            raise ValueError("The station-locations NPZ archive is empty.")
+
+        station_groups = {}
+        station_locations_per_var = {}
+        for raw_variable in archive.files:
+            try:
+                variable_index = int(raw_variable)
+            except ValueError as exc:
+                raise ValueError(
+                    f"NPZ entry '{raw_variable}' is not an integer variable index."
+                ) from exc
+            if variable_index < 0 or str(variable_index) != raw_variable:
+                raise ValueError(
+                    f"NPZ entry '{raw_variable}' must be a non-negative integer "
+                    "variable index."
+                )
+
+            locations = np.asarray(archive[raw_variable])
+            if locations.ndim != 2 or locations.shape[1] != 3:
+                raise ValueError(
+                    f"Station locations for variable {variable_index} must have "
+                    f"shape (stations, 3); got {locations.shape}."
+                )
+            normalized = _normalize_station_locations(locations)
+            if not normalized:
+                logging.warning(
+                    f"Station locations for variable {variable_index} are empty."
+                )
+                continue
+            station_groups[raw_variable] = normalized
+            station_locations_per_var[variable_index] = raw_variable
+    finally:
+        archive.close()
+
+    return station_groups, station_locations_per_var
+
+
+def load_real_observation_data(
+    obs_data_path: str,
+) -> dict[int, np.ndarray]:
+    """Load real station observations indexed directly by model variable.
+
+    ``obs_data_path`` must be a NumPy ``.npz`` archive whose entry names are
+    model channel indices. Each entry stores either a ``(stations,)`` array or a
+    ``(batch, stations)`` array of observations.
+
+    One-dimensional arrays are promoted to a single-batch array. Returned data
+    are finite ``float32`` arrays, ready to order by the selected variables and
+    pass as ``y_obs``.
+    """
+    archive = np.load(obs_data_path, allow_pickle=False)
+    if not isinstance(archive, np.lib.npyio.NpzFile):
+        raise ValueError(
+            f"obs_data_path must contain a NumPy .npz archive; "
+            f"got {obs_data_path}."
+        )
+
+    try:
+        if not archive.files:
+            raise ValueError("The station-data NPZ archive is empty.")
+
+        obs_data_per_var = {}
+        for raw_variable in archive.files:
+            try:
+                variable_index = int(raw_variable)
+            except ValueError as exc:
+                raise ValueError(
+                    f"NPZ entry '{raw_variable}' is not an integer variable index."
+                ) from exc
+            if variable_index < 0 or str(variable_index) != raw_variable:
+                raise ValueError(
+                    f"NPZ entry '{raw_variable}' must be a non-negative integer "
+                    "variable index."
+                )
+
+            try:
+                values = np.asarray(archive[raw_variable], dtype=np.float32)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Station data for variable {variable_index} must be numeric."
+                ) from exc
+            if values.ndim == 1:
+                values = values[np.newaxis, :]
+            elif values.ndim != 2:
+                raise ValueError(
+                    f"Station data for variable {variable_index} must have shape "
+                    f"(stations,) or (batch, stations); got {values.shape}."
+                )
+            if values.shape[0] == 0 or values.shape[1] == 0:
+                logging.warning(
+                    f"Station data for variable {variable_index} is empty."
+                )
+                continue
+            if not np.all(np.isfinite(values)):
+                raise ValueError(
+                    f"Station data for variable {variable_index} contains non-finite values."
+                )
+            obs_data_per_var[variable_index] = values
+    finally:
+        archive.close()
+
+    return obs_data_per_var
+
+
+# ==== Build observation operators from specification of stations per variable ====
+
+def build_observation_operator(
+    args,
+    station_groups: _StationGroups,
+    station_locations_per_var: dict[int, str],
+    lat_size: int,
+    lon_size: int,
+    level_size: int,
+    num_variables: int,
+    num_3d_fields: int,
+    num_2d_fields: int,
+) -> tuple[Callable | None, Callable | None]:
+    """Build H and H_adjoint for prepared station assignments.
+
+    num_3d_fields / num_2d_fields encode the actual model layout: 3D fields are
+    stored as blocks of NUM_LEVELS channels, while 2D fields are appended as a
+    single pseudo-level block after the 3D stack. This lets each channel map to
+    the correct vertical subset rather than flattening everything into a single
+    variable index space. Both pseudo and real observations can use this shared
+    construction path after preparing their station groups and variable mapping.
+    """
+    num_levels = level_size - 1 if num_2d_fields > 0 else level_size
+    station_count = sum(len(group) for group in station_groups.values())
+    if station_count == 0:
+        logging.warning("No station locations were provided.")
+        return None, None
 
     common_operator_kwargs = {
         "grid_shape": (lat_size, lon_size),
@@ -2467,7 +2603,7 @@ def build_pseudo_observation_operator(
     if args.obs_operator == "index":
         logging.info(
             "Using index observation operator with %d %s stations (subsampling_factor=%d).",
-            len(station_locs),
+            station_count,
             args.station_layout,
             args.subsampling_factor,
         )
@@ -2478,7 +2614,7 @@ def build_pseudo_observation_operator(
     if args.obs_operator == "interp":
         logging.info(
             "Using interp observation operator with %d %s stations (order=%d, subsampling_factor=%d).",
-            len(station_locs),
+            station_count,
             args.station_layout,
             args.interp_order,
             args.subsampling_factor,
@@ -2491,7 +2627,7 @@ def build_pseudo_observation_operator(
     if args.obs_operator == "footprint":
         logging.info(
             "Using circular footprint observation operator with %d %s stations (radius=%.3f grid cells).",
-            len(station_locs),
+            station_count,
             args.station_layout,
             args.footprint_radius,
         )
@@ -2508,7 +2644,7 @@ def build_pseudo_observation_operator(
         logging.info(
             "Using %s finite-difference observation operator with %d %s stations (spacing=%s).",
             args.finite_difference_kind,
-            len(station_locs),
+            station_count,
             args.station_layout,
             spacing,
         )
@@ -2522,17 +2658,17 @@ def build_pseudo_observation_operator(
     window_size = args.neighborhood_window_size
     if window_size is None:
         window_size = args.subsampling_factor
-        if window_size % 2 == 0:
-            window_size -= 1
-        window_size = max(window_size, 1)
+    if window_size % 2 == 0:
+        window_size -= 1
+    window_size = max(window_size, 1)
 
     sigma = args.neighborhood_sigma
     if sigma is None:
-        sigma = 0.425 * args.subsampling_factor
+        sigma = 0.425 * window_size
 
     logging.info(
         "Using neighborhood observation operator with %d %s stations (window_size=%d, kernel=%s, sigma=%.3f).",
-        len(station_locs),
+        station_count,
         args.station_layout,
         window_size,
         args.neighborhood_kernel,
