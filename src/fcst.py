@@ -926,13 +926,21 @@ class WeatherForecaster:
             return y
 
     def predict_sda(
-        self, model: ForecastModel, X: tf.Tensor, H: Callable, H_adjoint: Callable, y_obs: tf.Tensor, member: int = 0
+        self,
+        model: ForecastModel,
+        X: tf.Tensor,
+        x_b: tf.Tensor,
+        H: Callable | None,
+        H_adjoint: Callable | None,
+        y_obs: tf.Tensor | None,
+        member: int = 0,
     ) -> tf.Tensor:
         """
         Perform diffusion-based prediction with data assimilation guidance.
         Args:
             model: Diffusion model used for prediction.
             X: Input tensor including date encoding.
+            x_b: Normalized background forecast state.
             H: Observation operator.
             H_adjoint: Adjoint of the observation operator.
             y_obs: Ground truth observations.
@@ -990,6 +998,9 @@ class WeatherForecaster:
                 R_obs=0.1,
                 gamma=0.01,
                 guidance_scale=1.0,
+                x_b=x_b,
+                R_bck=1.0, # downweight background guidance by 10x compared to observations
+                background_guidance_scale=1.0,
             )
 
             eps = compute_epsilon(X_noisy, x_0_pred, step_t)
@@ -1319,32 +1330,21 @@ class WeatherForecaster:
             if nlat_sda != nlat or nlon_sda != nlon:
                 X_static = tf.image.resize(X_static, size=[nlat_sda, nlon_sda], method='bilinear')
 
-            # Downsample HRRR analyses from full grid  to SDA grid
-            model_input_tf = tf.convert_to_tensor(
+            # Extract the normalized background forecast state from model_input
+            # and downsample it to the SDA grid.
+            x_b = tf.convert_to_tensor(
                 model_input[:, :, :, :self.predicted_channels], dtype=tf.float32)
             if nlat_sda != nlat or nlon_sda != nlon:
-                model_input_tf = tf.image.resize(model_input_tf, size=[nlat_sda, nlon_sda], method='bilinear')
+                x_b = tf.image.resize(x_b, size=[nlat_sda, nlon_sda], method='bilinear')
 
-            # Create observation operator from configuration
-            logger.info("Building SDA observation operator.")
-            H, H_adjoint = build_pseudo_observation_operator(
-                args=args,
-                lat_size=nlat_sda,
-                lon_size=nlon_sda,
-                num_variables=self.predicted_channels,
-                level_size=len(self.metadata['levels']) + 1,
-                num_3d_fields=len(self.metadata['pl_vars']),
-                num_2d_fields=len(self.metadata['sfc_vars']),
-            )
-
-            # Apply observation operator to downsampled data
-            logger.info("Applying observation operator to downsampled model input for SDA...")
-            y_obs = H(model_input_tf)
+            # By default no observations, use only background HRRR forecast
+            y_obs, H, H_adjoint = None, None, None
 
             # Call SDA model and then change the model_input to the SDA output
             logger.info("Running data assimilation using SDA model...")
             y_analyses = self.predict_sda(
-                model, X_static, H=H, H_adjoint=H_adjoint, y_obs=y_obs, member=0)
+                model, X_static, x_b=x_b, H=H, H_adjoint=H_adjoint,
+                y_obs=y_obs, member=0)
             logger.info("Data assimilation completed, updating model input with SDA analyses...")
             model_input[:, :, :, :self.predicted_channels] = y_analyses.numpy()
 

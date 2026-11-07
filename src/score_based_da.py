@@ -2237,9 +2237,9 @@ def compute_background_gradient(
 def compute_sda_posterior_guidance(
     x_t: tf.Tensor,
     denoise_fn: Callable[[tf.Tensor], tf.Tensor],
-    y_obs: list[tf.Tensor] | tuple[tf.Tensor, ...],
-    H: Callable,
-    H_adjoint: Callable,
+    y_obs: list[tf.Tensor] | tuple[tf.Tensor, ...] | None,
+    H: Callable | None,
+    H_adjoint: Callable | None,
     t: tf.Tensor,
     weights: tf.Tensor | list | np.ndarray | None = None,
     R_obs: float = 0.1,
@@ -2271,18 +2271,20 @@ def compute_sda_posterior_guidance(
         tape.watch(x_t)
         x_0 = tf.cast(denoise_fn(x_t), tf.float32)
 
-    clean_likelihood_gradient = compute_likelihood_gradient(
-        x_0=x_0,
-        y_obs=y_obs,
-        H=H,
-        H_adjoint=H_adjoint,
-        t=t,
-        weights=weights,
-        R_obs=R_obs,
-        gamma=gamma,
-        guidance_scale=guidance_scale,
-    )
-    clean_posterior_gradient = clean_likelihood_gradient
+    clean_posterior_gradient = tf.zeros_like(x_0, dtype=tf.float32)
+    if y_obs is not None:
+        clean_likelihood_gradient = compute_likelihood_gradient(
+            x_0=x_0,
+            y_obs=y_obs,
+            H=H,
+            H_adjoint=H_adjoint,
+            t=t,
+            weights=weights,
+            R_obs=R_obs,
+            gamma=gamma,
+            guidance_scale=guidance_scale,
+        )
+        clean_posterior_gradient = clean_posterior_gradient + clean_likelihood_gradient
     if x_b is not None:
         clean_background_gradient = compute_background_gradient(
             x_0=x_0,
@@ -2292,9 +2294,7 @@ def compute_sda_posterior_guidance(
             background_gamma=background_gamma,
             background_guidance_scale=background_guidance_scale,
         )
-        clean_posterior_gradient = (
-            clean_posterior_gradient + clean_background_gradient
-        )
+        clean_posterior_gradient = clean_posterior_gradient + clean_background_gradient
 
     posterior_guidance_score = tape.gradient(
         x_0,

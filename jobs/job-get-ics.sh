@@ -19,4 +19,4 @@ source ${PACKAGEROOT}/etc/env.sh
 
 # job
 echo "In get_ics, init_time=${INIT_TIME} "
-python3 ${PACKAGEROOT}/src/get_ics.py ${INIT_TIME} --base_dir ${DATAROOT}
+python3 ${PACKAGEROOT}/src/get_ics.py ${INIT_TIME} --base_dir ${DATAROOT} --forecast-background
