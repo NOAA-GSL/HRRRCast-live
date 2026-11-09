@@ -1390,9 +1390,7 @@ class WeatherForecaster:
             )
 
             # pseudo observations
-            if has_obs:
-                x_b = None
-            elif H is not None:
+            if not has_obs and H is not None:
                 y_obs = H(x_b)
                 x_b = None
 
