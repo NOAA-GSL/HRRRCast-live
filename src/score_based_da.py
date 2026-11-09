@@ -743,12 +743,6 @@ def _create_compiled_linear_operator(
             updates,
             [batch_size, lat_size * lon_size, num_variables],
         )
-        ones_state = tf.scatter_nd(
-            scatter_indices,
-            tf.ones_like(updates),
-            [batch_size, lat_size * lon_size, num_variables],
-        )
-        full_state = tf.where(ones_state == 0, full_state, full_state / ones_state)
         return tf.reshape(full_state, [batch_size, lat_size, lon_size, num_variables])
 
     metadata = _ObservationMetadata(
