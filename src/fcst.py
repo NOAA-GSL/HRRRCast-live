@@ -53,6 +53,7 @@ from score_based_da import (
     create_pseudo_station_locations,
     load_real_station_locations,
     load_real_observation_data,
+    compute_observation_density_factors,
 )
 import utils
 from utils import setup_logging
@@ -936,6 +937,7 @@ class WeatherForecaster:
         H: Callable | None,
         H_adjoint: Callable | None,
         y_obs: list[tf.Tensor] | tuple[tf.Tensor, ...] | None,
+        sda_guidance_params: Dict[str, object],
         member: int = 0,
     ) -> tf.Tensor:
         """
@@ -947,6 +949,7 @@ class WeatherForecaster:
             H: Observation operator.
             H_adjoint: Adjoint of the observation operator.
             y_obs: Ground truth observations.
+            sda_guidance_params: Observation and background guidance parameters.
             member (int): Ensemble member seed.
         Returns:
             tf.Tensor: Predicted outputs for the batch.
@@ -988,17 +991,6 @@ class WeatherForecaster:
                     X_in, noisy_state, step_t
                 )
                 return model.predict(X_model)
-            # construct SDA params
-            kwargs = {
-                # observation guidance parameters
-                "R_obs": 0.1,
-                "gamma": 0.01,
-                "guidance_scale": 1.0,
-                # background guidance parameters
-                "R_bck": 0.3,
-                "background_gamma": 0.01,
-                "background_guidance_scale": 1.0,
-            }
             # Apply SDA guidance
             x_0_pred, _ = compute_sda_posterior_guidance(
                 x_t=X_noisy,
@@ -1008,7 +1000,7 @@ class WeatherForecaster:
                 H_adjoint=H_adjoint,
                 t=step_t,
                 x_b=x_b,
-                **kwargs,
+                **sda_guidance_params,
             )
 
             eps = compute_epsilon(X_noisy, x_0_pred, step_t)
@@ -1389,6 +1381,28 @@ class WeatherForecaster:
                 num_2d_fields=len(self.metadata['sfc_vars']),
             )
 
+            # Compute R_obs
+            R_obs = 0.1
+            if H is not None and H_adjoint is not None:
+                observation_density = compute_observation_density_factors(
+                    H, H_adjoint
+                )
+                R_obs = [
+                    tf.cast(R_obs, tf.float32) * density
+                    for density in observation_density
+                ]
+
+            sda_guidance_params: Dict[str, object] = {
+                # observation guidance parameters
+                "R_obs": R_obs,
+                "gamma": 0.01,
+                "guidance_scale": 1.0,
+                # background guidance parameters
+                "R_bck": 0.3,
+                "background_gamma": 0.01,
+                "background_guidance_scale": 1.0,
+            }
+
             # pseudo observations
             if not has_obs and H is not None:
                 y_obs = H(x_b)
@@ -1399,7 +1413,7 @@ class WeatherForecaster:
             y_analyses = self.predict_sda(
                 model, X_static, x_b=x_b,
                 H=H, H_adjoint=H_adjoint,
-                y_obs=y_obs, member=0
+                y_obs=y_obs, sda_guidance_params=sda_guidance_params, member=0
             )
             y_analyses = tf.clip_by_value(
                 y_analyses,

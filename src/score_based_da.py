@@ -2104,6 +2104,113 @@ def create_composed_observation_operator(
 
 # ==== Compute likelihood guidance in the clean state ====
 
+def compute_observation_density_factors(
+    H: Callable,
+    H_adjoint: Callable,
+) -> list[tf.Tensor]:
+    """Estimate observation-space overlap using ``H H^T 1``.
+
+    The returned rank-2 tensors contain one factor per observation block and
+    station. A factor of one leaves an isolated observation unchanged; factors
+    above one inflate its diagonal observation variance to compensate for
+    multiple positive stencils constraining the same model-space points.
+
+    This approximation is intended for fixed linear operators with non-negative
+    weights, such as index, linear interpolation, neighborhood, and footprint
+    operators. Signed finite-difference and higher-order interpolation stencils
+    require a full observation-error treatment instead.
+    """
+    metadata = getattr(H, "metadata", None)
+    if metadata is None:
+        raise ValueError("H must expose observation metadata.")
+    if getattr(H_adjoint, "requires_state", False):
+        raise ValueError(
+            "Observation-density factors require a state-independent linear adjoint."
+        )
+
+    stencil = getattr(H, "compiled_stencil", None)
+    if stencil is None:
+        raise ValueError("H must be a compiled linear observation operator.")
+    if any(np.any(block.weights < 0.0) for block in stencil.blocks):
+        raise ValueError(
+            "Observation-density factors require non-negative stencil weights."
+        )
+
+    observation_ones = [
+        tf.ones((1, count), dtype=tf.float32)
+        for count in metadata.observation_counts
+    ]
+    model_coverage = H_adjoint(observation_ones)
+    raw_factors = H(model_coverage)
+
+    density_factors = []
+    for block_index, (factor, expected_count) in enumerate(
+        zip(raw_factors, metadata.observation_counts)
+    ):
+        factor = tf.cast(factor, tf.float32)
+        checks = [
+            tf.debugging.assert_equal(
+                tf.shape(factor),
+                tf.constant([1, expected_count], dtype=tf.int32),
+                message=(
+                    f"Observation-density block {block_index} has the wrong shape."
+                ),
+            ),
+            tf.debugging.assert_all_finite(
+                factor,
+                f"Observation-density block {block_index} must be finite.",
+            ),
+        ]
+        with tf.control_dependencies(
+            [check for check in checks if check is not None]
+        ):
+            density_factors.append(
+                tf.stop_gradient(tf.maximum(tf.identity(factor), 1.0))
+            )
+    return density_factors
+
+
+def _normalize_observation_variances(
+    R_obs,
+    observation_blocks: list[tf.Tensor],
+) -> list[tf.Tensor]:
+    """Validate scalar or block-diagonal observation variances."""
+    if isinstance(R_obs, (list, tuple)):
+        if len(R_obs) != len(observation_blocks):
+            raise ValueError(
+                f"R_obs contains {len(R_obs)} blocks; expected "
+                f"{len(observation_blocks)}."
+            )
+        variance_values = list(R_obs)
+    else:
+        variance_values = [R_obs] * len(observation_blocks)
+
+    normalized = []
+    for block_index, (variance, observations) in enumerate(
+        zip(variance_values, observation_blocks)
+    ):
+        variance = tf.cast(variance, tf.float32)
+        try:
+            variance = tf.broadcast_to(variance, tf.shape(observations))
+        except (ValueError, tf.errors.InvalidArgumentError) as exc:
+            raise ValueError(
+                f"R_obs block {block_index} is not broadcastable to its "
+                "observation block."
+            ) from exc
+        checks = [
+            tf.debugging.assert_all_finite(
+                variance, f"R_obs block {block_index} must be finite."
+            ),
+            tf.debugging.assert_non_negative(
+                variance, f"R_obs block {block_index} must be non-negative."
+            ),
+        ]
+        with tf.control_dependencies(
+            [check for check in checks if check is not None]
+        ):
+            normalized.append(tf.identity(variance))
+    return normalized
+
 def compute_likelihood_gradient(
     x_0: tf.Tensor,
     y_obs: list[tf.Tensor] | tuple[tf.Tensor, ...],
@@ -2111,7 +2218,7 @@ def compute_likelihood_gradient(
     H_adjoint: Callable,
     t: tf.Tensor,
     weights: tf.Tensor | list | np.ndarray | None = None,  # Per-variable weights
-    R_obs: float = 0.1,
+    R_obs: float | tf.Tensor | list[tf.Tensor] | tuple[tf.Tensor, ...] = 0.1,
     gamma: float = 0.01,
     guidance_scale: float = 1.0,
 ) -> tf.Tensor:
@@ -2125,6 +2232,13 @@ def compute_likelihood_gradient(
     This function returns ``∇_{x_0} log p(y | x_t)``. It does not apply the
     denoiser Jacobian transpose; use ``compute_sda_posterior_guidance`` for the
     complete paper-style noisy-state likelihood score.
+
+    ``R_obs`` may be one scalar shared by every observation or a list/tuple of
+    tensors aligned with the blocks returned by ``H``. A rank-2 ``(1, stations)``
+    tensor is an efficient representation of a diagonal observation covariance
+    and broadcasts across the model-state batch. Use
+    :func:`compute_observation_density_factors` to inflate that diagonal for
+    overlapping positive observation stencils.
     """
 
     if not isinstance(y_obs, (list, tuple)):
@@ -2139,8 +2253,6 @@ def compute_likelihood_gradient(
         raise ValueError(
             f"y_obs contains {len(y_obs)} blocks; expected {expected_blocks}."
         )
-    if not np.isfinite(R_obs) or R_obs < 0:
-        raise ValueError(f"R_obs must be finite and non-negative; got {R_obs}.")
     if not np.isfinite(gamma) or gamma < 0:
         raise ValueError(f"gamma must be finite and non-negative; got {gamma}.")
     if not np.isfinite(guidance_scale):
@@ -2158,8 +2270,6 @@ def compute_likelihood_gradient(
     # Paper likelihood variance: V = R + (sigma_t / mu_t)^2 Gamma.
     sigma_sq = 1.0 - ALPHA_BAR_t
     diffusion_obs_var = gamma * sigma_sq / (ALPHA_BAR_t + 1e-12)
-    V = tf.cast(R_obs + diffusion_obs_var, tf.float32)
-    
     # Forward observation operator: this is the current model prediction at the
     # state x_0, which is compared to the observed values in observation space.
     y_hat = H(x_0)
@@ -2169,6 +2279,11 @@ def compute_likelihood_gradient(
         )
     else:
         y_obs = [tf.cast(block, tf.float32) for block in y_obs]
+    observation_variances = _normalize_observation_variances(R_obs, y_hat)
+    predictive_variances = [
+        variance + tf.cast(diffusion_obs_var, tf.float32)
+        for variance in observation_variances
+    ]
 
     # Residual in observation space with optional per-variable weighting.
     # This is the Gaussian mismatch term driving the guidance update.
@@ -2183,7 +2298,10 @@ def compute_likelihood_gradient(
 
         residual.append(res_i * guidance_scale)
 
-    weighted_residual = [res_i / V for res_i in residual]
+    weighted_residual = [
+        res_i / variance
+        for res_i, variance in zip(residual, predictive_variances)
+    ]
 
     # Adjoint: map residual back to full state space.
     # Divide by V for noise-aware scaling: H^T (H x_0 - y) / V.
@@ -2257,7 +2375,7 @@ def compute_sda_posterior_guidance(
     H_adjoint: Callable | None,
     t: tf.Tensor,
     weights: tf.Tensor | list | np.ndarray | None = None,
-    R_obs: float = 0.1,
+    R_obs: float | tf.Tensor | list[tf.Tensor] | tuple[tf.Tensor, ...] = 0.1,
     gamma: float = 0.01,
     guidance_scale: float = 1.0,
     x_b: tf.Tensor | None = None,
@@ -2397,7 +2515,7 @@ def create_pseudo_station_locations(
     # pseudo-level or the exact top atmospheric level, depending on the layout.
     num_atmospheric_levels = level_size - 1
     level_values = [
-        min(float(level_idx), float(num_atmospheric_levels - 1))
+        min(float(level_idx) + 0.5, float(num_atmospheric_levels - 1))
         for level_idx in range(num_atmospheric_levels)
     ]
     level_values.append(float(level_size - 1))
