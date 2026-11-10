@@ -1337,6 +1337,13 @@ class WeatherForecaster:
             if nlat_sda != nlat or nlon_sda != nlon:
                 x_b = tf.image.resize(x_b, size=[nlat_sda, nlon_sda], method='bilinear')
 
+            # clip input to range
+            x_b = tf.clip_by_value(
+                x_b,
+                self.channel_mins[:x_b.shape[-1]],
+                self.channel_maxs[:x_b.shape[-1]]
+            )
+
             # Load real data
             init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(args.inittime)
             date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
