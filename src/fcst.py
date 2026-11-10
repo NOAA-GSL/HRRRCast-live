@@ -35,8 +35,7 @@ except ImportError as e:
 
 from diffusion_params import (
     NUM_DIFFUSION_STEPS,
-    NUM_INFERENCE_STEPS,
-    INFERENCE_STEPS,
+    compute_inference_steps,
     compute_epsilon,
     ddpm,
     ddim,
@@ -251,6 +250,8 @@ class WeatherForecaster:
         self.diffusion_sampler = diffusion_sampler
         self.noise_rho = noise_rho
 
+        self.inference_steps = None
+
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
             "VIS",
@@ -323,6 +324,20 @@ class WeatherForecaster:
             self.member_anchors[member] = anchor
 
         logger.info("Member anchors initialized; noise will be generated on-the-fly during inference")
+
+    def _compute_inference_steps(self, args, is_da: bool) -> None:
+        num_inference_steps = (
+            args.da_inference_steps if is_da else args.forecast_inference_steps
+        )
+        self.inference_steps = tf.constant(
+            compute_inference_steps(num_inference_steps),
+            dtype=tf.int32,
+        )
+        logging.info(
+            "Using %d diffusion inference steps for %s",
+            num_inference_steps,
+            "data assimilation" if is_da else "forecasting",
+        )
 
     def _compute_pmm_mean(self, member_outputs: Dict[int, np.ndarray], method: int = 2) -> Tuple[np.ndarray, List[int]]:
         """Compute PMM mean for REFC and APCP channels only.
@@ -886,32 +901,33 @@ class WeatherForecaster:
                 return x_0_pred, eps
 
             # iterate over diffusion steps
+            n_steps = tf.shape(self.inference_steps)[0]
             prev_x0 = None
             prev_h = None
-            for t_ in range(NUM_INFERENCE_STEPS):
-                ti = NUM_INFERENCE_STEPS - 1 - t_
-                t = INFERENCE_STEPS[ti]
+            for t_ in tf.range(n_steps):
+                ti = n_steps - 1 - t_
 
                 # compute predicted noise epsilon at this step
+                t = tf.gather(self.inference_steps, ti)
                 x0_t, epsilon_t = predict_x0_and_epsilon(X, Xn, t)
 
                 # Choose diffusion sampler
                 if ti == 0:
                     Xn = x0_t
                 else:
+                    tm1 = tf.gather(self.inference_steps, ti - 1)
                     if self.diffusion_sampler == "ddim-heun":
-                        x_tm1_pred = ddim(Xn, epsilon_t, ti, seed=members, eta=0.0)
+                        x_tm1_pred = ddim(Xn, epsilon_t, t, tm1, seed=members, eta=0.0)
 
-                        tm1 = tf.gather(list(INFERENCE_STEPS), ti - 1)
                         _, epsilon_tm1 = predict_x0_and_epsilon(X, x_tm1_pred, tm1)
 
-                        Xn = ddim_heun(Xn, epsilon_t, epsilon_tm1, ti, seed=members, eta=0.0)
+                        Xn = ddim_heun(Xn, epsilon_t, epsilon_tm1, t, tm1, seed=members, eta=0.0)
                     elif self.diffusion_sampler == "dpmpp-2m":
-                        Xn, prev_x0, prev_h = dpmpp_2m(Xn, x0_t, ti, prev_x0=prev_x0, prev_h=prev_h)
+                        Xn, prev_x0, prev_h = dpmpp_2m(Xn, x0_t, t, tm1, prev_x0=prev_x0, prev_h=prev_h)
                     elif self.diffusion_sampler == "ddim":
-                        Xn = ddim(Xn, epsilon_t, ti, seed=members, eta=0.0)
+                        Xn = ddim(Xn, epsilon_t, t, tm1, seed=members, eta=0.0)
                     else:
-                        Xn = ddpm(Xn, epsilon_t, ti, seed=members)
+                        Xn = ddpm(Xn, epsilon_t, t, tm1, seed=members)
 
             return Xn
         else:
@@ -1007,32 +1023,33 @@ class WeatherForecaster:
             return x_0_pred, eps
 
         # iterate over diffusion steps
+        n_steps = tf.shape(self.inference_steps)[0]
         prev_x0 = None
         prev_h = None
-        for t_ in range(NUM_INFERENCE_STEPS):
-            ti = NUM_INFERENCE_STEPS - 1 - t_
-            t = INFERENCE_STEPS[ti]
+        for t_ in tf.range(n_steps):
+            ti = n_steps - 1 - t_
 
             # compute predicted noise epsilon at this step
+            t = tf.gather(self.inference_steps, ti)
             x0_t, epsilon_t = predict_x0_and_epsilon(X, Xn, t)
 
             # Choose diffusion sampler
             if ti == 0:
                 Xn = x0_t
             else:
-                if self.diffusion_sampler == "ddim-heun":
-                    x_tm1_pred = ddim(Xn, epsilon_t, ti, seed=member, eta=0.0)
+                tm1 = tf.gather(self.inference_steps, ti - 1)
 
-                    tm1 = tf.gather(list(INFERENCE_STEPS), ti - 1)
+                if self.diffusion_sampler == "ddim-heun":
+                    x_tm1_pred = ddim(Xn, epsilon_t, t, tm1, seed=member, eta=0.0)
                     _, epsilon_tm1 = predict_x0_and_epsilon(X, x_tm1_pred, tm1)
 
-                    Xn = ddim_heun(Xn, epsilon_t, epsilon_tm1, ti, seed=member, eta=0.0)
+                    Xn = ddim_heun(Xn, epsilon_t, epsilon_tm1, t, tm1, seed=member, eta=0.0)
                 elif self.diffusion_sampler == "dpmpp-2m":
-                    Xn, prev_x0, prev_h = dpmpp_2m(Xn, x0_t, ti, prev_x0=prev_x0, prev_h=prev_h)
+                    Xn, prev_x0, prev_h = dpmpp_2m(Xn, x0_t, t, tm1, prev_x0=prev_x0, prev_h=prev_h)
                 elif self.diffusion_sampler == "ddim":
-                    Xn = ddim(Xn, epsilon_t, ti, seed=member, eta=0.0)
+                    Xn = ddim(Xn, epsilon_t, t, tm1, seed=member, eta=0.0)
                 else:
-                    Xn = ddpm(Xn, epsilon_t, ti, seed=member)
+                    Xn = ddpm(Xn, epsilon_t, t, tm1, seed=member)
 
         # Upsample from SDA
         if nlat_sda != nlat or nlon_sda != nlon:
@@ -1286,7 +1303,7 @@ class WeatherForecaster:
 
         return ds
     
-    def run_forecast(self, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str = "./"):
+    def run_forecast(self, model: ForecastModel, lead_hours: int, model_input: np.ndarray, args, output_dir: str = "./"):
         """Run forecasts"""
         try:
             init_datetime = self.data_loader_hrrr.get_init_datetime()
@@ -1296,6 +1313,7 @@ class WeatherForecaster:
             logger.info(self.metadata)
 
             # Run autoregressive forecast and write per-hour outputs to disk
+            self._compute_inference_steps(args, is_da=False)
             self.autoregressive_rollout(
                 model_input,
                 self.data_loader_gfs.get_model_input(),
@@ -1416,6 +1434,8 @@ class WeatherForecaster:
                 x_b = None
 
             # Call SDA model and then change the model_input to the SDA output
+            self._compute_inference_steps(args, is_da=True)
+
             logger.info("Running data assimilation using SDA model...")
             y_analyses = self.predict_sda(
                 model, X_static, x_b=x_b,
@@ -1439,10 +1459,10 @@ class WeatherForecaster:
             logger.error(f"Data assimilation failed : {e}")
             raise
 
-def run_weather_forecast(forecaster: WeatherForecaster, model: ForecastModel, lead_hours: int, model_input: np.ndarray, output_dir: str):
+def run_weather_forecast(forecaster: WeatherForecaster, model: ForecastModel, lead_hours: int, model_input: np.ndarray, args, output_dir: str):
     """Run forecast for a single member. Requires precomputed model_input."""
     try:
-        forecaster.run_forecast(model, lead_hours, model_input, output_dir)
+        forecaster.run_forecast(model, lead_hours, model_input, args, output_dir)
     except Exception as e:
         logger.error(f"Forecast failed : {e}")
         raise
@@ -1482,6 +1502,8 @@ def parse_arguments():
                         help="Noise blend/correlation parameter (0..1)")
     parser.add_argument("--no_nudging", default=False, action="store_true",
                         help="Disable nudging (member perturbation toward consensus)")
+    parser.add_argument("--forecast-inference-steps", dest="forecast_inference_steps", required=False, type=int, default=25,
+                        help="Number of diffusion inference steps for forecasts (default: 25).")
 
     # Add arguments for observation operator and station layout
     parser.add_argument("--obs_operator", dest="obs_operator", type=str, choices=["index", "interp", "neighborhood"], default="neighborhood",
@@ -1500,6 +1522,8 @@ def parse_arguments():
                         help="Neighborhood kernel type.")
     parser.add_argument("--neighborhood_sigma", dest="neighborhood_sigma", type=float, default=None,
                         help="Gaussian sigma for neighborhood kernel; ignored for uniform kernel.")
+    parser.add_argument("--da-inference-steps", dest="da_inference_steps", required=False, type=int, default=100,
+                    help="Number of diffusion inference steps for data assimilation (default: 100).")
     
     return parser.parse_args()
 
@@ -1616,7 +1640,7 @@ def main():
             model.load_model(args.model_path)
 
             run_weather_forecast(
-                forecaster, model, args.lead_hours, model_input, args.output_dir
+                forecaster, model, args.lead_hours, model_input, args, args.output_dir
             )
 
             model.unload_model()
