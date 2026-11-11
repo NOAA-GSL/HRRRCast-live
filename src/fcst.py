@@ -1374,7 +1374,14 @@ class WeatherForecaster:
                 station_groups, station_locations_per_var = load_real_station_locations(stations_preprocessed_file)
                 logger.info(f"Loading preprocessed observation data from {obs_preprocessed_file}")
                 y_obs_dict = load_real_observation_data(obs_preprocessed_file)
-                y_obs = list(y_obs_dict.values()) if isinstance(y_obs_dict, dict) else y_obs_dict
+                y_obs = [
+                    np.clip(
+                        y_obs_dict[variable_index],
+                        self.channel_mins[variable_index],
+                        self.channel_maxs[variable_index],
+                    )
+                    for variable_index in sorted(y_obs_dict)
+                ]
             else:
                 logger.warning(f"Using pseudo-observations.")
                 if True:
@@ -1432,6 +1439,7 @@ class WeatherForecaster:
             if not has_obs and H is not None:
                 y_obs = H(x_b)
                 x_b = None
+
 
             # Call SDA model and then change the model_input to the SDA output
             self._compute_inference_steps(args, is_da=True)
