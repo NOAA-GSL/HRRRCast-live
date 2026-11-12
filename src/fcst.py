@@ -50,8 +50,7 @@ from score_based_da import (
     compute_sda_posterior_guidance,
     build_observation_operator,
     create_pseudo_station_locations,
-    load_real_station_locations,
-    load_real_observation_data,
+    load_and_merge_real_observations_with_uncertainties,
     compute_observation_density_factors,
 )
 import utils
@@ -1362,25 +1361,70 @@ class WeatherForecaster:
                 self.channel_maxs[:x_b.shape[-1]]
             )
 
-            # Load real data
+            # Construct the default set of station and observation files for this initialization time.
             init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(args.inittime)
             date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
-            stations_preprocessed_file = f"{args.base_dir}/{date_str}/stat_locs.npz"
-            obs_preprocessed_file = f"{args.base_dir}/{date_str}/stat_obs.npz"
-            has_obs = os.path.exists(stations_preprocessed_file) and os.path.exists(obs_preprocessed_file)
+            default_observation_specs = [
+                ("prepbufr_adpsfc", 0.1),
+                ("prepbufr_adpupa", 0.1),
+                ("prepbufr_aircar", 0.1),
+                ("prepbufr_aircft", 0.1),
+                ("prepbufr_ascatw", 0.1),
+                ("prepbufr_gpsipw", 0.1),
+                ("prepbufr_msonet", 0.1),
+                ("prepbufr_proflr", 0.1),
+                ("prepbufr_rassda", 0.1),
+                ("prepbufr_satwnd", 0.1),
+                ("prepbufr_sfcshp", 0.1),
+                ("prepbufr_vadwnd", 0.1),
+                ("mrms", 0.1),
+            ]
+            default_station_files = [
+                f"{station_file}_locs.npz" for station_file, _ in default_observation_specs
+            ]
+            default_obs_files = [
+                f"{station_file}_obs.npz" for station_file, _ in default_observation_specs
+            ]
+            default_observation_uncertainties = [
+                variance for _, variance in default_observation_specs
+            ]
 
+            station_files = [
+                os.path.join(args.base_dir, date_str, path) for path in default_station_files
+            ]
+            obs_files = [
+                os.path.join(args.base_dir, date_str, path) for path in default_obs_files
+            ]
+            observation_type_uncertainties = default_observation_uncertainties
+            missing_obs_files = [
+                path for path in station_files + obs_files if not os.path.exists(path)
+            ]
+            has_obs = not missing_obs_files
+
+            # Load and merge station locations and observation data, or create pseudo-observations 
+            # if no real data is available.
             if has_obs:
-                logger.info(f"Loading preprocessed station locations from {stations_preprocessed_file}")
-                station_groups, station_locations_per_var = load_real_station_locations(stations_preprocessed_file)
-                logger.info(f"Loading preprocessed observation data from {obs_preprocessed_file}")
-                y_obs_dict = load_real_observation_data(obs_preprocessed_file)
+                logger.info(f"Loading and merging station locations from {station_files}")
+                logger.info(f"Loading and merging observation data from {obs_files}")
+                (
+                    station_groups,
+                    station_locations_per_var,
+                    observation_data,
+                    observation_variances_per_var,
+                ) = load_and_merge_real_observations_with_uncertainties(
+                    station_files,
+                    obs_files,
+                    observation_type_uncertainties,
+                )
+
+                # clip observations to valid range
                 y_obs = [
                     np.clip(
-                        y_obs_dict[variable_index],
+                        observation_data[variable_index],
                         self.channel_mins[variable_index],
                         self.channel_maxs[variable_index],
                     )
-                    for variable_index in sorted(y_obs_dict)
+                    for variable_index in sorted(observation_data)
                 ]
             else:
                 logger.warning(f"Using pseudo-observations.")
@@ -1419,9 +1463,23 @@ class WeatherForecaster:
                 observation_density = compute_observation_density_factors(
                     H, H_adjoint
                 )
+                if has_obs:
+                    base_observation_variances = [
+                        tf.convert_to_tensor(
+                            observation_variances_per_var[variable_index],
+                            dtype=tf.float32,
+                        )
+                        for variable_index in sorted(observation_variances_per_var)
+                    ]
+                else:
+                    base_observation_variances = [
+                        tf.cast(R_obs, tf.float32)
+                    ] * len(observation_density)
                 R_obs = [
-                    tf.cast(R_obs, tf.float32) * density
-                    for density in observation_density
+                    variance * density
+                    for variance, density in zip(
+                        base_observation_variances, observation_density
+                    )
                 ]
 
             sda_guidance_params: Dict[str, object] = {
@@ -1510,7 +1568,7 @@ def parse_arguments():
                         help="Noise blend/correlation parameter (0..1)")
     parser.add_argument("--no_nudging", default=False, action="store_true",
                         help="Disable nudging (member perturbation toward consensus)")
-    parser.add_argument("--forecast-inference-steps", dest="forecast_inference_steps", required=False, type=int, default=25,
+    parser.add_argument("--forecast_inference_steps", dest="forecast_inference_steps", required=False, type=int, default=25,
                         help="Number of diffusion inference steps for forecasts (default: 25).")
 
     # Add arguments for observation operator and station layout
@@ -1530,9 +1588,8 @@ def parse_arguments():
                         help="Neighborhood kernel type.")
     parser.add_argument("--neighborhood_sigma", dest="neighborhood_sigma", type=float, default=None,
                         help="Gaussian sigma for neighborhood kernel; ignored for uniform kernel.")
-    parser.add_argument("--da-inference-steps", dest="da_inference_steps", required=False, type=int, default=100,
+    parser.add_argument("--da_inference_steps", dest="da_inference_steps", required=False, type=int, default=100,
                     help="Number of diffusion inference steps for data assimilation (default: 100).")
-    
     return parser.parse_args()
 
 

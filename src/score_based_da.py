@@ -74,7 +74,7 @@ Implementation pattern:
 """
 import logging
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 import tensorflow as tf
@@ -2601,7 +2601,7 @@ def load_real_station_locations(
                 )
             normalized = _normalize_station_locations(locations)
             if not normalized:
-                logging.warning(
+                logging.debug(
                     f"Station locations for variable {variable_index} are empty."
                 )
                 continue
@@ -2665,7 +2665,7 @@ def load_real_observation_data(
                     f"(stations,) or (batch, stations); got {values.shape}."
                 )
             if values.shape[0] == 0 or values.shape[1] == 0:
-                logging.warning(
+                logging.debug(
                     f"Station data for variable {variable_index} is empty."
                 )
                 continue
@@ -2678,6 +2678,234 @@ def load_real_observation_data(
         archive.close()
 
     return obs_data_per_var
+
+
+def merge_real_station_locations(
+    station_location_sets: Sequence[tuple[_StationGroups, dict[int, str]]],
+) -> tuple[_StationGroups, dict[int, str]]:
+    """Merge station-location results loaded from multiple archives.
+
+    Locations for a model variable are appended in input-file order. A canonical
+    group named with the variable index is used in the merged result, so source
+    archives may use different internal group names.
+    """
+    if not station_location_sets:
+        raise ValueError("station_location_sets must contain at least one result.")
+
+    merged_groups: _StationGroups = {}
+    merged_locations_per_var: dict[int, str] = {}
+    for source_index, (station_groups, locations_per_var) in enumerate(
+        station_location_sets
+    ):
+        for variable_index, source_group_name in locations_per_var.items():
+            if source_group_name not in station_groups:
+                raise ValueError(
+                    f"Station-location result {source_index} maps variable "
+                    f"{variable_index} to missing group '{source_group_name}'."
+                )
+
+            canonical_group_name = str(variable_index)
+            merged_groups.setdefault(canonical_group_name, []).extend(
+                station_groups[source_group_name]
+            )
+            merged_locations_per_var[variable_index] = canonical_group_name
+
+    if not merged_groups:
+        raise ValueError("The station-location results contain no stations.")
+    return merged_groups, merged_locations_per_var
+
+
+def merge_real_observation_data(
+    observation_sets: Sequence[dict[int, np.ndarray]],
+) -> dict[int, np.ndarray]:
+    """Merge loaded observations by appending their station dimensions.
+
+    All arrays must use the same batch size. Variables need not occur in every
+    source; when a variable occurs more than once, its arrays are concatenated
+    along axis 1 while preserving input-file order.
+    """
+    if not observation_sets:
+        raise ValueError("observation_sets must contain at least one result.")
+
+    arrays_per_var: dict[int, list[np.ndarray]] = {}
+    batch_size: int | None = None
+    for source_index, observation_data in enumerate(observation_sets):
+        for variable_index, values in observation_data.items():
+            values = np.asarray(values, dtype=np.float32)
+            if values.ndim != 2:
+                raise ValueError(
+                    f"Observation result {source_index} for variable "
+                    f"{variable_index} must have shape (batch, stations); "
+                    f"got {values.shape}."
+                )
+            if batch_size is None:
+                batch_size = values.shape[0]
+            elif values.shape[0] != batch_size:
+                raise ValueError(
+                    "All observation arrays must have the same batch size; "
+                    f"expected {batch_size}, got {values.shape[0]} for variable "
+                    f"{variable_index} in result {source_index}."
+                )
+            arrays_per_var.setdefault(variable_index, []).append(values)
+
+    if not arrays_per_var:
+        raise ValueError("The observation results contain no observations.")
+    return {
+        variable_index: np.concatenate(arrays, axis=1)
+        for variable_index, arrays in arrays_per_var.items()
+    }
+
+
+def build_observation_type_variances(
+    observation_sets: Sequence[dict[int, np.ndarray]],
+    observation_type_uncertainties: Sequence[float],
+) -> dict[int, np.ndarray]:
+    """Expand type-level variances into per-station variances.
+
+    Each variance is paired with one observation set and is interpreted in the
+    same normalized/model-transform space as that set's observations. The
+    returned arrays have shape ``(1, stations)`` and follow the exact source and
+    station concatenation order used by :func:`merge_real_observation_data`.
+    """
+    if not observation_sets:
+        raise ValueError("observation_sets must contain at least one result.")
+    if len(observation_sets) != len(observation_type_uncertainties):
+        raise ValueError(
+            "observation_sets and observation_type_uncertainties must have the "
+            f"same length; got {len(observation_sets)} and "
+            f"{len(observation_type_uncertainties)}."
+        )
+
+    variances_per_var: dict[int, list[np.ndarray]] = {}
+    for source_index, (observation_data, uncertainty) in enumerate(
+        zip(observation_sets, observation_type_uncertainties)
+    ):
+        uncertainty = float(uncertainty)
+        if not np.isfinite(uncertainty) or uncertainty <= 0.0:
+            raise ValueError(
+                f"Observation-type uncertainty {source_index} must be finite "
+                f"and positive; got {uncertainty}."
+            )
+        variance = np.float32(uncertainty)
+        for variable_index, values in observation_data.items():
+            station_count = np.asarray(values).shape[1]
+            variances_per_var.setdefault(variable_index, []).append(
+                np.full((1, station_count), variance, dtype=np.float32)
+            )
+
+    return {
+        variable_index: np.concatenate(variance_blocks, axis=1)
+        for variable_index, variance_blocks in variances_per_var.items()
+    }
+
+
+def _load_real_observation_pairs(
+    station_locations_paths: Sequence[str],
+    obs_data_paths: Sequence[str],
+) -> tuple[
+    list[tuple[_StationGroups, dict[int, str]]],
+    list[dict[int, np.ndarray]],
+]:
+    """Load and validate paired station/observation archives."""
+    if not station_locations_paths or not obs_data_paths:
+        raise ValueError(
+            "station_locations_paths and obs_data_paths must both be non-empty."
+        )
+    if len(station_locations_paths) != len(obs_data_paths):
+        raise ValueError(
+            "station_locations_paths and obs_data_paths must have the same "
+            f"length; got {len(station_locations_paths)} and "
+            f"{len(obs_data_paths)}."
+        )
+
+    station_location_sets = []
+    observation_sets = []
+    for pair_index, (station_path, obs_path) in enumerate(
+        zip(station_locations_paths, obs_data_paths)
+    ):
+        station_groups, locations_per_var = load_real_station_locations(
+            station_path
+        )
+        observation_data = load_real_observation_data(obs_path)
+
+        station_variables = set(locations_per_var)
+        observation_variables = set(observation_data)
+        if station_variables != observation_variables:
+            raise ValueError(
+                f"Station/observation file pair {pair_index} has mismatched "
+                f"variables: station-only={sorted(station_variables - observation_variables)}, "
+                f"observation-only={sorted(observation_variables - station_variables)}."
+            )
+        for variable_index, group_name in locations_per_var.items():
+            station_count = len(station_groups[group_name])
+            observation_count = observation_data[variable_index].shape[1]
+            if station_count != observation_count:
+                raise ValueError(
+                    f"Station/observation file pair {pair_index}, variable "
+                    f"{variable_index}, has {station_count} locations but "
+                    f"{observation_count} observations."
+                )
+
+        station_location_sets.append((station_groups, locations_per_var))
+        observation_sets.append(observation_data)
+
+    return station_location_sets, observation_sets
+
+
+def load_and_merge_real_observations(
+    station_locations_paths: Sequence[str],
+    obs_data_paths: Sequence[str],
+) -> tuple[_StationGroups, dict[int, str], dict[int, np.ndarray]]:
+    """Load paired station/observation archives and merge them safely.
+
+    The two path sequences are paired by position. Each pair must contain the
+    same model variables and the same station count for each variable. This
+    validation prevents station coordinates and observation values from being
+    silently misaligned during concatenation.
+    """
+    station_location_sets, observation_sets = _load_real_observation_pairs(
+        station_locations_paths, obs_data_paths
+    )
+    merged_groups, merged_locations_per_var = merge_real_station_locations(
+        station_location_sets
+    )
+    merged_observations = merge_real_observation_data(observation_sets)
+    return merged_groups, merged_locations_per_var, merged_observations
+
+
+def load_and_merge_real_observations_with_uncertainties(
+    station_locations_paths: Sequence[str],
+    obs_data_paths: Sequence[str],
+    observation_type_uncertainties: Sequence[float],
+) -> tuple[
+    _StationGroups,
+    dict[int, str],
+    dict[int, np.ndarray],
+    dict[int, np.ndarray],
+]:
+    """Load observations and construct type-based diagonal variances.
+
+    ``observation_type_uncertainties`` contains one normalized-space variance
+    per station/observation file pair. The returned variance mapping is indexed
+    by model variable and aligned station-for-station with the merged
+    observation mapping.
+    """
+    station_location_sets, observation_sets = _load_real_observation_pairs(
+        station_locations_paths, obs_data_paths
+    )
+    merged_groups, merged_locations_per_var = merge_real_station_locations(
+        station_location_sets
+    )
+    merged_observations = merge_real_observation_data(observation_sets)
+    observation_variances = build_observation_type_variances(
+        observation_sets, observation_type_uncertainties
+    )
+    return (
+        merged_groups,
+        merged_locations_per_var,
+        merged_observations,
+        observation_variances,
+    )
 
 
 # ==== Build observation operators from specification of stations per variable ====
