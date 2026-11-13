@@ -601,6 +601,7 @@ class WeatherForecaster:
             logger.error(f"Error in denormalization: {e}")
             raise
 
+
     def _apply_inverse_transforms(self, ds: xr.Dataset) -> xr.Dataset:
         """Apply inverse transforms to variables stored in log/signed-log space.
 
@@ -1457,47 +1458,52 @@ class WeatherForecaster:
                 num_2d_fields=len(self.metadata['sfc_vars']),
             )
 
-            # Compute R_obs
-            R_obs = 0.1
+
+            # Compute pseudo observations
+            if not has_obs and H is not None:
+                y_obs = H(x_b)
+                x_b = None
+
+            # Use merged, source-specific variances for real observations.
+            R_obs = (
+                [
+                    tf.convert_to_tensor(
+                        observation_variances_per_var[variable_index],
+                        dtype=tf.float32,
+                    )
+                    for variable_index in sorted(observation_data)
+                ]
+                if has_obs
+                else 0.1
+            )
+
+            # Reduce observation guidance in areas where observation stencils overlap.
+            guidance_scale = 1.0
             if H is not None and H_adjoint is not None:
                 observation_density = compute_observation_density_factors(
                     H, H_adjoint
                 )
-                if has_obs:
-                    base_observation_variances = [
-                        tf.convert_to_tensor(
-                            observation_variances_per_var[variable_index],
-                            dtype=tf.float32,
-                        )
-                        for variable_index in sorted(observation_variances_per_var)
-                    ]
-                else:
-                    base_observation_variances = [
-                        tf.cast(R_obs, tf.float32)
-                    ] * len(observation_density)
-                R_obs = [
-                    variance * density
-                    for variance, density in zip(
-                        base_observation_variances, observation_density
+                base_guidance_scales = [
+                    tf.cast(guidance_scale, tf.float32)
+                ] * len(observation_density)
+                guidance_scale = [
+                    scale / density
+                    for scale, density in zip(
+                        base_guidance_scales, observation_density
                     )
                 ]
 
+            # Set guidance parameters
             sda_guidance_params: Dict[str, object] = {
                 # observation guidance parameters
                 "R_obs": R_obs,
                 "gamma": 0.01,
-                "guidance_scale": 1.0,
+                "guidance_scale": guidance_scale,
                 # background guidance parameters
                 "R_bck": 0.3,
                 "background_gamma": 0.01,
                 "background_guidance_scale": 1.0,
             }
-
-            # pseudo observations
-            if not has_obs and H is not None:
-                y_obs = H(x_b)
-                x_b = None
-
 
             # Call SDA model and then change the model_input to the SDA output
             self._compute_inference_steps(args, is_da=True)

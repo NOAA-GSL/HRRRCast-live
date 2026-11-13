@@ -2211,6 +2211,42 @@ def _normalize_observation_variances(
             normalized.append(tf.identity(variance))
     return normalized
 
+
+def _normalize_guidance_scales(
+    guidance_scale,
+    observation_blocks: list[tf.Tensor],
+) -> list[tf.Tensor]:
+    """Validate and broadcast scalar or block-aligned guidance scales."""
+    if isinstance(guidance_scale, (list, tuple)):
+        if len(guidance_scale) != len(observation_blocks):
+            raise ValueError(
+                f"guidance_scale contains {len(guidance_scale)} blocks; expected "
+                f"{len(observation_blocks)}."
+            )
+        scale_values = list(guidance_scale)
+    else:
+        scale_values = [guidance_scale] * len(observation_blocks)
+
+    normalized = []
+    for block_index, (scale, observations) in enumerate(
+        zip(scale_values, observation_blocks)
+    ):
+        scale = tf.cast(scale, tf.float32)
+        try:
+            scale = tf.broadcast_to(scale, tf.shape(observations))
+        except (ValueError, tf.errors.InvalidArgumentError) as exc:
+            raise ValueError(
+                f"guidance_scale block {block_index} is not broadcastable to "
+                "its observation block."
+            ) from exc
+        check = tf.debugging.assert_all_finite(
+            scale, f"guidance_scale block {block_index} must be finite."
+        )
+        with tf.control_dependencies([check] if check is not None else []):
+            normalized.append(tf.identity(scale))
+    return normalized
+
+
 def compute_likelihood_gradient(
     x_0: tf.Tensor,
     y_obs: list[tf.Tensor] | tuple[tf.Tensor, ...],
@@ -2220,7 +2256,7 @@ def compute_likelihood_gradient(
     weights: tf.Tensor | list | np.ndarray | None = None,  # Per-variable weights
     R_obs: float | tf.Tensor | list[tf.Tensor] | tuple[tf.Tensor, ...] = 0.1,
     gamma: float = 0.01,
-    guidance_scale: float = 1.0,
+    guidance_scale: float | tf.Tensor | list[float | tf.Tensor] | tuple[float | tf.Tensor, ...] = 1.0,
 ) -> tf.Tensor:
     """Compute the clean-state factor of the SDA likelihood score.
 
@@ -2239,6 +2275,11 @@ def compute_likelihood_gradient(
     and broadcasts across the model-state batch. Use
     :func:`compute_observation_density_factors` to inflate that diagonal for
     overlapping positive observation stencils.
+
+    ``guidance_scale`` supports the same scalar, broadcastable tensor, or
+    block-aligned list/tuple forms as ``R_obs``. Each scale is broadcast to its
+    corresponding observation block before the residual is mapped through the
+    adjoint.
     """
 
     if not isinstance(y_obs, (list, tuple)):
@@ -2255,8 +2296,6 @@ def compute_likelihood_gradient(
         )
     if not np.isfinite(gamma) or gamma < 0:
         raise ValueError(f"gamma must be finite and non-negative; got {gamma}.")
-    if not np.isfinite(guidance_scale):
-        raise ValueError(f"guidance_scale must be finite; got {guidance_scale}.")
     if weights is not None and not getattr(H, "supports_channel_weights", True):
         raise ValueError(
             "Per-state-channel guidance weights are not supported by this "
@@ -2280,6 +2319,7 @@ def compute_likelihood_gradient(
     else:
         y_obs = [tf.cast(block, tf.float32) for block in y_obs]
     observation_variances = _normalize_observation_variances(R_obs, y_hat)
+    guidance_scales = _normalize_guidance_scales(guidance_scale, y_hat)
     predictive_variances = [
         variance + tf.cast(diffusion_obs_var, tf.float32)
         for variance in observation_variances
@@ -2291,12 +2331,14 @@ def compute_likelihood_gradient(
     observation_weights = (
         _effective_observation_weights(H, weights) if weights is not None else None
     )
-    for i, (y_hat_i, y_obs_i) in enumerate(zip(y_hat, y_obs)):
+    for i, (y_hat_i, y_obs_i, scale_i) in enumerate(
+        zip(y_hat, y_obs, guidance_scales)
+    ):
         res_i = y_hat_i - y_obs_i
         if observation_weights is not None:
             res_i = res_i * observation_weights[i]
 
-        residual.append(res_i * guidance_scale)
+        residual.append(res_i * scale_i)
 
     weighted_residual = [
         res_i / variance
@@ -2377,7 +2419,7 @@ def compute_sda_posterior_guidance(
     weights: tf.Tensor | list | np.ndarray | None = None,
     R_obs: float | tf.Tensor | list[tf.Tensor] | tuple[tf.Tensor, ...] = 0.1,
     gamma: float = 0.01,
-    guidance_scale: float = 1.0,
+    guidance_scale: float | tf.Tensor | list[float | tf.Tensor] | tuple[float | tf.Tensor, ...] = 1.0,
     x_b: tf.Tensor | None = None,
     R_bck: tf.Tensor | float = 0.1,
     background_gamma: tf.Tensor | float = 0.01,
