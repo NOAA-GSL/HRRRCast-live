@@ -1458,7 +1458,6 @@ class WeatherForecaster:
                 num_2d_fields=len(self.metadata['sfc_vars']),
             )
 
-
             # Compute pseudo observations
             if not has_obs and H is not None:
                 y_obs = H(x_b)
@@ -1493,6 +1492,47 @@ class WeatherForecaster:
                     )
                 ]
 
+            # Increase background guidance smoothly as effective observation
+            # counts decrease. Summing the inverse-density station scales
+            # discounts observations whose operator stencils overlap.
+            effective_observation_counts = np.zeros(
+                self.predicted_channels, dtype=np.float32
+            )
+            if H is not None and H_adjoint is not None:
+                for variable_index, station_scales in zip(
+                    H.metadata.selected_variables, guidance_scale
+                ):
+                    effective_observation_counts[int(variable_index)] = float(
+                        tf.reduce_sum(station_scales).numpy()
+                    )
+
+            positive_effective_counts = effective_observation_counts[
+                effective_observation_counts > 0.0
+            ]
+            reference_observation_count = (
+                float(np.median(positive_effective_counts))
+                if positive_effective_counts.size
+                else 1.0
+            )
+            minimum_background_scale = 1.0
+            maximum_background_scale = 2.5
+            background_guidance_scale = (
+                minimum_background_scale
+                + (maximum_background_scale - minimum_background_scale)
+                * reference_observation_count
+                / (effective_observation_counts + reference_observation_count)
+            ).astype(np.float32)
+            background_guidance_scale = tf.convert_to_tensor(
+                background_guidance_scale, dtype=tf.float32
+            )
+            logger.info(
+                "Background guidance uses density-adjusted observation counts "
+                "with reference count %.1f and scale range %.3f-%.3f.",
+                reference_observation_count,
+                float(tf.reduce_min(background_guidance_scale).numpy()),
+                float(tf.reduce_max(background_guidance_scale).numpy()),
+            )
+
             # Set guidance parameters
             sda_guidance_params: Dict[str, object] = {
                 # observation guidance parameters
@@ -1502,7 +1542,7 @@ class WeatherForecaster:
                 # background guidance parameters
                 "R_bck": 0.3,
                 "background_gamma": 0.01,
-                "background_guidance_scale": 1.0,
+                "background_guidance_scale": background_guidance_scale,
             }
 
             # Call SDA model and then change the model_input to the SDA output

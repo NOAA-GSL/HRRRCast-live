@@ -2362,7 +2362,7 @@ def compute_background_gradient(
     t: tf.Tensor,
     R_bck: tf.Tensor | float = 0.1,
     background_gamma: tf.Tensor | float = 0.01,
-    background_guidance_scale: float = 1.0,
+    background_guidance_scale: tf.Tensor | float = 1.0,
 ) -> tf.Tensor:
     """Compute the clean-state gradient of a Gaussian background factor.
 
@@ -2373,16 +2373,17 @@ def compute_background_gradient(
         V_b,t = R_bck + background_gamma * (1 - alpha_bar_t) / alpha_bar_t.
 
     ``R_bck`` and ``background_gamma`` may be scalars or positive tensors
-    broadcastable to the state shape. This returns the closed-form plug-in
-    gradient ``background_guidance_scale * (x_b - x_0) / V_b,t``.
+    broadcastable to the state shape. ``background_guidance_scale`` may be a
+    scalar or a rank-1 tensor with one value per state channel. This returns
+    the closed-form plug-in gradient
+    ``background_guidance_scale * (x_b - x_0) / V_b,t``.
     """
-    if not np.isfinite(background_guidance_scale):
-        raise ValueError(f"background_guidance_scale must be finite; got {background_guidance_scale}.")
-
     x_b = tf.cast(x_b, tf.float32)
     x_b = tf.stop_gradient(tf.identity(x_b))
     R_bck = tf.cast(R_bck, tf.float32)
     background_gamma = tf.cast(background_gamma, tf.float32)
+    background_guidance_scale = tf.cast(background_guidance_scale, tf.float32)
+
     checks = [
         tf.debugging.assert_all_finite(R_bck, "R_bck must be finite."),
         tf.debugging.assert_positive(R_bck, "R_bck must be positive."),
@@ -2391,6 +2392,14 @@ def compute_background_gradient(
         ),
         tf.debugging.assert_non_negative(
             background_gamma, "background_gamma must be non-negative."
+        ),
+        tf.debugging.assert_all_finite(
+            background_guidance_scale,
+            "background_guidance_scale must be finite.",
+        ),
+        tf.debugging.assert_non_negative(
+            background_guidance_scale,
+            "background_guidance_scale must be non-negative.",
         ),
     ]
     with tf.control_dependencies([check for check in checks if check is not None]):
@@ -2402,8 +2411,7 @@ def compute_background_gradient(
         )
         V_b = tf.stop_gradient(tf.identity(R_bck + diffusion_background_var))
     return (
-        tf.cast(background_guidance_scale, tf.float32)
-        * (x_b - x_0) / V_b
+        background_guidance_scale * (x_b - x_0) / V_b
     )
 
 
@@ -2423,7 +2431,7 @@ def compute_sda_posterior_guidance(
     x_b: tf.Tensor | None = None,
     R_bck: tf.Tensor | float = 0.1,
     background_gamma: tf.Tensor | float = 0.01,
-    background_guidance_scale: float = 1.0,
+    background_guidance_scale: tf.Tensor | float = 1.0,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """Propagate clean-state likelihood and background guidance through the denoiser.
 
