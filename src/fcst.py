@@ -1366,19 +1366,19 @@ class WeatherForecaster:
             init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(args.inittime)
             date_str = f"{init_year}{init_month}{init_day}/{init_hh}"
             default_observation_specs = [
-                ("prepbufr_adpsfc", 0.1),
-                ("prepbufr_adpupa", 0.1),
-                ("prepbufr_aircar", 0.1),
-                ("prepbufr_aircft", 0.1),
-                ("prepbufr_ascatw", 0.1),
-                ("prepbufr_gpsipw", 0.1),
-                ("prepbufr_msonet", 0.1),
-                ("prepbufr_proflr", 0.1),
-                ("prepbufr_rassda", 0.1),
-                ("prepbufr_satwnd", 0.1),
-                ("prepbufr_sfcshp", 0.1),
-                ("prepbufr_vadwnd", 0.1),
-                ("mrms", 0.1),
+                ("prepbufr_adpsfc", 0.08),  # Reliable surface data with representativeness error
+                ("prepbufr_adpupa", 0.05),  # High-confidence conventional upper-air soundings
+                ("prepbufr_aircar", 0.07),  # Generally high-quality automated aircraft reports
+                ("prepbufr_aircft", 0.10),  # Mixed aircraft data with time and location uncertainty
+                ("prepbufr_ascatw", 0.18),  # Scatterometer winds affected by rain and surface mismatch
+                ("prepbufr_gpsipw", 0.10),  # Good integrated moisture, but indirect vertical information
+                ("prepbufr_msonet", 0.15),  # Heterogeneous networks and surface representativeness error
+                ("prepbufr_proflr", 0.15),  # Wind profiler height and weather-contamination errors
+                ("prepbufr_rassda", 0.18),  # Retrieved virtual temperature with vertical mismatch
+                ("prepbufr_satwnd", 0.20),  # Satellite wind retrieval and height-assignment uncertainty
+                ("prepbufr_sfcshp", 0.12),  # Reliable marine data with sparse spatial sampling
+                ("prepbufr_vadwnd", 0.15),  # Radar-derived winds with volume-sampling effects
+                ("mrms", 0.10),  # High-quality reflectivity with grid and neighborhood mismatch
             ]
             default_station_files = [
                 f"{station_file}_locs.npz" for station_file, _ in default_observation_specs
