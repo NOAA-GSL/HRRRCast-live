@@ -1541,7 +1541,7 @@ class WeatherForecaster:
                 "guidance_scale": guidance_scale,
                 # background guidance parameters
                 "R_bck": 0.3,
-                "background_gamma": 0.01,
+                "background_gamma": 0.03,
                 "background_guidance_scale": background_guidance_scale,
             }
 
