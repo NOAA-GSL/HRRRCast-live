@@ -137,6 +137,32 @@ class ChannelPoolAvg(Layer):
         return config
     
 @register_keras_serializable()
+class ResidualSpatialScale(Layer):
+    """Convert sigmoid spatial attention [0, 1] to a bounded residual scale.
+
+    scale = 1 + alpha * (2 * attention - 1)
+
+    For alpha=0.5:
+        attention = 0   -> scale = 0.5
+        attention = 0.5 -> scale = 1.0
+        attention = 1   -> scale = 1.5
+    """
+
+    def __init__(self, alpha=0.5, **kwargs):
+        super().__init__(**kwargs)
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha must be in [0, 1].")
+        self.alpha = alpha
+
+    def call(self, attention):
+        return 1.0 + self.alpha * (2.0 * attention - 1.0)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"alpha": self.alpha})
+        return config
+    
+@register_keras_serializable()
 class RecomputeSubModel(tf.keras.layers.Layer):
     """Gradient checkpointing wrapper for memory-efficient training.
     
@@ -212,8 +238,9 @@ class TimeCondLayer(Layer):
             return tf.concat([extra_time_feats, lead_time], axis=1)
 
         # Case C: CRPS with noise
-        ens_id = tf.cast(tf.floor(tf.cast(d[:, -2], tf.float32) * (2**31 - 1)), tf.int32)  # (B,)
-        seed = tf.stack([ens_id, ens_id ^ 0x9E3779B9], axis=1)  # (B,2)
+        # Ensemble ID is constant across the batch, so use a single shared seed key.
+        ens_id = tf.cast(tf.floor(tf.cast(d[0, -2], tf.float32) * (2**31 - 1)), tf.int32)  # scalar
+        seed = tf.stack([ens_id, ens_id ^ 0x9E3779B9], axis=0)  # (2,)
         z = tf.random.stateless_normal([tf.shape(d)[0], 32], seed=seed, dtype=lead_time.dtype)  # (B,32)
         return tf.concat([z, extra_time_feats, lead_time], axis=1)
 
